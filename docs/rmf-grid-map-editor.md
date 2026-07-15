@@ -7,7 +7,7 @@ and positive Y points upward.
 ## Start the editor
 
 ```bash
-cd layout-managemeny
+cd layout-management
 python3 rmf_grid_map_editor.py
 ```
 

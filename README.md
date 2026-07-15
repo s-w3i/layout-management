@@ -38,8 +38,8 @@ python3 -m pip install PyYAML
 Clone the public repository and start the application:
 
 ```bash
-git clone https://github.com/s-w3i/layout-managemeny.git
-cd layout-managemeny
+git clone https://github.com/s-w3i/layout-management.git
+cd layout-management
 python3 rmf_grid_map_editor.py
 ```
 
