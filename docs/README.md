@@ -8,6 +8,9 @@
   grid, place racks and workstations, assign zones, generate slotting layouts,
   inspect inventory, and demonstrate SKU or shelf swaps.
 
+The root [user manual](../README.md) also documents the object-oriented module
+structure and service regression tests.
+
 ## Reference assets
 
 - `resources/map/` contains RMF building maps and source layout images.

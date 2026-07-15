@@ -18,7 +18,8 @@ the bottom-left point of a generated map, and positive Y points upward.
 6. [Inventory address rules](#inventory-address-rules)
 7. [Command-line map generation](#command-line-map-generation)
 8. [Files and folders](#files-and-folders)
-9. [Troubleshooting](#troubleshooting)
+9. [Code architecture](#code-architecture)
+10. [Troubleshooting](#troubleshooting)
 
 ## Install and start
 
@@ -378,10 +379,22 @@ column 0, row 0.
 ```text
 layout_management_master/
 ├── README.md
-├── rmf_grid_map_editor.py
+├── rmf_grid_map_editor.py                         Application launcher only
 ├── sku_velocity_analysis.py
+├── warehouse_layout/
+│   ├── cli.py                                     CLI application controller
+│   ├── config.py                                  Paths and schema constants
+│   ├── domain.py                                  Grid domain models
+│   ├── gui.py                                     Tkinter application class
+│   ├── inventory.py                               Search and swap service
+│   ├── rmf.py                                     RMF/project persistence service
+│   └── slotting.py                                Routing, addressing and slotting
+├── tests/
+│   └── test_services.py                           Service regression tests
 ├── docs/
-│   └── sku-velocity-analysis.md
+│   ├── README.md                                  Documentation index
+│   ├── rmf-grid-map-editor.md                     Additional editor notes
+│   └── sku-velocity-analysis.md                   ABC analysis guide
 └── resources/
     ├── data/
     │   ├── Sample Data.xlsx                     Optional local input (ignored)
@@ -394,6 +407,38 @@ layout_management_master/
     │   └── v6.building.yaml
     └── others/
 ```
+
+## Code architecture
+
+`rmf_grid_map_editor.py` is intentionally a minimal launcher. Application code
+is organized by responsibility inside the `warehouse_layout` package:
+
+| Module | Main class | Responsibility |
+|---|---|---|
+| `domain.py` | `GridProject`, `GridSpec`, `Marker` | Grid state, validation and RMF dictionary construction |
+| `rmf.py` | `RmfMapService` | Load/save editable projects and import/export building YAML |
+| `slotting.py` | `SlottingService` | Rack routing, zone-local aisles, dynamic addresses and basic slotting |
+| `slotting.py` | `SlottingLayoutRepository` | Read/write self-contained slotting JSON |
+| `inventory.py` | `InventoryService` | SKU lookup, SKU-slot swap and AMR-shelf swap |
+| `gui.py` | `GridMapEditorApp` | Tkinter widgets and user interaction |
+| `cli.py` | `GridMapEditorCommand` | Command-line parsing and application startup |
+
+Run the service regression tests from the repository root:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+On Linux, run the automated three-tab GUI workflow with a virtual display:
+
+```bash
+sudo apt install xvfb
+xvfb-run -a python3 -m tests.gui_workflow_smoke
+```
+
+The GUI smoke test covers grid editing, map loading and drawing, rectangle zone
+selection, all handling-unit address models, rack inspection, SKU search,
+SKU-slot swap, AMR-shelf swap, and operation-layout saving.
 
 ## Troubleshooting
 
