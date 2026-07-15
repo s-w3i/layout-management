@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.tmp
+*.bak
+*~
+
+# Local source data and generated analysis/slotting artifacts
+resources/data/Sample Data.xlsx
+resources/data/sku_velocity_output/demand_plots/
+resources/data/basic_slotting_layout.csv
+resources/data/*.slotting.json
+
+# Local warehouse drawings and non-demo design references
+resources/map/AMR layout-1.png
+resources/map/v6.building.yaml
+resources/others/
