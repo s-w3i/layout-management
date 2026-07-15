@@ -83,6 +83,19 @@ class WarehouseServiceTests(unittest.TestCase):
                     all(row["dynamic_address_level"] == expected_layer for row in rows)
                 )
 
+    def test_unreachable_racks_remain_last_resort_storage_capacity(self):
+        building = copy.deepcopy(self.building)
+        level = next(iter(building["levels"].values()))
+        level["lanes"] = []
+        rows, summary = self.slotting.generate_basic(
+            building, copy.deepcopy(self.skus[:2]), 1, 1, "AMR shelf"
+        )
+        self.assertEqual(summary["assigned_count"], 2)
+        self.assertEqual(summary["unreachable_rack_count"], 2)
+        self.assertTrue(
+            all(row["routing_status"] == "UNREACHABLE_LAST_RESORT" for row in rows)
+        )
+
     def test_sku_slot_swap_exchanges_locations(self):
         rows, _summary = self.slotting.generate_basic(
             copy.deepcopy(self.building), copy.deepcopy(self.skus), 1, 3, "AMR shelf"

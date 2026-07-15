@@ -11,9 +11,16 @@ from tkinter import filedialog, messagebox, ttk
 
 import yaml
 
+from .attribute_editor import HierarchyAttributeEditor
+from .attributes import (
+    PHYSICAL_ATTRIBUTE_KEYS,
+    STANDARD_STORAGE_DEFAULTS,
+    StorageAttributeService,
+)
 from .config import (
     DEFAULT_BUILDING_INPUT,
     DEFAULT_BUILDING_OUTPUT,
+    DEFAULT_CHILLED_INPUT,
     DEFAULT_SLOTTING_OUTPUT,
     DEFAULT_VELOCITY_INPUT,
 )
@@ -21,19 +28,60 @@ from .domain import GridPosition, GridProject, GridSpec, Marker
 from .inventory import InventoryService
 from .rmf import RmfMapService
 from .slotting import SlottingLayoutRepository, SlottingService
+from .zone_settings_editor import ZoneStorageSettingsEditor
 
 
 class GridMapEditorApp:
     """Coordinate the three-tab desktop UI and application services."""
+
+    @staticmethod
+    def sku_storage_flags(row):
+        """Return compact, operator-facing storage markers for an SKU row."""
+        flags = []
+        requirements = row.get("sku_requirements") or {}
+        if requirements.get("chilled") is True:
+            flags.append("CHILLED")
+
+        physical_class = str(row.get("physical_storage_class") or "").upper()
+        if physical_class == "OVERSIZE":
+            flags.append("OVERSIZE")
+        elif physical_class == "OVERWEIGHT":
+            flags.append("OVERWEIGHT")
+        elif physical_class == "OVERSIZE_AND_OVERWEIGHT":
+            flags.extend(("OVERSIZE", "OVERWEIGHT"))
+        elif physical_class == "UNVERIFIED_OVERSIZE":
+            flags.append("UNVERIFIED OVERSIZE")
+
+        return " · ".join(flags) or "STANDARD AMBIENT"
+
+    @staticmethod
+    def rack_storage_flag_counts(rows):
+        """Count temperature-controlled and physical-exception SKUs in a rack."""
+        chilled = sum(
+            (row.get("sku_requirements") or {}).get("chilled") is True
+            for row in rows
+        )
+        physical_exceptions = sum(
+            str(row.get("physical_storage_class") or "").upper()
+            in {
+                "OVERSIZE",
+                "OVERWEIGHT",
+                "OVERSIZE_AND_OVERWEIGHT",
+                "UNVERIFIED_OVERSIZE",
+            }
+            for row in rows
+        )
+        return chilled, physical_exceptions
 
     def __init__(self, root, initial_project: GridProject | None = None):
         self.root = root
         self.root.title("RMF Grid Map Editor")
         self.root.geometry("1220x820")
         self.rmf_maps = RmfMapService()
-        self.slotting = SlottingService(self.rmf_maps)
+        self.attributes = StorageAttributeService()
+        self.slotting = SlottingService(self.rmf_maps, self.attributes)
         self.layouts = SlottingLayoutRepository()
-        self.inventory = InventoryService(self.slotting)
+        self.inventory = InventoryService(self.slotting, self.attributes)
         self.project = initial_project or GridProject()
         self.selected: GridPosition | None = None
         self.bulk_anchor: GridPosition | None = None
@@ -133,6 +181,7 @@ class GridMapEditorApp:
     def _build_slotting_tab(self, parent):
         self.slot_building_path = tk.StringVar(value=str(DEFAULT_BUILDING_INPUT))
         self.slot_velocity_path = tk.StringVar(value=str(DEFAULT_VELOCITY_INPUT))
+        self.slot_chilled_path = tk.StringVar(value=str(DEFAULT_CHILLED_INPUT))
         self.slot_output_path = tk.StringVar(value=str(DEFAULT_SLOTTING_OUTPUT))
         self.slot_strategy = tk.StringVar(value="basic")
         self.slot_handling_unit = tk.StringVar(value="AMR shelf")
@@ -147,6 +196,11 @@ class GridMapEditorApp:
         self.slot_selected_rack = None
         self.slot_loaded_path = None
         self.slot_zone_assignments = {}
+        self.slot_attribute_catalog = self.attributes.starter_catalog()
+        self.slot_location_attributes = {}
+        self.slot_hierarchy_paths = []
+        self.slot_storage_initialized = False
+        self.slot_zone_storage_types = {}
         self.slot_zone_mode = tk.BooleanVar(value=True)
         self.slot_zone_auto = tk.BooleanVar(value=True)
         self.slot_zone_drag_start = None
@@ -166,31 +220,40 @@ class GridMapEditorApp:
         ttk.Entry(form, textvariable=self.slot_velocity_path).grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Button(form, text="Browse…", command=lambda: self.browse_slot_input(self.slot_velocity_path, [("CSV", "*.csv"), ("All files", "*")])).grid(row=1, column=2, padx=(8, 0), pady=4)
 
-        ttk.Label(form, text="Strategy").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(form, textvariable=self.slot_strategy, state="readonly", values=("basic",), width=18).grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Label(form, text="Handling unit").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(form, textvariable=self.slot_handling_unit, state="readonly", values=("AMR shelf", "Tote", "Pallet"), width=18).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(form, text="Zone ID").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.slot_zone, width=20).grid(row=4, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Chilled SKU CSV (optional)").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.slot_chilled_path).grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Button(form, text="Browse…", command=lambda: self.browse_slot_input(self.slot_chilled_path, [("CSV", "*.csv"), ("All files", "*")])).grid(row=2, column=2, padx=(8, 0), pady=4)
+
+        ttk.Label(form, text="Strategy").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(form, textvariable=self.slot_strategy, state="readonly", values=("basic",), width=18).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Handling unit").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(form, textvariable=self.slot_handling_unit, state="readonly", values=("AMR shelf", "Tote", "Pallet"), width=18).grid(row=4, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Zone ID").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.slot_zone, width=20).grid(row=5, column=1, sticky="w", pady=4)
         zone_actions = ttk.Frame(form)
-        zone_actions.grid(row=4, column=2, columnspan=2, sticky="w")
+        zone_actions.grid(row=5, column=2, columnspan=2, sticky="w")
         ttk.Checkbutton(zone_actions, text="Rectangle zone selection", variable=self.slot_zone_mode, command=self.zone_mode_changed).pack(side="left")
         ttk.Checkbutton(zone_actions, text="Auto next ID", variable=self.slot_zone_auto).pack(side="left", padx=(6,0))
         ttk.Button(zone_actions, text="Clear zones", command=self.clear_slot_zones).pack(side="left", padx=(6,0))
 
         capacity = ttk.Frame(form)
-        capacity.grid(row=5, column=1, sticky="w", pady=4)
-        ttk.Label(form, text="Rack capacity").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
+        capacity.grid(row=6, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Rack capacity").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Label(capacity, text="Levels").pack(side="left")
         ttk.Spinbox(capacity, from_=1, to=100, textvariable=self.slot_levels, width=5).pack(side="left", padx=(5, 14))
         ttk.Label(capacity, text="Slots per level").pack(side="left")
         ttk.Spinbox(capacity, from_=1, to=100, textvariable=self.slot_slots, width=5).pack(side="left", padx=5)
 
-        ttk.Label(form, text="Output layout JSON").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.slot_output_path).grid(row=6, column=1, sticky="ew", pady=4)
-        ttk.Button(form, text="Browse…", command=self.browse_slot_output).grid(row=6, column=2, padx=(8, 0), pady=4)
-        ttk.Button(form, text="Generate slotting layout", command=self.run_slotting, style="Accent.TButton").grid(row=7, column=1, sticky="w", pady=(10, 4))
-        ttk.Label(form, textvariable=self.slot_summary, foreground="#315b66").grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(form, text="Output layout JSON").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.slot_output_path).grid(row=7, column=1, sticky="ew", pady=4)
+        ttk.Button(form, text="Browse…", command=self.browse_slot_output).grid(row=7, column=2, padx=(8, 0), pady=4)
+        slot_actions = ttk.Frame(form)
+        slot_actions.grid(row=8, column=1, columnspan=3, sticky="w", pady=(10, 4))
+        ttk.Button(slot_actions, text="Zone storage settings…", command=self.open_zone_storage_settings).pack(side="left")
+        ttk.Button(slot_actions, text="Advanced attributes…", command=self.open_attribute_editor).pack(side="left", padx=(6, 0))
+        ttk.Button(slot_actions, text="Load previous layout…", command=self.load_slotting_configuration).pack(side="left", padx=(6, 0))
+        ttk.Button(slot_actions, text="Generate slotting layout", command=self.run_slotting, style="Accent.TButton").pack(side="left", padx=(12, 0))
+        ttk.Label(form, textvariable=self.slot_summary, foreground="#315b66").grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         result = ttk.LabelFrame(parent, text="Interactive slotting layout", padding=8)
         result.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -214,15 +277,15 @@ class GridMapEditorApp:
 
         ttk.Label(rack_view, text="RACK DETAILS", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", padx=8)
         ttk.Label(rack_view, textvariable=self.slot_rack_detail, justify="left", wraplength=450).grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 8))
-        columns = ("rank", "sku", "class", "static", "dynamic", "unit_type", "unit_id", "status")
+        columns = ("rank", "sku", "class", "flags", "static", "dynamic", "unit_type", "unit_id", "status")
         tree_frame = ttk.Frame(rack_view)
         tree_frame.grid(row=2, column=0, sticky="nsew", padx=8)
         tree_frame.columnconfigure(0, weight=1); tree_frame.rowconfigure(0, weight=1)
         self.slot_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-        headings = {"rank":"Rank", "sku":"SKU", "class":"ABC", "static":"Current static address", "dynamic":"Current dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
-        widths = {"rank":55, "sku":95, "class":50, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
+        headings = {"rank":"Rank", "sku":"SKU", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Current dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
+        widths = {"rank":55, "sku":95, "class":50, "flags":180, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
         for column in columns:
-            self.slot_tree.heading(column, text=headings[column]); self.slot_tree.column(column, width=widths[column], anchor="center" if column not in {"static","dynamic"} else "w")
+            self.slot_tree.heading(column, text=headings[column]); self.slot_tree.column(column, width=widths[column], anchor="center" if column not in {"flags","static","dynamic"} else "w")
         yscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.slot_tree.yview)
         xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.slot_tree.xview)
         self.slot_tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
@@ -263,10 +326,10 @@ class GridMapEditorApp:
         ttk.Label(control,textvariable=self.ops_details,justify="left",wraplength=470).grid(row=1,column=0,sticky="ew",pady=(0,10))
 
         inventory=ttk.LabelFrame(control,text="SELECTED RACK INVENTORY",padding=6); inventory.grid(row=2,column=0,sticky="nsew",pady=(0,8)); inventory.columnconfigure(0,weight=1); inventory.rowconfigure(0,weight=1)
-        columns=("sku","class","static","dynamic","unit")
+        columns=("sku","class","flags","static","dynamic","unit")
         self.ops_inventory_tree=ttk.Treeview(inventory,columns=columns,show="headings",height=8)
-        headings={"sku":"SKU","class":"ABC","static":"Static address","dynamic":"Dynamic address","unit":"Shelf / unit"}
-        widths={"sku":100,"class":45,"static":190,"dynamic":220,"unit":110}
+        headings={"sku":"SKU","class":"ABC","flags":"Storage flags","static":"Static address","dynamic":"Dynamic address","unit":"Shelf / unit"}
+        widths={"sku":100,"class":45,"flags":180,"static":190,"dynamic":220,"unit":110}
         for column in columns:
             self.ops_inventory_tree.heading(column,text=headings[column]);self.ops_inventory_tree.column(column,width=widths[column],anchor="center" if column in {"class","unit"} else "w")
         inventory_y=ttk.Scrollbar(inventory,orient="vertical",command=self.ops_inventory_tree.yview)
@@ -354,7 +417,7 @@ class GridMapEditorApp:
         rows=[row for row in self.ops_rows if row.get("assignment_status")=="ASSIGNED" and row.get("rack_id")==rack_id]
         rows.sort(key=lambda row:(int(row.get("storage_level") or 0),int(row.get("storage_slot") or 0),str(row.get("sku",""))))
         for row in rows:
-            item=self.ops_inventory_tree.insert("","end",values=(row.get("sku",""),row.get("velocity_class",""),row.get("static_address",""),row.get("dynamic_address",""),row.get("handling_unit_id","")))
+            item=self.ops_inventory_tree.insert("","end",values=(row.get("sku",""),row.get("velocity_class",""),self.sku_storage_flags(row),row.get("static_address",""),row.get("dynamic_address",""),row.get("handling_unit_id","")))
             self.ops_inventory_rows[item]=row
 
     def ops_inventory_select(self,_event=None):
@@ -377,10 +440,20 @@ class GridMapEditorApp:
     def show_ops_assignment(self,row):
         self.ops_highlight_rack=row.get("rack_id","")
         self.show_ops_rack_inventory(self.ops_highlight_rack)
+        local = self.ops_payload.get("location_attributes", {}) if self.ops_payload else {}
+        effective, _sources = self.attributes.effective_attributes(
+            row.get("static_address", ""), local
+        )
         self.ops_details.set(
             f"SKU: {row.get('sku','')} · ABC class {row.get('velocity_class','')} · quantity {row.get('total_quantity_ea','')} EA\n"
+            f"Storage flags: {self.sku_storage_flags(row)}\n"
+            f"Physical class: {row.get('physical_storage_class','NOT_EVALUATED')} · data {row.get('physical_data_status','NOT_EVALUATED')}\n"
             f"Current static address: {row.get('static_address','')}\nCurrent dynamic address: {row.get('dynamic_address','')}\n"
-            f"Handling unit: {row.get('handling_unit_id','')} ({row.get('handling_unit_type','')})\nRMF grid position: {row.get('rmf_grid_address','')}"
+            f"Handling unit: {row.get('handling_unit_id','')} ({row.get('handling_unit_type','')})\nRMF grid position: {row.get('rmf_grid_address','')}\n"
+            f"SKU requirements: {self.attributes.format_values(row.get('sku_requirements'))}\n"
+            f"Effective location attributes: {self.attributes.format_values(effective)}\n"
+            f"Compatibility: {row.get('compatibility_status','NOT_EVALUATED')}\n"
+            f"Warnings / mismatch: {'; '.join(row.get('compatibility_issues', [])) or 'none'}"
         );self.draw_ops_layout()
 
     def search_ops_sku(self):
@@ -401,7 +474,19 @@ class GridMapEditorApp:
         self.ops_highlight_rack=rack_id
         self.show_ops_rack_inventory(rack_id)
         units=sorted({str(row.get("handling_unit_id","")) for row in rows if row.get("handling_unit_id")})
-        self.ops_details.set(f"Rack {rack_id} · {len(rows)} assigned SKU(s)\nShelf / handling unit: "+(", ".join(units) if units else "empty"))
+        rack_attributes = {}
+        if rows and self.ops_payload:
+            bay_path = "/".join(str(rows[0].get("static_address", "")).split("/")[:3])
+            rack_attributes, _sources = self.attributes.effective_attributes(
+                bay_path, self.ops_payload.get("location_attributes", {})
+            )
+        chilled_count, exception_count = self.rack_storage_flag_counts(rows)
+        self.ops_details.set(
+            f"Rack {rack_id} · {len(rows)} assigned SKU(s)\nShelf / handling unit: "
+            + (", ".join(units) if units else "empty")
+            + f"\nStorage flags: CHILLED={chilled_count} · OVERSIZE / WEIGHT EXCEPTION={exception_count}"
+            + f"\nEffective bay attributes: {self.attributes.format_values(rack_attributes)}"
+        )
         if self.ops_swap_mode.get()=="Whole shelf":
             self.select_ops_shelf_for_swap(rack_id,rows)
         else:self.draw_ops_layout()
@@ -435,14 +520,19 @@ class GridMapEditorApp:
 
     def perform_ops_swap(self,source,target,mode):
         timestamp=datetime.now(timezone.utc).isoformat()
+        catalog=self.ops_payload.get("attribute_catalog",[]) if self.ops_payload else []
+        local=self.ops_payload.get("location_attributes",{}) if self.ops_payload else {}
         try:
             if mode=="SKU slot":
-                first,second=self.inventory.swap_sku_slots(self.ops_rows,source,target);message=f"Swapped SKU slots: {first['sku']} ↔ {second['sku']}"
+                first,second=self.inventory.swap_sku_slots(self.ops_rows,source,target,catalog,local);message=f"Swapped SKU slots: {first['sku']} ↔ {second['sku']}"
                 row=self.inventory.find_sku(self.ops_rows,source)
             else:
-                first_unit,second_unit,first_count,second_count=self.inventory.swap_whole_shelf_units(self.ops_rows,source,target);message=f"Swapped shelves: {first_unit} ({first_count} SKUs) ↔ {second_unit} ({second_count} SKUs)"
+                first_unit,second_unit,first_count,second_count=self.inventory.swap_whole_shelf_units(self.ops_rows,source,target,catalog,local);message=f"Swapped shelves: {first_unit} ({first_count} SKUs) ↔ {second_unit} ({second_count} SKUs)"
                 row=next(row for row in self.ops_rows if row.get("handling_unit_id")==first_unit)
         except ValueError as exc:messagebox.showerror("Swap failed",str(exc));return False
+        self.ops_payload.setdefault("summary", {})["zone_storage_types"] = (
+            self.slotting.derive_zone_storage_types(self.ops_rows)
+        )
         event={"timestamp":timestamp,"type":mode,"source":source,"target":target,"message":message};self.ops_payload.setdefault("operation_log",[]).append(event);self.ops_log.insert("end",f"{timestamp[:19]}  {message}");self.ops_log.see("end")
         self.ops_shelf_selection=[];self.ops_sku_selection=[];self.show_ops_assignment(row);self.ops_status.set(message+" · save changes to persist the demo result")
         return True
@@ -460,6 +550,164 @@ class GridMapEditorApp:
         path = filedialog.asksaveasfilename(defaultextension=".slotting.json", filetypes=[("Slotting layout", "*.slotting.json"), ("JSON", "*.json")], initialdir=str(Path(self.slot_output_path.get()).expanduser().parent), initialfile=Path(self.slot_output_path.get()).name)
         if path: self.slot_output_path.set(path)
 
+    def prepare_slot_attribute_hierarchy(self, confirm_orphans=True):
+        if not self.slot_building:
+            raise ValueError("load the building YAML before editing attributes")
+        unassigned = [
+            rack["waypoint"] for rack in self.slot_racks
+            if rack["waypoint"] not in self.slot_zone_assignments
+        ]
+        if unassigned:
+            raise ValueError(
+                f"assign a zone to all racks first; {len(unassigned)} remain unassigned"
+            )
+        levels = int(self.slot_levels.get())
+        slots = int(self.slot_slots.get())
+        self.slotting.apply_zone_local_aisles(
+            self.slot_building, self.slot_racks, self.slot_zone_assignments,
+            self.slot_zone.get() or "Z01",
+        )
+        self.ensure_zone_storage_settings()
+        paths = self.attributes.hierarchy_paths(self.slot_racks, levels, slots)
+        orphaned = sorted(set(self.slot_location_attributes) - set(paths))
+        if orphaned:
+            if confirm_orphans and not messagebox.askyesno(
+                "Hierarchy changed",
+                f"{len(orphaned)} attribute path(s) no longer exist after the zone or "
+                "capacity change. Discard those local values?",
+            ):
+                raise ValueError("attribute update cancelled; restore the previous hierarchy")
+            self.slot_location_attributes = {
+                path: values for path, values in self.slot_location_attributes.items()
+                if path in paths
+            }
+        self.slot_hierarchy_paths = paths
+        return paths
+
+    def ensure_zone_storage_settings(self):
+        starter = self.attributes.starter_catalog()
+        for key, definition in starter.items():
+            self.slot_attribute_catalog.setdefault(key, definition)
+        zones = sorted({rack["zone_id"] for rack in self.slot_racks})
+        for zone in zones:
+            values = self.slot_location_attributes.setdefault(zone, {})
+            for key, value in STANDARD_STORAGE_DEFAULTS.items():
+                values.setdefault(key, value)
+            values.setdefault("chilled", False)
+        self.slot_storage_initialized = True
+
+    def open_zone_storage_settings(self):
+        try:
+            self.prepare_slot_attribute_hierarchy()
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("Zone storage settings", str(exc)); return
+        editor = ZoneStorageSettingsEditor(
+            self.root,
+            self.attributes,
+            [path for path in self.slot_hierarchy_paths if "/" not in path],
+            self.slot_location_attributes,
+            self.apply_zone_storage_settings,
+        )
+        editor.grab_set()
+
+    def apply_zone_storage_settings(self, location_attributes):
+        self.slot_location_attributes = dict(location_attributes)
+        unverified_note = (
+            " Missing physical data will remain visibly unverified."
+        )
+        self.slot_summary.set(
+            f"Saved storage settings for {len([p for p in location_attributes if '/' not in p])} zone(s)."
+            + unverified_note
+        )
+
+    def open_attribute_editor(self):
+        try:
+            paths = self.prepare_slot_attribute_hierarchy()
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("Hierarchy attributes", str(exc)); return
+        editor = HierarchyAttributeEditor(
+            self.root,
+            self.attributes,
+            self.slot_attribute_catalog,
+            self.slot_location_attributes,
+            paths,
+            self.apply_slot_attributes,
+        )
+        editor.grab_set()
+
+    def apply_slot_attributes(self, catalog, location_attributes):
+        self.slot_attribute_catalog = dict(catalog)
+        self.slot_location_attributes = dict(location_attributes)
+        self.slot_summary.set(
+            f"Saved {len(self.slot_attribute_catalog)} attribute definition(s) and "
+            f"{len(self.slot_location_attributes)} node(s) with local values."
+        )
+
+    def load_slotting_configuration(self, path=None):
+        if path is None:
+            path = filedialog.askopenfilename(
+                filetypes=[("Slotting layout", "*.slotting.json"), ("JSON", "*.json")],
+                initialdir=str(Path(self.slot_output_path.get()).expanduser().parent),
+            )
+        if not path:
+            return
+        try:
+            layout_path = Path(path).expanduser().resolve()
+            payload = self.layouts.load(layout_path)
+            building = payload["building"]
+            _, racks, workstations, unreachable = self.slotting.rack_distances(building)
+            capacity = payload.get("rack_capacity", {})
+            levels = int(capacity.get("levels", 1))
+            slots = int(capacity.get("slots_per_level", 6))
+            zones = dict(payload.get("zone_assignments", {}))
+            default_zone = next(iter(zones.values()), "Z01")
+            self.slotting.apply_zone_local_aisles(building, racks, zones, default_zone)
+            paths = self.attributes.hierarchy_paths(racks, levels, slots)
+            catalog = self.attributes.normalize_catalog(payload.get("attribute_catalog"))
+            local = self.attributes.validate_location_attributes(
+                payload.get("location_attributes"), catalog, paths
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, yaml.YAMLError) as exc:
+            messagebox.showerror("Layout configuration load failed", str(exc)); return
+        source_building = payload.get("sources", {}).get("building_yaml", "")
+        source_velocity = payload.get("sources", {}).get("sku_velocity_csv", "")
+        source_chilled = payload.get("sources", {}).get("chilled_requirements_csv", "")
+        if source_building:
+            self.slot_building_path.set(source_building)
+        if source_velocity:
+            self.slot_velocity_path.set(source_velocity)
+        self.slot_chilled_path.set(source_chilled)
+        self.slot_building = building
+        self.slot_racks = racks
+        self.slot_loaded_path = Path(self.slot_building_path.get()).expanduser().resolve()
+        self.slot_zone_assignments = zones
+        self.slot_levels.set(str(levels)); self.slot_slots.set(str(slots))
+        self.slot_strategy.set(payload.get("strategy", "basic"))
+        self.slot_handling_unit.set(payload.get("handling_unit_type", "AMR shelf"))
+        self.slot_attribute_catalog = catalog or self.attributes.starter_catalog()
+        self.slot_location_attributes = local
+        self.slot_hierarchy_paths = paths
+        self.slot_storage_initialized = any(
+            "/" not in path
+            and all(key in values for key in PHYSICAL_ATTRIBUTE_KEYS)
+            for path, values in local.items()
+        )
+        self.slot_rows = payload.get("assignments", [])
+        self.slot_zone_storage_types = payload.get("summary", {}).get(
+            "zone_storage_types", {}
+        )
+        self.slot_output_path.set(str(layout_path))
+        self.slot_selected_rack = None; self.slot_zone_mode.set(False)
+        self.show_slotting_rows(self.slot_rows); self.draw_slotting_layout()
+        self.slot_summary.set(
+            f"Restored {len(racks)} racks, {len(set(zones.values()))} zones, "
+            f"{len(local)} attributed nodes and {len(self.slot_rows):,} assignments · "
+            f"{workstations} workstations · {unreachable} unreachable"
+        )
+        self.slot_rack_detail.set(
+            "Previous layout configuration restored. Edit attributes or regenerate."
+        )
+
     def load_slot_building(self):
         try:
             path=Path(self.slot_building_path.get()).expanduser().resolve()
@@ -469,6 +717,9 @@ class GridMapEditorApp:
             messagebox.showerror("Building map load failed",str(exc)); return
         self.slot_building=building; self.slot_racks=racks; self.slot_loaded_path=path
         self.slot_zone_assignments={}; self.slot_rows=[]; self.slot_selected_rack=None
+        self.slot_attribute_catalog=self.attributes.starter_catalog(); self.slot_location_attributes={}; self.slot_hierarchy_paths=[]
+        self.slot_storage_initialized=False
+        self.slot_zone_storage_types={}
         self.slot_zone.set("Z01")
         self.slot_zone_drag_start=None; self.slot_zone_drag_current=None; self.slot_zone_mode.set(True)
         self.show_slotting_rows([]); self.draw_slotting_layout()
@@ -482,6 +733,7 @@ class GridMapEditorApp:
     def clear_slot_zones(self):
         if not self.slot_building: return
         self.slot_zone_assignments={}; self.slot_rows=[]; self.slot_selected_rack=None; self.slot_zone_mode.set(True)
+        self.slot_zone_storage_types={}
         self.slot_zone.set("Z01")
         self.show_slotting_rows([]); self.draw_slotting_layout()
         self.slot_summary.set(f"Cleared zone assignments for {len(self.slot_racks)} racks.")
@@ -527,17 +779,43 @@ class GridMapEditorApp:
             current_path=Path(self.slot_building_path.get()).expanduser().resolve()
             if self.slot_building is None or self.slot_loaded_path!=current_path:
                 raise ValueError("load the selected building YAML before generating")
-            unassigned=[rack["waypoint"] for rack in self.slot_racks if rack["waypoint"] not in self.slot_zone_assignments]
-            if unassigned:
-                raise ValueError(f"assign a zone to all racks first; {len(unassigned)} remain unassigned")
+            self.prepare_slot_attribute_hierarchy()
             building=self.slot_building
-            skus=self.slotting.load_velocity(Path(self.slot_velocity_path.get()).expanduser())
+            skus=self.slotting.load_velocity(
+                Path(self.slot_velocity_path.get()).expanduser(),
+                self.slot_attribute_catalog,
+                (
+                    Path(self.slot_chilled_path.get()).expanduser()
+                    if self.slot_chilled_path.get().strip()
+                    else None
+                ),
+            )
             levels=int(self.slot_levels.get()); slots=int(self.slot_slots.get())
-            rows, summary = self.slotting.generate_basic(building, skus, levels, slots, self.slot_handling_unit.get(), self.slot_zone.get(), self.slot_zone_assignments)
-            self.layouts.save(rows,building,summary,Path(self.slot_output_path.get()).expanduser(),strategy=self.slot_strategy.get(),handling_unit_type=self.slot_handling_unit.get(),levels_per_rack=levels,slots_per_level=slots,zone_assignments=self.slot_zone_assignments,source_building=str(current_path),source_velocity=str(Path(self.slot_velocity_path.get()).expanduser().resolve()))
+            rows, summary = self.slotting.generate_basic(
+                building, skus, levels, slots, self.slot_handling_unit.get(),
+                self.slot_zone.get(), self.slot_zone_assignments,
+                self.slot_attribute_catalog, self.slot_location_attributes,
+            )
+            self.layouts.save(
+                rows, building, summary, Path(self.slot_output_path.get()).expanduser(),
+                strategy=self.slot_strategy.get(),
+                handling_unit_type=self.slot_handling_unit.get(),
+                levels_per_rack=levels, slots_per_level=slots,
+                zone_assignments=self.slot_zone_assignments,
+                attribute_catalog=self.slot_attribute_catalog,
+                location_attributes=self.slot_location_attributes,
+                source_building=str(current_path),
+                source_velocity=str(Path(self.slot_velocity_path.get()).expanduser().resolve()),
+                source_chilled=(
+                    str(Path(self.slot_chilled_path.get()).expanduser().resolve())
+                    if self.slot_chilled_path.get().strip()
+                    else ""
+                ),
+            )
         except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
             messagebox.showerror("Slotting generation failed", str(exc)); return
         self.slot_rows = rows
+        self.slot_zone_storage_types = summary["zone_storage_types"]
         self.slotting.apply_zone_local_aisles(building,self.slot_racks,self.slot_zone_assignments,self.slot_zone.get())
         self.slot_selected_rack = None
         self.slot_zone_mode.set(False)
@@ -546,15 +824,28 @@ class GridMapEditorApp:
         self.slot_rack_detail.set("Click a coloured rack point on the map to inspect its assignments.")
         self.slot_summary.set(
             f"Assigned {summary['assigned_count']:,}/{summary['sku_count']:,} SKUs · "
+            f"unassigned {summary['unassigned_count']:,} · "
+            f"temperature-zone shortage "
+            f"{summary['unassigned_status_counts'].get('UNASSIGNED_NO_CHILLED_LOCATION', 0) + summary['unassigned_status_counts'].get('UNASSIGNED_NO_AMBIENT_LOCATION', 0):,} · "
+            f"all slots occupied {summary['unassigned_no_capacity_count']:,} · "
             f"{summary['rack_count']} racks ({summary['unreachable_rack_count']} unreachable) · "
             f"{summary['workstation_count']} workstations · {summary['zone_count']} zones · capacity {summary['capacity']:,} · "
+            f"unverified physical data {summary['unverified_oversize_count']:,} "
+            f"({summary['assigned_unverified_count']:,} assigned with warning) · "
+            f"auto slot overrides {summary['auto_overridden_slot_count']:,} · "
+            f"generated zone types "
+            + ", ".join(
+                f"{zone}={storage_type}"
+                for zone, storage_type in summary["zone_storage_types"].items()
+            )
+            + " · "
             f"saved to {self.slot_output_path.get()}"
         )
 
     def show_slotting_rows(self, rows):
         self.slot_tree.delete(*self.slot_tree.get_children())
         for row in rows[:1000]:
-            self.slot_tree.insert("", "end", values=(row["sku_rank"], row["sku"], row["velocity_class"], row["static_address"], row["dynamic_address"], row["handling_unit_type"], row["handling_unit_id"], row["assignment_status"]))
+            self.slot_tree.insert("", "end", values=(row["sku_rank"], row["sku"], row["velocity_class"], self.sku_storage_flags(row), row["static_address"], row["dynamic_address"], row["handling_unit_type"], row["handling_unit_id"], row["assignment_status"]))
 
     def slotting_geometry(self, vertices):
         xs=[float(v[0]) for v in vertices]; ys=[float(v[1]) for v in vertices]
@@ -625,11 +916,25 @@ class GridMapEditorApp:
         if not rack: return
         classes={label:sum(row["velocity_class"]==label for row in rows) for label in ("A","B","C")}
         unit_ids=sorted({row["handling_unit_id"] for row in rows})
+        bay_path = f"{rack.get('zone_id','UNASSIGNED')}/{rack['aisle_id']}/{rack['static_bay_id']}"
+        effective, _sources = self.attributes.effective_attributes(
+            bay_path, self.slot_location_attributes
+        )
+        chilled_count, exception_count = self.rack_storage_flag_counts(rows)
         self.slot_rack_detail.set(
             f"Static grid rack: {rack_id}\nPickup dispenser: {rack['pickup_dispenser_id']} · vertex {rack['vertex_index']}\n"
             f"Current static address: {rows[0]['static_address'] if rows else rack.get('zone_id','UNASSIGNED')+'/'+rack['aisle_id']+'/'+rack['static_bay_id']+'/L--/S--'}\n"
+            f"Generated zone storage type: {self.slot_zone_storage_types.get(rack.get('zone_id', ''), 'UNUSED')}\n"
             f"Assigned SKUs: {len(rows)} · A {classes['A']} / B {classes['B']} / C {classes['C']}\n"
-            f"Handling unit(s): {', '.join(unit_ids) if unit_ids else 'none'}"
+            f"Storage flags: CHILLED={chilled_count} · OVERSIZE / WEIGHT EXCEPTION={exception_count}\n"
+            f"Physical classes: "
+            + (", ".join(
+                f"{key}={sum(row.get('physical_storage_class') == key for row in rows)}"
+                for key in ("STANDARD", "OVERSIZE", "OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT", "UNVERIFIED_OVERSIZE")
+                if any(row.get('physical_storage_class') == key for row in rows)
+            ) or "not evaluated") + "\n"
+            f"Handling unit(s): {', '.join(unit_ids) if unit_ids else 'none'}\n"
+            f"Effective bay attributes: {self.attributes.format_values(effective)}"
         )
 
     def spec_from_inputs(self) -> GridSpec:

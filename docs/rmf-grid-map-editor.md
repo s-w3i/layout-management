@@ -84,9 +84,12 @@ The **Inventory Slotting** tab accepts:
 - An RMF `.building.yaml` containing rack `pickup_dispenser` points and
   workstation `dropoff_ingestor` points
 - The ABC SKU velocity summary CSV
+- An optional selected-SKU chilled requirements CSV
 - A strategy selected from the dropdown
 - The handling-unit model: AMR shelf, tote, or pallet
 - Levels and slots per rack
+- Optional typed hierarchy attributes and matching `req_<attribute_key>` CSV
+  columns
 
 Use this workflow:
 
@@ -96,8 +99,18 @@ Use this workflow:
 4. Repeat until every rack belongs to a zone. After each successful rectangle,
    the ID advances automatically to `Z02`, `Z03`, and so on. IDs such as
    `ZONE_001` advance to `ZONE_002` while preserving their numeric width.
-5. Browse for the ABC SKU velocity CSV.
-6. Select the strategy and handling-unit type, then generate the layout.
+5. Set levels and slots, then click **Zone storage settings…**. Limits default
+   to 15 × 16 × 13 and weight 250 in unconfirmed source units. No zone is
+   pre-labelled or automatically enlarged for oversize storage.
+6. Mark actual chilled zones. Chilled defaults to false and is never inferred
+   from the map.
+7. Use **Advanced attributes…** for extra inherited values or lower-level
+   overrides. A child slot can use larger limits such as the sample maximums
+   150 × 50 × 95 and weight 640 while its parent zone remains normal.
+8. Browse for the ABC SKU velocity CSV and optional chilled CSV. Physical
+   requirement columns are `req_max_item_length`, `req_max_item_width`,
+   `req_max_item_height`, and `req_max_item_weight`.
+9. Select the strategy and handling-unit type, then generate the layout.
 
 Racks are coloured by zone while grouping. Generation is blocked until all
 racks have a zone. After generation, rectangle mode turns off and rack colours
@@ -107,8 +120,32 @@ numbered independently inside every zone, so each zone starts at `A01`.
 
 The demo **basic** strategy calculates the shortest directed graph route from
 each rack to every workstation, then uses the average of those route distances
-as the rack score. It sorts SKUs by ABC class and pick frequency and fills the
-lowest-average-distance rack positions first.
+as the rack score. It sorts SKUs by ABC class and pick frequency, checks chilled
+exclusivity first, then uses rotation-aware dimensions, weight, and custom
+attributes as best-fit preferences. Chilled versus ambient is the only hard
+storage boundary. If a matching-temperature slot needs different soft values,
+the generator writes local overrides on that child slot and assigns the SKU.
+Missing physical data is assigned with an `UNVERIFIED` warning. A general
+not-enough-space result occurs only when every slot is occupied.
+
+Chilled and ambient capacity is counted separately because neither category may
+use slots from the other. The result distinguishes this temperature-zone
+shortage from global not-enough-space.
+
+An automatic override is recommendation metadata, not a physical modification
+to a rack. Validate generated limits against real equipment before production.
+Racks without a complete route to every workstation rank last but remain usable
+and receive `UNREACHABLE_LAST_RESORT` when selected.
+
+Zone storage type is generated after allocation from actual contents:
+`STANDARD`, `OVERSIZE`, `MIXED`, or `UNUSED`. It is output metadata and is not a
+pre-generation zone role. Compatibility always uses the effective slot values,
+including child overrides inherited from or replacing parent values.
+
+Local attributes are stored against full static hierarchy paths, so `Z01/A01`
+and `Z02/A01` are independent. Children inherit ancestor values and can override
+them; clearing a local value restores inheritance. **Load previous layout…**
+restores this configuration from a v2 slotting JSON.
 
 The generated slotting JSON contains both address levels:
 

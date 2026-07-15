@@ -27,13 +27,13 @@ the bottom-left point of a generated map, and positive Y points upward.
 
 - Python 3.10 or newer
 - Tkinter
-- PyYAML
+- PyYAML, openpyxl and matplotlib
 
 On Ubuntu or Debian, install the required packages with:
 
 ```bash
 sudo apt install python3 python3-tk python3-pip
-python3 -m pip install PyYAML
+python3 -m pip install PyYAML openpyxl matplotlib
 ```
 
 Clone the public repository and start the application:
@@ -61,10 +61,11 @@ For a new warehouse, use the tabs in this order:
 3. Save the editable project and export the RMF building YAML.
 4. Open **Inventory Slotting** and load the building YAML.
 5. Group every rack into a zone.
-6. Load the ABC SKU velocity CSV and generate the slotting layout.
-7. Open **Inventory Operations Demo** and load the generated `.slotting.json`.
-8. Search for SKUs or demonstrate position swaps.
-9. Save operation-demo changes to a new JSON file when required.
+6. Review the automatically initialized zone capacities and mark real chilled zones.
+7. Load the ABC SKU velocity CSV and optional chilled-requirements CSV, then generate the slotting layout.
+8. Open **Inventory Operations Demo** and load the generated `.slotting.json`.
+9. Search for SKUs or demonstrate position swaps.
+10. Save operation-demo changes to a new JSON file when required.
 
 To use the included demonstration map, start directly from the Inventory
 Slotting tab. Its default building file is:
@@ -159,6 +160,7 @@ The default inputs are:
 |---|---|
 | Building YAML | `resources/map/demo.building.yaml` |
 | ABC SKU velocity CSV | `resources/data/sku_velocity_output/sku_velocity_summary.csv` |
+| Chilled SKU CSV | `resources/data/demo_chilled_requirements.csv` |
 | Output layout | `resources/data/basic_slotting_layout.slotting.json` |
 
 The YAML must contain at least one rack with `pickup_dispenser` and at least one
@@ -169,6 +171,20 @@ The SKU CSV must contain these columns:
 - `sku`
 - `pick_frequency`
 - `velocity_class`
+
+It may also contain typed storage requirements using `req_<attribute_key>`
+columns. For example:
+
+```csv
+sku,pick_frequency,velocity_class,req_max_item_length,req_max_item_width,req_max_item_height,req_max_item_weight
+SKU_001,120,A,12,8,6,25
+SKU_002,80,B,20,10,8,270
+```
+
+A blank custom requirement means that the SKU does not constrain that custom
+attribute. A blank core dimension or weight is instead treated as missing
+physical data and classifies the SKU as `UNVERIFIED_OVERSIZE`. Requirement keys
+must exist in the attribute catalog before generation.
 
 The included compact CSV is ready for the demo. To analyse another warehouse,
 place its transaction workbook under `resources/data/` and follow the
@@ -224,23 +240,108 @@ Select:
 The handling-unit choice controls where the dynamic identity appears in the
 address. See [Inventory address rules](#inventory-address-rules).
 
+### Configure zone storage settings
+
+Click **Zone storage settings…** after grouping the racks. The application
+initializes all zones with these source-unit demo limits:
+
+| Storage | Length | Width | Height | Weight |
+|---|---:|---:|---:|---:|
+| Standard | 15 | 16 | 13 | 250 |
+
+No zone is designated as oversize before generation. Change the capacity values
+only to match real storage limits. The units are deliberately labelled as
+unconfirmed source units; the demo does not perform a centimetre, millimetre,
+gram or kilogram conversion.
+
+Mark only physically chilled zones with the **Chilled area** checkbox. Chilled
+defaults to false because it cannot be inferred safely from an RMF map. Zone
+values inherit down to every aisle, bay, level and slot.
+
+Use **Advanced attributes…** to give a particular aisle, bay, level, or slot a
+larger capacity than its parent. For the sample data, 150 × 50 × 95 and weight
+640 are available as reference maximum values, but they are not automatically
+applied to a zone. An oversize SKU can therefore use an enlarged child slot
+inside an otherwise normal zone.
+
+### Configure advanced hierarchy attributes
+
+After assigning every rack to a zone and setting the rack capacity, click
+**Advanced attributes…**. The editor uses the static hierarchy:
+
+```text
+Zone → Aisle → Bay → Level → Slot
+```
+
+The starter catalog contains `chilled`, `max_item_length`, `max_item_width`,
+`max_item_height`, and `max_item_weight`. You can add reusable
+boolean, number, text, or choice definitions. Exact matching is available for
+all types; numeric attributes can use capacity matching, where the location
+value must be at least the SKU requirement.
+
+Select one or several hierarchy nodes to apply a value in bulk. Values inherit
+downward. A child can override an inherited value, and **Clear local value**
+removes the override so inheritance applies again. The effective-values table
+shows both the final value and the ancestor that supplied it. Values never
+inherit upward.
+
+If zones or rack capacity change, values on unchanged address paths are kept.
+The application asks before discarding values whose paths no longer exist.
+Use **Load previous layout…** to restore zones, capacity, catalog, local values,
+and assignments from an existing `.slotting.json`.
+
 ### Generate the slotting layout
 
 1. Confirm that every rack has a zone.
 2. Confirm the SKU CSV and output paths.
 3. Select the handling unit and rack capacity.
-4. Click **Generate slotting layout**.
+4. Review zone limits and chilled areas; optionally add advanced attributes.
+5. Confirm or clear the optional chilled-SKU CSV path.
+6. Click **Generate slotting layout**.
 
 The **basic** strategy:
 
 1. Calculates the directed route distance from each rack to every workstation.
 2. Uses the average distance across all workstations as the rack score.
-3. Sorts SKUs by A, B, C class and then by descending pick frequency.
-4. Assigns the highest-velocity SKUs to positions with the lowest average route
-   distance.
+3. Sorts and allocates all class A inventory before B, and all B before C.
+4. Within each ABC class, groups standard and physical-exception SKUs, then
+   applies descending pick frequency.
+5. Fills an existing rack of the same ABC and physical group before opening a
+   new rack. Another ABC class enters that rack only when dedicated capacity is
+   exhausted, so mixing is limited to transition racks.
+6. Uses ambient versus chilled as the only hard location boundary.
+7. Prefers a slot that already satisfies dimensions, weight, and custom
+   requirements. When oversize inventory must share a rack with standard
+   inventory, oversize and unverified-oversize SKUs use L03 (or the highest
+   available level when the rack has fewer than three levels).
+8. If a matching-temperature slot needs different soft attributes, writes
+   those requirements as local child-slot overrides and assigns the SKU.
+9. Uses average workstation distance to rank otherwise equivalent racks and
+   returns general not-enough-space only after every storage slot is occupied.
 
-If a rack cannot reach every workstation through the directed RMF graph, it is
-marked unreachable and is not used for assignment.
+Chilled SKUs still require chilled slots and ambient SKUs require non-chilled
+slots. If one temperature category has insufficient slots, the result reports a
+temperature-zone shortage even when the opposite category has empty capacity.
+
+The optional chilled CSV contains `sku,chilled_required`. Only selected chilled
+SKUs need rows; all absent SKUs are ambient. The included file selects 10% of
+the 1,524 sample SKUs with seed 42. Invalid booleans, duplicates, unknown SKUs,
+or conflicts with `req_chilled` stop generation.
+
+An SKU with missing physical data is assigned to an available slot and remains
+`UNVERIFIED`. Complete oversize, overweight, and custom requirements can produce
+`COMPATIBLE_AUTO_OVERRIDE`. The generated local override records what the slot
+would need to support; it does not physically increase rack capacity. Production
+users must validate generated overrides against the actual equipment.
+
+After allocation, each zone receives a generated result type: `STANDARD` when
+it holds only standard SKUs, `OVERSIZE` when it holds only exception or
+unverified SKUs, `MIXED` when it holds both, and `UNUSED` when empty. This is
+output metadata—not a zone setting used to restrict allocation.
+
+If a rack cannot reach every workstation through the directed RMF graph, it
+ranks after reachable racks but remains usable storage. An assignment on it is
+marked `UNREACHABLE_LAST_RESORT`.
 
 ### Inspect the result
 
@@ -253,10 +354,16 @@ After generation:
 - Blue diamonds are workstations.
 
 Click a rack to view all assigned SKUs and their complete static and dynamic
-addresses. Use **Show all assignments** to return to the complete table.
+addresses. The **Storage flags** column marks each row as `CHILLED`, `OVERSIZE`,
+`OVERWEIGHT`, `UNVERIFIED OVERSIZE`, or `STANDARD AMBIENT`; combined conditions
+show multiple flags. The rack summary also shows chilled and physical-exception
+counts. Use **Show all assignments** to return to the complete table.
 
-The generated `.slotting.json` is self-contained. It stores the building map,
-zone assignments, strategy settings, inventory assignments, and operation log.
+The generated v2 `.slotting.json` is self-contained. It stores the building
+map, zone assignments, zone limits, chilled input metadata, strategy settings,
+attribute catalog, local hierarchy values, physical SKU requirements,
+generated slot overrides, inventory assignments, and operation log. Existing
+v1 files remain loadable and are normalized with an empty attribute model.
 
 ## 3. Inventory Operations Demo tab
 
@@ -264,7 +371,8 @@ zone assignments, strategy settings, inventory assignments, and operation log.
 
 1. Confirm or browse for the `.slotting.json` file.
 2. Click **Load layout**.
-3. Click any occupied rack to display every SKU in that rack.
+3. Click any occupied rack to display every SKU in that rack, including the
+   same chilled and physical-exception storage flags shown during slotting.
 
 ### Search for a SKU
 
@@ -272,7 +380,8 @@ zone assignments, strategy settings, inventory assignments, and operation log.
 2. Click **Search**.
 
 The application highlights the current rack and shows the SKU's static address,
-dynamic address, handling-unit ID, and RMF grid position.
+dynamic address, handling-unit ID, RMF grid position, requirements, effective
+location attributes, and compatibility state.
 
 ### Swap two SKU slots
 
@@ -285,6 +394,8 @@ dynamic address, handling-unit ID, and RMF grid position.
 
 The two SKU records exchange their complete location assignments. Selecting the
 rows does not change inventory; the change occurs only after Execute is clicked.
+Both target locations are checked first. A chilled/ambient mismatch rejects the
+complete swap; other requirements create local overrides on the target slots.
 
 ### Swap two AMR shelves
 
@@ -299,6 +410,9 @@ Whole-shelf swapping is available only for layouts generated with **AMR shelf**.
 
 Every SKU remains tied to its movable shelf ID while the two shelves exchange
 fixed rack positions. Static and dynamic addresses are recalculated.
+Every SKU on both shelves is validated before anything moves. A chilled/ambient
+mismatch rejects the complete swap atomically; soft requirements are recorded
+as target-slot overrides before movement is applied.
 
 Tote and pallet layouts do not use whole-shelf swap because their movable IDs
 exist at slot level.
@@ -384,12 +498,16 @@ layout_management_master/
 ├── warehouse_layout/
 │   ├── cli.py                                     CLI application controller
 │   ├── config.py                                  Paths and schema constants
+│   ├── attributes.py                              Inheritance and compatibility service
+│   ├── attribute_editor.py                        Hierarchy attribute editor
+│   ├── zone_settings_editor.py                    Core zone-capacity editor
 │   ├── domain.py                                  Grid domain models
 │   ├── gui.py                                     Tkinter application class
 │   ├── inventory.py                               Search and swap service
 │   ├── rmf.py                                     RMF/project persistence service
 │   └── slotting.py                                Routing, addressing and slotting
 ├── tests/
+│   ├── test_attributes.py                         Attribute and compatibility tests
 │   └── test_services.py                           Service regression tests
 ├── docs/
 │   ├── README.md                                  Documentation index
@@ -398,6 +516,7 @@ layout_management_master/
 └── resources/
     ├── data/
     │   ├── Sample Data.xlsx                     Optional local input (ignored)
+    │   ├── demo_chilled_requirements.csv        Seeded chilled demo input
     │   ├── basic_slotting_layout.slotting.json  Generated output (ignored)
     │   └── sku_velocity_output/
     │       ├── sku_velocity_summary.csv
@@ -420,6 +539,8 @@ is organized by responsibility inside the `warehouse_layout` package:
 | `slotting.py` | `SlottingService` | Rack routing, zone-local aisles, dynamic addresses and basic slotting |
 | `slotting.py` | `SlottingLayoutRepository` | Read/write self-contained slotting JSON |
 | `inventory.py` | `InventoryService` | SKU lookup, SKU-slot swap and AMR-shelf swap |
+| `attributes.py` | `StorageAttributeService` | Inheritance, physical classification and compatibility |
+| `zone_settings_editor.py` | `ZoneStorageSettingsEditor` | Chilled and physical capacity input by zone |
 | `gui.py` | `GridMapEditorApp` | Tkinter widgets and user interaction |
 | `cli.py` | `GridMapEditorCommand` | Command-line parsing and application startup |
 

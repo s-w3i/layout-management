@@ -10,15 +10,28 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import SLOTTING_SCHEMA
+from .attributes import (
+    OVERSIZE_STORAGE_DEFAULTS,
+    PHYSICAL_ATTRIBUTE_KEYS,
+    PHYSICAL_DIMENSION_KEYS,
+    PHYSICAL_WEIGHT_KEY,
+    STANDARD_STORAGE_DEFAULTS,
+    StorageAttributeService,
+)
+from .config import LEGACY_SLOTTING_SCHEMA, SLOTTING_SCHEMA
 from .rmf import RmfMapService
 
 
 class SlottingService:
     """Generate warehouse slotting recommendations from RMF and ABC inputs."""
 
-    def __init__(self, rmf_maps: RmfMapService | None = None):
+    def __init__(
+        self,
+        rmf_maps: RmfMapService | None = None,
+        attributes: StorageAttributeService | None = None,
+    ):
         self.rmf_maps = rmf_maps or RmfMapService()
+        self.attributes = attributes or StorageAttributeService()
 
     @staticmethod
     def next_zone_id(zone_id: str) -> str:
@@ -55,12 +68,103 @@ class SlottingService:
                 ratios.append(real_distance / drawing_distance)
         return sorted(ratios)[len(ratios) // 2] if ratios else 1.0
 
-    def load_velocity(self, path: Path) -> list[dict]:
+    def load_chilled_requirements(
+        self, path: Path, known_skus: set[str]
+    ) -> dict[str, bool]:
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        required = {"sku", "chilled_required"}
+        if not rows or not required.issubset(rows[0]):
+            raise ValueError(
+                "chilled SKU CSV must contain: sku, chilled_required"
+            )
+        chilled_definition = self.attributes.starter_catalog()["chilled"]
+        values: dict[str, bool] = {}
+        for row_number, row in enumerate(rows, start=2):
+            sku = str(row.get("sku", "")).strip()
+            if not sku:
+                raise ValueError(f"chilled SKU CSV row {row_number}: SKU is blank")
+            if sku in values:
+                raise ValueError(f"chilled SKU CSV contains duplicate SKU: {sku}")
+            if sku not in known_skus:
+                raise ValueError(f"chilled SKU CSV references unknown SKU: {sku}")
+            try:
+                values[sku] = self.attributes.parse_value(
+                    chilled_definition, row.get("chilled_required")
+                )
+            except ValueError as exc:
+                raise ValueError(f"chilled SKU CSV row {row_number}: {exc}") from exc
+        return values
+
+    def load_velocity(
+        self,
+        path: Path,
+        attribute_catalog=None,
+        chilled_path: Path | None = None,
+    ) -> list[dict]:
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
         required = {"sku", "pick_frequency", "velocity_class"}
         if not rows or not required.issubset(rows[0]):
             raise ValueError(f"SKU CSV must contain: {', '.join(sorted(required))}")
+        catalog = self.attributes.normalize_catalog(attribute_catalog)
+        unknown_columns = sorted(
+            column
+            for column in rows[0]
+            if column.startswith("req_") and column[4:] not in catalog
+        )
+        if unknown_columns:
+            raise ValueError(
+                "unknown SKU requirement column(s): " + ", ".join(unknown_columns)
+            )
+        sku_ids = [str(row.get("sku", "")).strip() for row in rows]
+        if any(not sku for sku in sku_ids):
+            raise ValueError("SKU CSV contains a blank SKU")
+        if len(set(sku_ids)) != len(sku_ids):
+            raise ValueError("SKU CSV contains duplicate SKU values")
+        chilled_values = (
+            self.load_chilled_requirements(chilled_path, set(sku_ids))
+            if chilled_path is not None
+            else None
+        )
+        for row_number, row in enumerate(rows, start=2):
+            try:
+                requirements = self.attributes.requirements_from_row(row, catalog)
+                for key in PHYSICAL_ATTRIBUTE_KEYS:
+                    if key in requirements and float(requirements[key]) <= 0:
+                        raise ValueError(
+                            f"req_{key} must be greater than zero when provided"
+                        )
+                if "chilled" in catalog:
+                    raw_chilled = row.get("req_chilled")
+                    velocity_has_chilled = (
+                        raw_chilled is not None and str(raw_chilled).strip() != ""
+                    )
+                    file_value = (
+                        chilled_values.get(sku_ids[row_number - 2], False)
+                        if chilled_values is not None
+                        else None
+                    )
+                    if (
+                        file_value is not None
+                        and velocity_has_chilled
+                        and requirements.get("chilled") != file_value
+                    ):
+                        raise ValueError(
+                            "conflicting chilled requirement between velocity and "
+                            "chilled CSV"
+                        )
+                    if file_value is not None:
+                        requirements["chilled"] = file_value
+                    elif not velocity_has_chilled:
+                        requirements["chilled"] = False
+                row["sku_requirements"] = requirements
+                if self.attributes.has_physical_catalog(catalog):
+                    profile = self.attributes.physical_profile(requirements)
+                    row["physical_data_status"] = profile["data_status"]
+                    row["physical_storage_class"] = profile["storage_class"]
+            except ValueError as exc:
+                raise ValueError(f"SKU CSV row {row_number}: {exc}") from exc
         return rows
 
     def load_inputs(self, building_path: Path, velocity_path: Path) -> tuple[dict, list[dict]]:
@@ -189,6 +293,172 @@ class SlottingService:
                 ):
                     rack["bay_order"] = bay_order
 
+    def _candidate_sort_key(
+        self, candidate: dict, profile: dict, physical_enabled: bool
+    ) -> tuple:
+        effective = candidate["effective_location_attributes"]
+        waste = 0.0
+        if physical_enabled and profile["data_status"] == "COMPLETE":
+            try:
+                item_dimensions = sorted(
+                    float(profile["values"][key]) for key in PHYSICAL_DIMENSION_KEYS
+                )
+                location_dimensions = sorted(
+                    float(effective[key]) for key in PHYSICAL_DIMENSION_KEYS
+                )
+                dimension_waste = sum(
+                    max(0.0, capacity - item) / max(capacity, 1.0)
+                    for item, capacity in zip(item_dimensions, location_dimensions)
+                )
+                weight_capacity = float(effective[PHYSICAL_WEIGHT_KEY])
+                weight_waste = max(
+                    0.0,
+                    weight_capacity - float(profile["values"][PHYSICAL_WEIGHT_KEY]),
+                ) / max(weight_capacity, 1.0)
+                waste = dimension_waste + weight_waste
+            except (KeyError, TypeError, ValueError):
+                waste = 0.0
+        return (
+            waste,
+            int(candidate["level"]),
+            float(candidate["distance_m"]),
+            int(candidate["rack_rank"]),
+            int(candidate["slot"]),
+        )
+
+    @staticmethod
+    def _physical_allocation_bucket(profile: dict, physical_enabled: bool) -> str:
+        if not physical_enabled:
+            return "STANDARD"
+        return (
+            "STANDARD"
+            if str(profile.get("storage_class", "")).upper() == "STANDARD"
+            else "EXCEPTION"
+        )
+
+    def _allocation_candidate_key(
+        self,
+        candidate: dict,
+        profile: dict,
+        physical_enabled: bool,
+        velocity_class: str,
+        overrides: dict,
+        rack_state: dict[str, dict],
+        levels_per_rack: int,
+    ) -> tuple:
+        """Rank a slot with ABC rack grouping ahead of physical preferences."""
+        state = rack_state.get(candidate["rack_id"], {})
+        rack_classes = state.get("velocity_classes", set())
+        rack_physical_buckets = state.get("physical_buckets", set())
+        rack_has_oversize = bool(state.get("has_oversize"))
+        physical_bucket = self._physical_allocation_bucket(
+            profile, physical_enabled
+        )
+        physical_class = str(profile.get("storage_class", "")).upper()
+        is_oversize = physical_class in {
+            "OVERSIZE", "OVERSIZE_AND_OVERWEIGHT", "UNVERIFIED_OVERSIZE",
+        }
+
+        # Empty racks and racks already holding this ABC class are preferred.
+        # A rack containing another class is used only when class-dedicated
+        # capacity has been exhausted.
+        class_mix_penalty = int(
+            bool(rack_classes) and velocity_class not in rack_classes
+        )
+
+        # Prefer a physically homogeneous rack, but keep this behind ABC class
+        # affinity. Standard inventory is especially discouraged from entering
+        # an oversize rack because an existing oversize SKU may not be on L03.
+        if not rack_physical_buckets or physical_bucket in rack_physical_buckets:
+            physical_mix_penalty = 0
+        elif physical_bucket == "EXCEPTION":
+            physical_mix_penalty = 1
+        else:
+            physical_mix_penalty = 2
+
+        preferred_oversize_level = min(3, levels_per_rack)
+        oversize_level_penalty = 0
+        if is_oversize and "STANDARD" in rack_physical_buckets:
+            oversize_level_penalty = int(
+                int(candidate["level"]) != preferred_oversize_level
+            )
+        elif physical_bucket == "STANDARD" and rack_has_oversize:
+            oversize_level_penalty = int(
+                int(candidate["level"]) == preferred_oversize_level
+            )
+
+        # Once a suitable class/physical rack is open, fill it before opening
+        # another rack. This prevents level-first allocation from spreading A,
+        # B and C inventory over every rack.
+        if rack_classes and velocity_class in rack_classes:
+            rack_reuse_penalty = 0
+        elif not rack_classes:
+            rack_reuse_penalty = 1
+        else:
+            rack_reuse_penalty = 2
+
+        return (
+            # The L03 rule is a placement constraint whenever physical classes
+            # must share a rack; it therefore wins over opening another ABC
+            # transition rack.
+            oversize_level_penalty,
+            class_mix_penalty,
+            bool(overrides),
+            len(overrides),
+            physical_mix_penalty,
+            rack_reuse_penalty,
+            self._candidate_sort_key(candidate, profile, physical_enabled),
+        )
+
+    @staticmethod
+    def derive_zone_storage_types(
+        rows: list[dict], zones: set[str] | None = None
+    ) -> dict[str, str]:
+        """Classify zones from their current assigned SKU mix, never from input roles."""
+        exception_classes = {
+            "OVERSIZE", "OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT",
+            "UNVERIFIED_OVERSIZE",
+        }
+        known_zones = set(zones or ())
+        known_zones.update(
+            str(row.get("zone_id", ""))
+            for row in rows
+            if row.get("assignment_status") == "ASSIGNED" and row.get("zone_id")
+        )
+        zone_mix = {
+            zone: {"standard": 0, "oversize": 0}
+            for zone in sorted(known_zones)
+        }
+        for row in rows:
+            if row.get("assignment_status") != "ASSIGNED":
+                continue
+            zone = str(row.get("zone_id", ""))
+            if not zone:
+                continue
+            bucket = (
+                "oversize"
+                if row.get("physical_storage_class") in exception_classes
+                else "standard"
+            )
+            zone_mix[zone][bucket] += 1
+        zone_storage_types = {}
+        for zone, counts in zone_mix.items():
+            if counts["standard"] and counts["oversize"]:
+                zone_storage_types[zone] = "MIXED"
+            elif counts["oversize"]:
+                zone_storage_types[zone] = "OVERSIZE"
+            elif counts["standard"]:
+                zone_storage_types[zone] = "STANDARD"
+            else:
+                zone_storage_types[zone] = "UNUSED"
+        for row in rows:
+            row["zone_storage_type"] = (
+                zone_storage_types.get(str(row.get("zone_id", "")), "")
+                if row.get("assignment_status") == "ASSIGNED"
+                else ""
+            )
+        return zone_storage_types
+
     @staticmethod
     def build_dynamic_address(
         zone_id: str,
@@ -220,11 +490,15 @@ class SlottingService:
         handling_unit_type: str = "AMR shelf",
         zone_id: str = "Z01",
         zone_assignments: dict[str, str] | None = None,
+        attribute_catalog=None,
+        location_attributes: dict[str, dict] | None = None,
     ) -> tuple[list[dict], dict]:
         if levels_per_rack < 1 or slots_per_level < 1:
             raise ValueError("levels and slots per level must be at least 1")
         level_name, racks, workstation_count, unreachable_count = self.rack_distances(building)
-        usable_racks = [rack for rack in racks if not math.isinf(rack["distance_m"])]
+        # Route reachability affects preference, not whether physical storage exists.
+        # Unreachable racks sort last but remain usable when capacity is needed.
+        usable_racks = list(racks)
         unit_prefix = {
             "AMR shelf": "SHELF",
             "Tote": "TOTE",
@@ -237,6 +511,13 @@ class SlottingService:
             raise ValueError("zone ID cannot be blank")
         zone_assignments = zone_assignments or {}
         self.apply_zone_local_aisles(building, racks, zone_assignments, zone_id)
+        catalog = self.attributes.normalize_catalog(attribute_catalog)
+        valid_paths = self.attributes.hierarchy_paths(
+            racks, levels_per_rack, slots_per_level
+        )
+        local_attributes = self.attributes.validate_location_attributes(
+            location_attributes, catalog, valid_paths
+        )
 
         positions = []
         movable_unit_number = 0
@@ -263,6 +544,9 @@ class SlottingService:
                         handling_unit_type,
                         handling_unit_id,
                     )
+                    effective_attributes = self.attributes.effective_attributes(
+                        static_address, local_attributes
+                    )[0]
                     positions.append({
                         **rack,
                         "zone_id": rack_zone,
@@ -274,13 +558,31 @@ class SlottingService:
                         "slot": slot_number,
                         "static_address": static_address,
                         "dynamic_address": dynamic_address,
+                        "effective_location_attributes": effective_attributes,
+                        "storage_area_type": (
+                            "OVERSIZE"
+                            if self.attributes.is_oversize_location(effective_attributes)
+                            else "STANDARD"
+                        ),
                     })
+
+        physical_enabled = self.attributes.has_physical_catalog(catalog)
+
+        def physical_group_rank(row):
+            if not physical_enabled:
+                return 0
+            requirements = row.get("sku_requirements")
+            if not isinstance(requirements, dict):
+                requirements = self.attributes.requirements_from_row(row, catalog)
+            profile = self.attributes.physical_profile(requirements)
+            return int(profile["storage_class"] != "STANDARD")
 
         class_rank = {"A": 0, "B": 1, "C": 2}
         sorted_skus = sorted(
             sku_rows,
             key=lambda row: (
                 class_rank.get(str(row.get("velocity_class", "")).upper(), 9),
+                physical_group_rank(row),
                 -float(row.get("pick_frequency") or 0),
                 str(row.get("sku", "")),
             ),
@@ -292,10 +594,138 @@ class SlottingService:
             "rack_vertex_index", "rack_rank", "handling_unit_type",
             "handling_unit_id", "dynamic_address_level", "dynamic_address",
             "storage_level", "storage_slot", "workstations_evaluated",
-            "average_workstation_distance_m",
+            "average_workstation_distance_m", "routing_status",
+            "storage_area_type",
         )
+        available_positions = list(positions)
+        rack_state: dict[str, dict] = {}
         for sku_rank, sku in enumerate(sorted_skus, start=1):
-            position = positions[sku_rank - 1] if sku_rank <= len(positions) else None
+            requirements = sku.get("sku_requirements")
+            if not isinstance(requirements, dict):
+                requirements = self.attributes.requirements_from_row(sku, catalog)
+            else:
+                requirements = self.attributes.validate_requirements(
+                    requirements, catalog
+                )
+            profile = (
+                self.attributes.physical_profile(requirements)
+                if physical_enabled
+                else {
+                    "data_status": str(sku.get("physical_data_status", "NOT_EVALUATED")),
+                    "storage_class": str(sku.get("physical_storage_class", "NOT_EVALUATED")),
+                    "missing_fields": [],
+                    "values": {},
+                }
+            )
+            position = None
+            compatibility_status = "NOT_EVALUATED"
+            mismatch_details: list[str] = []
+            auto_overrides: dict = {}
+            if available_positions:
+                hard_candidates = []
+                hard_issues: list[str] = []
+                for index, candidate in enumerate(available_positions):
+                    issues = self.attributes.hard_compatibility_issues(
+                        requirements, candidate["effective_location_attributes"]
+                    )
+                    if issues:
+                        for issue in issues:
+                            if issue not in hard_issues:
+                                hard_issues.append(issue)
+                        continue
+                    overrides = self.attributes.required_local_overrides(
+                        requirements,
+                        candidate["effective_location_attributes"],
+                        catalog,
+                    )
+                    hard_candidates.append((
+                        self._allocation_candidate_key(
+                            candidate,
+                            profile,
+                            physical_enabled,
+                            str(sku.get("velocity_class", "")).upper(),
+                            overrides,
+                            rack_state,
+                            levels_per_rack,
+                        ),
+                        index,
+                        candidate,
+                        overrides,
+                    ))
+                if hard_candidates:
+                    _key, selected_index, position, auto_overrides = min(
+                        hard_candidates, key=lambda item: item[0]
+                    )
+                    available_positions.pop(selected_index)
+                    if auto_overrides:
+                        local_attributes.setdefault(
+                            position["static_address"], {}
+                        ).update(auto_overrides)
+                        position["effective_location_attributes"] = (
+                            self.attributes.effective_attributes(
+                                position["static_address"], local_attributes
+                            )[0]
+                        )
+                        position["storage_area_type"] = (
+                            "OVERSIZE"
+                            if self.attributes.is_oversize_location(
+                                position["effective_location_attributes"]
+                            )
+                            else "STANDARD"
+                        )
+                    selected_state = rack_state.setdefault(
+                        position["rack_id"],
+                        {
+                            "velocity_classes": set(),
+                            "physical_buckets": set(),
+                            "has_oversize": False,
+                        },
+                    )
+                    selected_state["velocity_classes"].add(
+                        str(sku.get("velocity_class", "")).upper()
+                    )
+                    selected_state["physical_buckets"].add(
+                        self._physical_allocation_bucket(profile, physical_enabled)
+                    )
+                    selected_state["has_oversize"] = (
+                        selected_state["has_oversize"]
+                        or str(profile.get("storage_class", "")).upper()
+                        in {
+                            "OVERSIZE",
+                            "OVERSIZE_AND_OVERWEIGHT",
+                            "UNVERIFIED_OVERSIZE",
+                        }
+                    )
+                    if profile["data_status"] == "MISSING":
+                        compatibility_status = "UNVERIFIED"
+                        mismatch_details.append(
+                            "physical fit is unverified; missing "
+                            + ", ".join(profile["missing_fields"])
+                        )
+                    elif auto_overrides:
+                        compatibility_status = "COMPATIBLE_AUTO_OVERRIDE"
+                    else:
+                        compatibility_status = "COMPATIBLE"
+                    mismatch_details.extend(
+                        f"Auto slot override: {key}={value}"
+                        for key, value in sorted(auto_overrides.items())
+                    )
+                else:
+                    mismatch_details = hard_issues
+            if position:
+                assignment_status = "ASSIGNED"
+            elif available_positions:
+                assignment_status = (
+                    "UNASSIGNED_NO_CHILLED_LOCATION"
+                    if requirements.get("chilled") is True
+                    else "UNASSIGNED_NO_AMBIENT_LOCATION"
+                    if requirements.get("chilled") is False
+                    else "UNASSIGNED_NO_COMPATIBLE_LOCATION"
+                )
+                compatibility_status = "INCOMPATIBLE"
+            else:
+                assignment_status = "UNASSIGNED_NO_CAPACITY"
+                compatibility_status = "NOT_EVALUATED"
             row = {
                 "sku_rank": sku_rank,
                 "sku": sku.get("sku", ""),
@@ -304,7 +734,14 @@ class SlottingService:
                 "total_quantity_ea": sku.get("total_quantity_ea", ""),
                 "active_days": sku.get("active_days", ""),
                 "strategy": "basic",
-                "assignment_status": "ASSIGNED" if position else "UNASSIGNED_NO_CAPACITY",
+                "assignment_status": assignment_status,
+                "sku_requirements": requirements,
+                "physical_data_status": profile["data_status"],
+                "physical_storage_class": profile["storage_class"],
+                "physical_missing_fields": profile["missing_fields"],
+                "compatibility_status": compatibility_status,
+                "compatibility_issues": mismatch_details,
+                "auto_attribute_overrides": auto_overrides,
             }
             if position:
                 row.update({
@@ -324,17 +761,69 @@ class SlottingService:
                     "dynamic_address": position["dynamic_address"],
                     "storage_level": position["level"],
                     "storage_slot": position["slot"],
+                    "storage_area_type": position["storage_area_type"],
+                    "effective_location_attributes": position[
+                        "effective_location_attributes"
+                    ],
                     "workstations_evaluated": "|".join(position["workstations"]),
-                    "average_workstation_distance_m": round(position["distance_m"], 3),
+                    "average_workstation_distance_m": (
+                        round(position["distance_m"], 3)
+                        if math.isfinite(position["distance_m"])
+                        else ""
+                    ),
+                    "routing_status": (
+                        "REACHABLE"
+                        if math.isfinite(position["distance_m"])
+                        else "UNREACHABLE_LAST_RESORT"
+                    ),
                 })
             else:
                 row.update({key: "" for key in empty_location_fields})
+                row["effective_location_attributes"] = {}
             output.append(row)
 
+        if location_attributes is not None:
+            location_attributes.clear()
+            location_attributes.update(local_attributes)
+
+        zone_storage_types = self.derive_zone_storage_types(
+            output, {position["zone_id"] for position in positions}
+        )
+
+        status_counts = {
+            status: sum(row["assignment_status"] == status for row in output)
+            for status in {
+                "UNASSIGNED_NO_CAPACITY",
+                "UNASSIGNED_NO_CHILLED_LOCATION",
+                "UNASSIGNED_NO_AMBIENT_LOCATION",
+                "UNASSIGNED_NO_COMPATIBLE_LOCATION",
+            }
+        }
         summary = {
             "sku_count": len(sorted_skus),
-            "assigned_count": min(len(sorted_skus), len(positions)),
-            "unassigned_count": max(0, len(sorted_skus) - len(positions)),
+            "assigned_count": sum(
+                row["assignment_status"] == "ASSIGNED" for row in output
+            ),
+            "unassigned_count": sum(
+                row["assignment_status"] != "ASSIGNED" for row in output
+            ),
+            "unassigned_no_capacity_count": status_counts["UNASSIGNED_NO_CAPACITY"],
+            "unassigned_no_compatible_location_count": status_counts[
+                "UNASSIGNED_NO_COMPATIBLE_LOCATION"
+            ],
+            "unassigned_status_counts": status_counts,
+            "unverified_oversize_count": sum(
+                row["physical_storage_class"] == "UNVERIFIED_OVERSIZE"
+                for row in output
+            ),
+            "assigned_unverified_count": sum(
+                row["assignment_status"] == "ASSIGNED"
+                and row["compatibility_status"] == "UNVERIFIED"
+                for row in output
+            ),
+            "auto_overridden_slot_count": sum(
+                bool(row["auto_attribute_overrides"]) for row in output
+            ),
             "rack_count": len(racks),
             "usable_rack_count": len(usable_racks),
             "unreachable_rack_count": unreachable_count,
@@ -342,6 +831,7 @@ class SlottingService:
             "capacity": len(positions),
             "level_name": level_name,
             "zone_count": len({position["zone_id"] for position in positions}),
+            "zone_storage_types": zone_storage_types,
         }
         return output, summary
 
@@ -361,8 +851,15 @@ class SlottingLayoutRepository:
         levels_per_rack: int,
         slots_per_level: int,
         zone_assignments: dict[str, str],
+        attribute_catalog=None,
+        location_attributes: dict[str, dict] | None = None,
         source_building: str = "",
         source_velocity: str = "",
+        source_chilled: str = "",
+        standard_storage_defaults: dict | None = None,
+        oversize_storage_defaults: dict | None = None,
+        chilled_demo_rate: float = 0.10,
+        chilled_demo_seed: int = 42,
     ) -> None:
         payload = {
             "schema": SLOTTING_SCHEMA,
@@ -376,8 +873,22 @@ class SlottingLayoutRepository:
             "sources": {
                 "building_yaml": source_building,
                 "sku_velocity_csv": source_velocity,
+                "chilled_requirements_csv": source_chilled,
+            },
+            "storage_defaults": {
+                "standard": standard_storage_defaults or STANDARD_STORAGE_DEFAULTS,
+                "oversize": oversize_storage_defaults or OVERSIZE_STORAGE_DEFAULTS,
+            },
+            "chilled_requirements": {
+                "missing_sku_is_ambient": True,
+                "demo_rate": chilled_demo_rate,
+                "demo_seed": chilled_demo_seed,
             },
             "zone_assignments": zone_assignments,
+            "attribute_catalog": StorageAttributeService.serialize_catalog(
+                attribute_catalog
+            ),
+            "location_attributes": location_attributes or {},
             "summary": summary,
             "building": building,
             "assignments": rows,
@@ -388,13 +899,72 @@ class SlottingLayoutRepository:
 
     def load(self, path: Path) -> dict:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("schema") != SLOTTING_SCHEMA:
+        schema = payload.get("schema")
+        if schema not in {SLOTTING_SCHEMA, LEGACY_SLOTTING_SCHEMA}:
             raise ValueError("not a supported inventory slotting layout")
         if not isinstance(payload.get("building"), dict) or not isinstance(
             payload.get("assignments"), list
         ):
             raise ValueError("slotting layout is missing building or assignment data")
+        if schema == LEGACY_SLOTTING_SCHEMA:
+            payload["source_schema"] = LEGACY_SLOTTING_SCHEMA
+            payload["schema"] = SLOTTING_SCHEMA
+            payload.setdefault("attribute_catalog", [])
+            payload.setdefault("location_attributes", {})
+        payload.setdefault("sources", {})
+        payload["sources"].setdefault("chilled_requirements_csv", "")
+        payload.setdefault("storage_defaults", {
+            "standard": STANDARD_STORAGE_DEFAULTS,
+            "oversize": {},
+        })
+        payload.setdefault("chilled_requirements", {
+            "missing_sku_is_ambient": True,
+            "demo_rate": 0.10,
+            "demo_seed": 42,
+        })
+        attributes = StorageAttributeService()
+        catalog = attributes.normalize_catalog(payload.get("attribute_catalog"))
+        payload["attribute_catalog"] = attributes.serialize_catalog(catalog)
+        payload["location_attributes"] = attributes.validate_location_attributes(
+            payload.get("location_attributes"), catalog
+        )
+        for row in payload["assignments"]:
+            requirements = row.setdefault("sku_requirements", {})
+            if not isinstance(requirements, dict):
+                raise ValueError("assignment sku_requirements must be an object")
+            row["sku_requirements"] = attributes.validate_requirements(
+                requirements, catalog
+            )
+            row.setdefault(
+                "compatibility_status",
+                "COMPATIBLE"
+                if row.get("assignment_status") == "ASSIGNED"
+                else "NOT_EVALUATED",
+            )
+            row.setdefault("compatibility_issues", [])
+            row.setdefault("auto_attribute_overrides", {})
+            row.setdefault("routing_status", "NOT_EVALUATED")
+            if self._physical_requirements_present(row["sku_requirements"]):
+                profile = attributes.physical_profile(row["sku_requirements"])
+                row.setdefault("physical_data_status", profile["data_status"])
+                row.setdefault("physical_storage_class", profile["storage_class"])
+                row.setdefault("physical_missing_fields", profile["missing_fields"])
+            else:
+                row.setdefault("physical_data_status", "NOT_EVALUATED")
+                row.setdefault("physical_storage_class", "NOT_EVALUATED")
+                row.setdefault("physical_missing_fields", [])
+            row.setdefault("effective_location_attributes", {})
+        zones = set(
+            payload.get("summary", {}).get("zone_storage_types", {}).keys()
+        )
+        payload.setdefault("summary", {})["zone_storage_types"] = (
+            SlottingService.derive_zone_storage_types(payload["assignments"], zones)
+        )
         return payload
+
+    @staticmethod
+    def _physical_requirements_present(requirements: dict) -> bool:
+        return any(key in requirements for key in PHYSICAL_ATTRIBUTE_KEYS)
 
     @staticmethod
     def save_payload(payload: dict, path: Path) -> None:
