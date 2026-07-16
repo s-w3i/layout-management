@@ -77,6 +77,27 @@ ros2 run rmf_building_map_tools building_map_generator nav \
   resources/map/v6.building.yaml output_nav_graphs
 ```
 
+## SKU affinity tab
+
+The **SKU Affinity** tab reads the line-level order workbook independently of
+slotting. It finds `Date`, `Store ID`, and `Item or SKU` automatically. Every
+valid row counts once, even when `Quantity (in EA)` is greater than one.
+
+Click **Analyze** to scan the workbook on a background thread. Repeat loads use
+a local source-fingerprinted cache. The inclusive date fields can then rebuild
+the analysis without reopening Excel.
+
+The heatmap displays direct SKU–store line frequencies. The relationship map
+groups rows by `(Store ID, Date)`, treats SKU presence in each store-day as
+binary, and calculates cosine similarity across those groups. Select a heatmap
+cell, search for a SKU, or click a graph node to update the related-SKU and
+store-frequency tables. The default threshold is three shared store-days.
+
+**Export JSON + CSV…** writes the active analysis as a versioned affinity JSON,
+a direct SKU–store CSV, and a derived SKU-pair CSV. The slotting strategy reads
+the selected raw Excel workbook directly, while these exports remain review and
+interchange artifacts.
+
 ## Inventory slotting tab
 
 The **Inventory Slotting** tab accepts:
@@ -112,6 +133,13 @@ Use this workflow:
    `req_max_item_height`, and `req_max_item_weight`.
 9. Select the strategy and handling-unit type, then generate the layout.
 
+For `abc_affinity`, select the order-history workbook and an affinity weight.
+The first generation automatically suggests minimum shared store-days, minimum
+affinity score, and maximum service-distance increase from that workbook and
+warehouse map. The values appear after generation and become editable. Use
+**Regenerate with edited values** to test an adjustment or **Recalculate
+automatic suggestion** after changing the source data.
+
 Racks are coloured by zone while grouping. Generation is blocked until all
 racks have a zone. After generation, rectangle mode turns off and rack colours
 change to their assigned ABC class. Aisles are derived from rack columns
@@ -127,6 +155,13 @@ storage boundary. If a matching-temperature slot needs different soft values,
 the generator writes local overrides on that child slot and assigns the SKU.
 Missing physical data is assigned with an `UNVERIFIED` warning. A general
 not-enough-space result occurs only when every slot is occupied.
+
+The **abc_affinity** strategy retains that ABC-first allocation and all storage
+constraints. It uses store-day cosine affinity only to rank locations that are
+otherwise eligible at the same ABC/physical priority, balancing service distance
+against proximity to already placed related SKUs. Automatic thresholds come
+from empirical distributions in the selected workbook and map; they are not
+fixed to the bundled sample data.
 
 Chilled and ambient capacity is counted separately because neither category may
 use slots from the other. The result distinguishes this temperature-zone

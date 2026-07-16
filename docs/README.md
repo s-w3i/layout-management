@@ -4,6 +4,8 @@
 
 - [SKU velocity analysis](sku-velocity-analysis.md) — classify SKUs as A, B or
   C using pick frequency and generate a demand graph for every SKU.
+- [SKU affinity analysis](sku-affinity-analysis.md) — explore direct SKU–store
+  order frequency and use data-calibrated store-day relationships in slotting.
 - [RMF grid map editor](rmf-grid-map-editor.md) — create and edit the warehouse
   grid, place racks and workstations, assign zones, generate slotting layouts,
   inspect inventory, and demonstrate SKU or shelf swaps.

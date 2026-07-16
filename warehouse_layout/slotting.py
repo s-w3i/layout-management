@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import heapq
 import json
 import math
@@ -10,6 +11,9 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
+from .affinity import AffinityAnalysis
 from .attributes import (
     OVERSIZE_STORAGE_DEFAULTS,
     PHYSICAL_ATTRIBUTE_KEYS,
@@ -411,6 +415,168 @@ class SlottingService:
         )
 
     @staticmethod
+    def _build_affinity_neighbors(
+        analysis: AffinityAnalysis,
+        sku_names: set[str],
+        minimum_shared_store_days: int,
+        minimum_affinity_score: float,
+    ) -> dict[str, list[tuple[str, float, float, int]]]:
+        affinity_index = {
+            sku: index
+            for index, sku in enumerate(analysis.dataset.skus)
+            if sku in sku_names
+        }
+        index_to_sku = {index: sku for sku, index in affinity_index.items()}
+        neighbors: dict[str, list[tuple[str, float, float, int]]] = {}
+        for sku, index in affinity_index.items():
+            shared_row = analysis.shared_store_days[index]
+            score_row = analysis.similarity[index]
+            related_indices = np.flatnonzero(
+                (shared_row >= minimum_shared_store_days)
+                & (score_row >= minimum_affinity_score)
+                & (score_row > 0)
+            )
+            neighbors[sku] = [
+                (
+                    index_to_sku[int(related_index)],
+                    int(shared_row[related_index]) * float(score_row[related_index]),
+                    float(score_row[related_index]),
+                    int(shared_row[related_index]),
+                )
+                for related_index in related_indices
+                if int(related_index) in index_to_sku
+                and int(related_index) != index
+            ]
+        return neighbors
+
+    @staticmethod
+    def _empirical_service_cap_candidates(racks: list[dict]) -> list[float]:
+        """Derive service-distance allowance candidates from the current map."""
+        distances = np.array(
+            sorted({
+                float(rack["distance_m"])
+                for rack in racks
+                if math.isfinite(float(rack["distance_m"]))
+            }),
+            dtype=np.float64,
+        )
+        if len(distances) < 2:
+            return [0.0]
+        positive = distances[distances > 0]
+        reference = float(positive.min()) if len(positive) else 1.0
+        first, second = np.triu_indices(len(distances), 1)
+        increases = (distances[second] - distances[first]) / np.maximum(
+            distances[first], reference
+        )
+        increases = increases[np.isfinite(increases) & (increases >= 0)]
+        if not len(increases):
+            return [0.0]
+        candidate_count = max(2, int(math.ceil(math.log2(len(increases)) + 1)))
+        candidates = np.unique(
+            np.quantile(
+                increases,
+                np.linspace(0.0, 1.0, candidate_count),
+                method="nearest",
+            )
+        )
+        return sorted({0.0, *(float(value) for value in candidates)})
+
+    @staticmethod
+    def _normalized_metric(values: list[float], value: float) -> float:
+        finite = [item for item in values if math.isfinite(item)]
+        if not finite:
+            return 0.0
+        low, high = min(finite), max(finite)
+        return 0.0 if high <= low else (value - low) / (high - low)
+
+    @staticmethod
+    def _affinity_layout_metrics(
+        rows: list[dict],
+        racks: list[dict],
+        analysis: AffinityAnalysis,
+        minimum_shared_store_days: int,
+        minimum_affinity_score: float,
+        coordinate_scale: float,
+    ) -> dict:
+        assigned = {
+            str(row.get("sku", "")): row
+            for row in rows
+            if row.get("assignment_status") == "ASSIGNED"
+        }
+        rack_by_id = {rack["rack_id"]: rack for rack in racks}
+        dataset_index = {
+            sku: index for index, sku in enumerate(analysis.dataset.skus)
+        }
+        skus = [
+            sku for sku in assigned
+            if sku in dataset_index
+            and assigned[sku].get("rack_id") in rack_by_id
+        ]
+        pair_weight = 0.0
+        pair_distance = 0.0
+        same_rack_weight = 0.0
+        retained_pairs = 0
+        if len(skus) >= 2:
+            indices = np.array([dataset_index[sku] for sku in skus], dtype=np.int32)
+            coordinates = np.array(
+                [
+                    [
+                        float(rack_by_id[assigned[sku]["rack_id"]]["x"]),
+                        float(rack_by_id[assigned[sku]["rack_id"]]["y"]),
+                    ]
+                    for sku in skus
+                ],
+                dtype=np.float64,
+            )
+            rack_ids = np.array(
+                [str(assigned[sku]["rack_id"]) for sku in skus]
+            )
+            shared = analysis.shared_store_days[np.ix_(indices, indices)]
+            scores = analysis.similarity[np.ix_(indices, indices)]
+            first, second = np.triu_indices(len(skus), 1)
+            retained = (
+                (shared[first, second] >= minimum_shared_store_days)
+                & (scores[first, second] >= minimum_affinity_score)
+                & (scores[first, second] > 0)
+            )
+            first = first[retained]
+            second = second[retained]
+            weights = (
+                shared[first, second].astype(np.float64)
+                * scores[first, second].astype(np.float64)
+            )
+            distances = np.linalg.norm(
+                coordinates[first] - coordinates[second], axis=1
+            ) * coordinate_scale
+            pair_weight = float(weights.sum())
+            pair_distance = float(weights @ distances)
+            same_rack_weight = float(weights[rack_ids[first] == rack_ids[second]].sum())
+            retained_pairs = len(weights)
+        service_weight = 0.0
+        service_distance = 0.0
+        for row in assigned.values():
+            raw_distance = row.get("average_workstation_distance_m")
+            if raw_distance in (None, ""):
+                continue
+            weight = float(row.get("pick_frequency") or 0)
+            service_weight += weight
+            service_distance += weight * float(raw_distance)
+        return {
+            "weighted_pair_distance_m": (
+                pair_distance / pair_weight if pair_weight else 0.0
+            ),
+            "pair_weight": pair_weight,
+            "same_rack_affinity_fraction": (
+                same_rack_weight / pair_weight if pair_weight else 0.0
+            ),
+            "retained_relationship_count": retained_pairs,
+            "weighted_service_distance_m": (
+                service_distance / service_weight if service_weight else 0.0
+            ),
+            "service_weight": service_weight,
+        }
+
+    @staticmethod
     def derive_zone_storage_types(
         rows: list[dict], zones: set[str] | None = None
     ) -> dict[str, str]:
@@ -492,10 +658,34 @@ class SlottingService:
         zone_assignments: dict[str, str] | None = None,
         attribute_catalog=None,
         location_attributes: dict[str, dict] | None = None,
+        strategy: str = "basic",
+        affinity_analysis: AffinityAnalysis | None = None,
+        affinity_weight: float = 0.0,
+        minimum_shared_store_days: int = 0,
+        minimum_affinity_score: float = 0.0,
+        maximum_service_distance_increase: float = 0.0,
+        precomputed_affinity_neighbors: (
+            dict[str, list[tuple[str, float, float, int]]] | None
+        ) = None,
     ) -> tuple[list[dict], dict]:
         if levels_per_rack < 1 or slots_per_level < 1:
             raise ValueError("levels and slots per level must be at least 1")
+        if strategy not in {"basic", "abc_affinity"}:
+            raise ValueError(f"unsupported slotting strategy: {strategy}")
+        if not 0.0 <= affinity_weight <= 1.0:
+            raise ValueError("affinity weight must be between 0 and 1")
+        if minimum_shared_store_days < 0:
+            raise ValueError("minimum shared store-days cannot be negative")
+        if not 0.0 <= minimum_affinity_score <= 1.0:
+            raise ValueError("minimum affinity score must be between 0 and 1")
+        if maximum_service_distance_increase < 0:
+            raise ValueError("maximum service-distance increase cannot be negative")
+        affinity_enabled = strategy == "abc_affinity"
+        if affinity_enabled and affinity_analysis is None:
+            raise ValueError("ABC + affinity strategy requires affinity analysis")
         level_name, racks, workstation_count, unreachable_count = self.rack_distances(building)
+        level = building["levels"][level_name]
+        coordinate_scale = self._distance_scale(building, level)
         # Route reachability affects preference, not whether physical storage exists.
         # Unreachable racks sort last but remain usable when capacity is needed.
         usable_racks = list(racks)
@@ -587,6 +777,35 @@ class SlottingService:
                 str(row.get("sku", "")),
             ),
         )
+        affinity_neighbors: dict[str, list[tuple[str, float, float, int]]] = {}
+        if affinity_enabled and affinity_analysis is not None:
+            affinity_neighbors = precomputed_affinity_neighbors or (
+                self._build_affinity_neighbors(
+                    affinity_analysis,
+                    {str(row.get("sku", "")) for row in sorted_skus},
+                    minimum_shared_store_days,
+                    minimum_affinity_score,
+                )
+            )
+        finite_service_distances = [
+            float(rack["distance_m"])
+            for rack in racks
+            if math.isfinite(float(rack["distance_m"]))
+        ]
+        max_service_distance = max(finite_service_distances, default=1.0) or 1.0
+        positive_service_distances = [
+            value for value in finite_service_distances if value > 0
+        ]
+        minimum_service_reference = (
+            min(positive_service_distances) if positive_service_distances else 1.0
+        )
+        xs = [float(rack["x"]) for rack in racks]
+        ys = [float(rack["y"]) for rack in racks]
+        maximum_rack_distance = (
+            math.hypot(max(xs) - min(xs), max(ys) - min(ys)) * coordinate_scale
+            if xs and ys
+            else 1.0
+        ) or 1.0
         output = []
         empty_location_fields = (
             "static_address", "rmf_grid_address", "zone_id", "aisle_id",
@@ -599,6 +818,7 @@ class SlottingService:
         )
         available_positions = list(positions)
         rack_state: dict[str, dict] = {}
+        assigned_affinity_positions: dict[str, dict] = {}
         for sku_rank, sku in enumerate(sorted_skus, start=1):
             requirements = sku.get("sku_requirements")
             if not isinstance(requirements, dict):
@@ -621,6 +841,10 @@ class SlottingService:
             compatibility_status = "NOT_EVALUATED"
             mismatch_details: list[str] = []
             auto_overrides: dict = {}
+            affinity_neighbors_used: list[str] = []
+            affinity_weight_sum = 0.0
+            weighted_affinity_distance = 0.0
+            combined_location_score = None
             if available_positions:
                 hard_candidates = []
                 hard_issues: list[str] = []
@@ -653,8 +877,123 @@ class SlottingService:
                         overrides,
                     ))
                 if hard_candidates:
-                    _key, selected_index, position, auto_overrides = min(
+                    baseline_candidate = min(
                         hard_candidates, key=lambda item: item[0]
+                    )
+                    selected_candidate = baseline_candidate
+                    current_sku = str(sku.get("sku", ""))
+                    related_assigned = [
+                        (related_sku, weight, assigned_affinity_positions[related_sku])
+                        for related_sku, weight, _score, _shared
+                        in affinity_neighbors.get(current_sku, [])
+                        if related_sku in assigned_affinity_positions
+                    ]
+                    if affinity_enabled and related_assigned:
+                        baseline_key = baseline_candidate[0]
+                        fixed_signature = (
+                            baseline_key[:-1] + baseline_key[-1][:2]
+                        )
+                        baseline_service = float(
+                            baseline_candidate[2]["distance_m"]
+                        )
+                        service_reference = max(
+                            baseline_service
+                            if math.isfinite(baseline_service)
+                            else 0.0,
+                            minimum_service_reference,
+                        )
+                        service_limit = (
+                            baseline_service
+                            + maximum_service_distance_increase * service_reference
+                            if math.isfinite(baseline_service)
+                            else math.inf
+                        )
+                        eligible = []
+                        for candidate_record in hard_candidates:
+                            key, _index, candidate, _overrides = candidate_record
+                            signature = key[:-1] + key[-1][:2]
+                            candidate_service = float(candidate["distance_m"])
+                            if signature != fixed_signature:
+                                continue
+                            if (
+                                math.isfinite(baseline_service)
+                                and (
+                                    not math.isfinite(candidate_service)
+                                    or candidate_service > service_limit + 1e-9
+                                )
+                            ):
+                                continue
+                            eligible.append(candidate_record)
+                        if eligible:
+                            candidate_coordinates = np.array(
+                                [
+                                    [float(item[2]["x"]), float(item[2]["y"])]
+                                    for item in eligible
+                                ],
+                                dtype=np.float64,
+                            )
+                            related_coordinates = np.array(
+                                [
+                                    [float(item[2]["x"]), float(item[2]["y"])]
+                                    for item in related_assigned
+                                ],
+                                dtype=np.float64,
+                            )
+                            relationship_weights = np.array(
+                                [float(item[1]) for item in related_assigned],
+                                dtype=np.float64,
+                            )
+                            pair_distances = np.linalg.norm(
+                                candidate_coordinates[:, None, :]
+                                - related_coordinates[None, :, :],
+                                axis=2,
+                            ) * coordinate_scale
+                            affinity_distances = (
+                                pair_distances @ relationship_weights
+                            ) / float(relationship_weights.sum())
+                            scores = []
+                            for candidate_number, candidate_record in enumerate(eligible):
+                                service_distance = float(
+                                    candidate_record[2]["distance_m"]
+                                )
+                                service_score = (
+                                    service_distance / max_service_distance
+                                    if math.isfinite(service_distance)
+                                    else 1.0
+                                )
+                                affinity_score = (
+                                    float(affinity_distances[candidate_number])
+                                    / maximum_rack_distance
+                                )
+                                combined = (
+                                    (1.0 - affinity_weight) * service_score
+                                    + affinity_weight * affinity_score
+                                )
+                                scores.append((
+                                    combined,
+                                    service_distance,
+                                    candidate_record[0],
+                                    candidate_number,
+                                    candidate_record,
+                                ))
+                            (
+                                combined_location_score,
+                                _service,
+                                _candidate_key,
+                                selected_number,
+                                selected_candidate,
+                            ) = min(scores, key=lambda item: item[:4])
+                            affinity_neighbors_used = [
+                                item[0] for item in related_assigned
+                            ]
+                            affinity_weight_sum = float(
+                                relationship_weights.sum()
+                            )
+                            weighted_affinity_distance = float(
+                                affinity_distances[selected_number]
+                            )
+                    _key, selected_index, position, auto_overrides = (
+                        selected_candidate
                     )
                     available_positions.pop(selected_index)
                     if auto_overrides:
@@ -710,6 +1049,7 @@ class SlottingService:
                         f"Auto slot override: {key}={value}"
                         for key, value in sorted(auto_overrides.items())
                     )
+                    assigned_affinity_positions[current_sku] = position
                 else:
                     mismatch_details = hard_issues
             if position:
@@ -733,7 +1073,7 @@ class SlottingService:
                 "pick_frequency": sku.get("pick_frequency", ""),
                 "total_quantity_ea": sku.get("total_quantity_ea", ""),
                 "active_days": sku.get("active_days", ""),
-                "strategy": "basic",
+                "strategy": strategy,
                 "assignment_status": assignment_status,
                 "sku_requirements": requirements,
                 "physical_data_status": profile["data_status"],
@@ -742,6 +1082,17 @@ class SlottingService:
                 "compatibility_status": compatibility_status,
                 "compatibility_issues": mismatch_details,
                 "auto_attribute_overrides": auto_overrides,
+                "affinity_neighbors_used": affinity_neighbors_used,
+                "affinity_weight_sum": round(affinity_weight_sum, 6),
+                "weighted_affinity_distance_m": round(
+                    weighted_affinity_distance, 6
+                ),
+                "combined_location_score": (
+                    round(float(combined_location_score), 9)
+                    if combined_location_score is not None
+                    else ""
+                ),
+                "affinity_weight": affinity_weight if affinity_enabled else 0.0,
             }
             if position:
                 row.update({
@@ -800,6 +1151,7 @@ class SlottingService:
             }
         }
         summary = {
+            "strategy": strategy,
             "sku_count": len(sorted_skus),
             "assigned_count": sum(
                 row["assignment_status"] == "ASSIGNED" for row in output
@@ -833,7 +1185,257 @@ class SlottingService:
             "zone_count": len({position["zone_id"] for position in positions}),
             "zone_storage_types": zone_storage_types,
         }
+        if affinity_analysis is not None:
+            affinity_metrics = self._affinity_layout_metrics(
+                output,
+                racks,
+                affinity_analysis,
+                minimum_shared_store_days,
+                minimum_affinity_score,
+                coordinate_scale,
+            )
+            summary["affinity_metrics"] = affinity_metrics
+            summary["affinity_configuration"] = {
+                "affinity_weight": affinity_weight if affinity_enabled else 0.0,
+                "minimum_shared_store_days": minimum_shared_store_days,
+                "minimum_affinity_score": minimum_affinity_score,
+                "maximum_service_distance_increase": (
+                    maximum_service_distance_increase if affinity_enabled else 0.0
+                ),
+            }
         return output, summary
+
+    def generate_abc_affinity(
+        self,
+        building: dict,
+        sku_rows: list[dict],
+        affinity_analysis: AffinityAnalysis,
+        affinity_weight: float,
+        levels_per_rack: int = 1,
+        slots_per_level: int = 6,
+        handling_unit_type: str = "AMR shelf",
+        zone_id: str = "Z01",
+        zone_assignments: dict[str, str] | None = None,
+        attribute_catalog=None,
+        location_attributes: dict[str, dict] | None = None,
+        tuning_parameters: dict | None = None,
+    ) -> tuple[list[dict], dict]:
+        """Generate ABC-first affinity slotting with empirical auto-tuning."""
+        if not 0.0 <= affinity_weight <= 1.0:
+            raise ValueError("affinity weight must be between 0 and 1")
+        known_skus = {str(row.get("sku", "")) for row in sku_rows}
+        automatic = tuning_parameters is None
+        threshold_recommendation = affinity_analysis.suggest_slotting_thresholds(
+            known_skus, affinity_weight
+        )
+        if automatic:
+            minimum_shared_store_days = int(
+                threshold_recommendation["minimum_shared_store_days"]
+            )
+            minimum_affinity_score = float(
+                threshold_recommendation["minimum_affinity_score"]
+            )
+        else:
+            try:
+                minimum_shared_store_days = int(
+                    tuning_parameters["minimum_shared_store_days"]
+                )
+                minimum_affinity_score = float(
+                    tuning_parameters["minimum_affinity_score"]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "adjusted tuning requires minimum shared store-days and "
+                    "minimum affinity score"
+                ) from exc
+
+        affinity_neighbors = self._build_affinity_neighbors(
+            affinity_analysis,
+            known_skus,
+            minimum_shared_store_days,
+            minimum_affinity_score,
+        )
+
+        baseline_rows, baseline_summary = self.generate_basic(
+            building,
+            copy.deepcopy(sku_rows),
+            levels_per_rack,
+            slots_per_level,
+            handling_unit_type,
+            zone_id,
+            zone_assignments,
+            attribute_catalog,
+            copy.deepcopy(location_attributes or {}),
+            strategy="basic",
+            affinity_analysis=affinity_analysis,
+            minimum_shared_store_days=minimum_shared_store_days,
+            minimum_affinity_score=minimum_affinity_score,
+        )
+        _level, racks, _workstations, _unreachable = self.rack_distances(building)
+        self.apply_zone_local_aisles(
+            building, racks, zone_assignments or {}, zone_id
+        )
+        if automatic:
+            empirical_service_caps = self._empirical_service_cap_candidates(racks)
+            relationship_confidence = math.sqrt(
+                float(threshold_recommendation["retained_weight_fraction"])
+                * float(threshold_recommendation["sku_coverage_fraction"])
+            )
+            affinity_pressure = affinity_weight * relationship_confidence
+            service_cap_index = int(
+                round(affinity_pressure * (len(empirical_service_caps) - 1))
+            )
+            suggested_service_cap = float(
+                empirical_service_caps[service_cap_index]
+            )
+            cap_candidates = [suggested_service_cap]
+            service_cap_recommendation = {
+                "method": "affinity_weighted_empirical_map_distance_quantile",
+                "relationship_confidence": relationship_confidence,
+                "affinity_pressure": affinity_pressure,
+                "empirical_candidate_count": len(empirical_service_caps),
+                "selected_candidate_index": service_cap_index,
+                "selected_service_distance_increase": suggested_service_cap,
+                "empirical_candidates": empirical_service_caps,
+            }
+        else:
+            try:
+                cap_candidates = [
+                    float(tuning_parameters["maximum_service_distance_increase"])
+                ]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "adjusted tuning requires maximum service-distance increase"
+                ) from exc
+            empirical_service_caps = cap_candidates
+            service_cap_recommendation = {
+                "method": "user_adjusted",
+                "selected_service_distance_increase": cap_candidates[0],
+            }
+        if any(value < 0 for value in cap_candidates):
+            raise ValueError("maximum service-distance increase cannot be negative")
+
+        trials = []
+        for service_cap in cap_candidates:
+            trial_location_attributes = copy.deepcopy(location_attributes or {})
+            trial_rows, trial_summary = self.generate_basic(
+                building,
+                copy.deepcopy(sku_rows),
+                levels_per_rack,
+                slots_per_level,
+                handling_unit_type,
+                zone_id,
+                zone_assignments,
+                attribute_catalog,
+                trial_location_attributes,
+                strategy="abc_affinity",
+                affinity_analysis=affinity_analysis,
+                affinity_weight=affinity_weight,
+                minimum_shared_store_days=minimum_shared_store_days,
+                minimum_affinity_score=minimum_affinity_score,
+                maximum_service_distance_increase=service_cap,
+                precomputed_affinity_neighbors=affinity_neighbors,
+            )
+            if trial_summary["unassigned_count"] > baseline_summary["unassigned_count"]:
+                continue
+            metrics = trial_summary["affinity_metrics"]
+            trials.append({
+                "maximum_service_distance_increase": service_cap,
+                "weighted_pair_distance_m": float(
+                    metrics["weighted_pair_distance_m"]
+                ),
+                "weighted_service_distance_m": float(
+                    metrics["weighted_service_distance_m"]
+                ),
+                "same_rack_affinity_fraction": float(
+                    metrics["same_rack_affinity_fraction"]
+                ),
+                "summary": trial_summary,
+                "rows": trial_rows,
+                "location_attributes": trial_location_attributes,
+            })
+        if not trials:
+            raise ValueError(
+                "no affinity parameter candidate preserved the ABC baseline assignment count"
+            )
+        pair_values = [row["weighted_pair_distance_m"] for row in trials]
+        service_values = [row["weighted_service_distance_m"] for row in trials]
+        for trial in trials:
+            pair_normalized = self._normalized_metric(
+                pair_values, trial["weighted_pair_distance_m"]
+            )
+            service_normalized = self._normalized_metric(
+                service_values, trial["weighted_service_distance_m"]
+            )
+            trial["selection_loss"] = math.sqrt(
+                affinity_weight * pair_normalized**2
+                + (1.0 - affinity_weight) * service_normalized**2
+            )
+        selected_trial = min(
+            trials,
+            key=lambda row: (
+                row["selection_loss"],
+                row["weighted_service_distance_m"],
+                row["weighted_pair_distance_m"],
+                row["maximum_service_distance_increase"],
+            ),
+        )
+        selected_cap = float(
+            selected_trial["maximum_service_distance_increase"]
+        )
+        final_rows = selected_trial["rows"]
+        final_summary = selected_trial["summary"]
+        if location_attributes is not None:
+            location_attributes.clear()
+            location_attributes.update(selected_trial["location_attributes"])
+        baseline_metrics = baseline_summary["affinity_metrics"]
+        final_metrics = final_summary["affinity_metrics"]
+
+        def relative_change(current, baseline):
+            return (
+                (float(current) - float(baseline)) / float(baseline)
+                if baseline
+                else 0.0
+            )
+
+        final_summary["affinity_tuning"] = {
+            "parameter_status": "AUTO_SUGGESTED" if automatic else "USER_ADJUSTED",
+            "method": "data_driven_relationship_pareto_and_map_quantile",
+            "affinity_weight": affinity_weight,
+            "minimum_shared_store_days": minimum_shared_store_days,
+            "minimum_affinity_score": minimum_affinity_score,
+            "maximum_service_distance_increase": selected_cap,
+            "relationship_recommendation": threshold_recommendation,
+            "service_cap_recommendation": service_cap_recommendation,
+            "service_cap_candidate_count": len(empirical_service_caps),
+            "service_cap_evaluated_count": len(cap_candidates),
+            "valid_layout_candidate_count": len(trials),
+            "layout_candidates": [
+                {
+                    key: value for key, value in trial.items()
+                    if key not in {"rows", "summary", "location_attributes"}
+                }
+                for trial in trials
+            ],
+            "source_store_day_count": affinity_analysis.store_day_count,
+            "source_line_order_count": affinity_analysis.event_count,
+        }
+        final_summary["baseline_comparison"] = {
+            "basic": baseline_metrics,
+            "abc_affinity": final_metrics,
+            "weighted_pair_distance_change_fraction": relative_change(
+                final_metrics["weighted_pair_distance_m"],
+                baseline_metrics["weighted_pair_distance_m"],
+            ),
+            "weighted_service_distance_change_fraction": relative_change(
+                final_metrics["weighted_service_distance_m"],
+                baseline_metrics["weighted_service_distance_m"],
+            ),
+            "assigned_count_change": (
+                final_summary["assigned_count"] - baseline_summary["assigned_count"]
+            ),
+        }
+        return final_rows, final_summary
 
 
 class SlottingLayoutRepository:
@@ -856,6 +1458,8 @@ class SlottingLayoutRepository:
         source_building: str = "",
         source_velocity: str = "",
         source_chilled: str = "",
+        source_affinity: str = "",
+        affinity_configuration: dict | None = None,
         standard_storage_defaults: dict | None = None,
         oversize_storage_defaults: dict | None = None,
         chilled_demo_rate: float = 0.10,
@@ -874,7 +1478,9 @@ class SlottingLayoutRepository:
                 "building_yaml": source_building,
                 "sku_velocity_csv": source_velocity,
                 "chilled_requirements_csv": source_chilled,
+                "affinity_order_workbook": source_affinity,
             },
+            "affinity_configuration": affinity_configuration or {},
             "storage_defaults": {
                 "standard": standard_storage_defaults or STANDARD_STORAGE_DEFAULTS,
                 "oversize": oversize_storage_defaults or OVERSIZE_STORAGE_DEFAULTS,
@@ -913,6 +1519,8 @@ class SlottingLayoutRepository:
             payload.setdefault("location_attributes", {})
         payload.setdefault("sources", {})
         payload["sources"].setdefault("chilled_requirements_csv", "")
+        payload["sources"].setdefault("affinity_order_workbook", "")
+        payload.setdefault("affinity_configuration", {})
         payload.setdefault("storage_defaults", {
             "standard": STANDARD_STORAGE_DEFAULTS,
             "oversize": {},

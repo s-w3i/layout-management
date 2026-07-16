@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import csv
 import tempfile
+import time
+from datetime import date, timedelta
 from pathlib import Path
 import tkinter as tk
 from types import SimpleNamespace
+
+from openpyxl import Workbook
 
 import warehouse_layout.gui as gui
 
@@ -27,6 +32,8 @@ def main() -> None:
     root = tk.Tk()
     app = gui.GridMapEditorApp(root)
     root.update_idletasks()
+    assert len(app.notebook.tabs()) == 4
+    assert app.notebook.tab(app.notebook.tabs()[1], "text") == "SKU Affinity"
 
     with tempfile.TemporaryDirectory() as directory:
         temp = Path(directory)
@@ -64,6 +71,62 @@ def main() -> None:
         app.rmf_maps.export_building(app.project, yaml_path)
         assert app.rmf_maps.load_project(project_path).to_project_dict() == app.project.to_project_dict()
         assert app.rmf_maps.load_building(yaml_path)["levels"]
+
+        # Affinity tab: asynchronously load line orders, filter, inspect, and export.
+        affinity_path = temp / "affinity-orders.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Picking"
+        sheet.append(["Date", "Store ID", "Item or SKU", "Quantity (in EA)"])
+        sheet.append(["2026-01-01", "STORE_1", "SKU_A", 1])
+        sheet.append(["2026-01-01", "STORE_1", "SKU_B", 500])
+        sheet.append(["2026-01-02", "STORE_2", "SKU_A", 2])
+        sheet.append(["2026-01-02", "STORE_2", "SKU_B", 2])
+        sheet.append(["2026-01-02", "STORE_3", "SKU_C", 1])
+        workbook.save(affinity_path)
+        app.affinity.cache_dir = temp / "affinity-cache"
+        app.affinity_input_path.set(str(affinity_path))
+        app.start_affinity_load()
+        deadline = time.monotonic() + 10
+        while app.affinity_worker and app.affinity_worker.is_alive():
+            root.update()
+            time.sleep(0.01)
+            assert time.monotonic() < deadline
+        app.poll_affinity_load()
+        root.update_idletasks()
+        assert app.affinity_dataset.valid_rows == 5
+        assert app.affinity_analysis.event_count == 5
+        assert "SKUs 3" in app.affinity_kpis.get()
+        assert app.affinity_heatmap_skus
+        app.affinity_min_shared.set("1")
+        app.affinity_sku_search.set("SKU_A")
+        app.apply_affinity_filters()
+        assert app.affinity_selected_sku is not None
+        assert app.affinity_related_tree.get_children()
+        related_item = app.affinity_related_tree.get_children()[0]
+        app.affinity_related_tree.selection_set(related_item)
+        app.affinity_related_double_click()
+        assert app.affinity_sku_search.get() == "SKU_B"
+        app.affinity_start_date.set("2026-01-02")
+        app.affinity_end_date.set("2026-01-02")
+        app.apply_affinity_filters()
+        assert app.affinity_analysis.event_count == 3
+        affinity_export = temp / "gui-affinity.affinity.json"
+        original_save_dialog = gui.filedialog.asksaveasfilename
+        gui.filedialog.asksaveasfilename = lambda **_kwargs: str(affinity_export)
+        try:
+            app.export_affinity()
+            deadline = time.monotonic() + 10
+            while app.affinity_export_worker and app.affinity_export_worker.is_alive():
+                root.update()
+                time.sleep(0.01)
+                assert time.monotonic() < deadline
+            app.poll_affinity_export()
+        finally:
+            gui.filedialog.asksaveasfilename = original_save_dialog
+        assert affinity_export.exists()
+        assert (temp / "gui-affinity_sku_store.csv").exists()
+        assert (temp / "gui-affinity_sku_pairs.csv").exists()
 
         # Slotting tab: load/draw map, zone every rack, generate, and inspect.
         app.load_slot_building()
@@ -189,6 +252,66 @@ def main() -> None:
         saved_payload = app.layouts.load(layout_path)
         assert saved_payload["schema"] == "inventory_slotting_layout/v2"
         assert saved_payload["location_attributes"][special_slot]["chilled"] is True
+
+        # ABC + affinity: calculate workbook/map-specific values, expose them,
+        # then accept an edited regeneration and persist both input and tuning.
+        with Path(app.slot_velocity_path.get()).open(
+            encoding="utf-8-sig", newline=""
+        ) as stream:
+            affinity_skus = [row["sku"] for row in csv.DictReader(stream)][:3]
+        affinity_velocity_path = temp / "slot-affinity-velocity.csv"
+        with affinity_velocity_path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=("sku", "pick_frequency", "velocity_class")
+            )
+            writer.writeheader()
+            for index, sku in enumerate(affinity_skus):
+                writer.writerow({
+                    "sku": sku,
+                    "pick_frequency": 100 - index,
+                    "velocity_class": "A",
+                })
+        slot_affinity_path = temp / "slot-affinity-orders.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Date", "Store ID", "Item or SKU"])
+        picked_date = date(2026, 2, 1)
+        for store, pair, count in (
+            ("STORE_AB", affinity_skus[:2], 5),
+            ("STORE_AC", (affinity_skus[0], affinity_skus[2]), 2),
+            ("STORE_BC", affinity_skus[1:], 1),
+        ):
+            for _ in range(count):
+                for sku in pair:
+                    sheet.append([picked_date, store, sku])
+                picked_date += timedelta(days=1)
+        workbook.save(slot_affinity_path)
+        affinity_layout_path = temp / "workflow-affinity.slotting.json"
+        app.slot_strategy.set("abc_affinity")
+        app.slot_strategy_changed()
+        app.slot_velocity_path.set(str(affinity_velocity_path))
+        app.slot_chilled_path.set("")
+        app.slot_affinity_path.set(str(slot_affinity_path))
+        app.slot_affinity_weight.set("60")
+        app.slot_output_path.set(str(affinity_layout_path))
+        app.run_slotting()
+        root.update_idletasks()
+        assert affinity_layout_path.exists()
+        assert app.slot_affinity_recommendation["parameter_status"] == "AUTO_SUGGESTED"
+        assert app.slot_affinity_min_shared.get()
+        automatic_payload = app.layouts.load(affinity_layout_path)
+        assert automatic_payload["sources"]["affinity_order_workbook"] == str(
+            slot_affinity_path.resolve()
+        )
+        assert automatic_payload["affinity_configuration"]["parameter_status"] == "AUTO_SUGGESTED"
+        app.slot_affinity_max_service.set("0")
+        app.slot_affinity_min_shared.set("1")
+        app.slot_affinity_min_score.set("0")
+        app.run_slotting(use_adjusted=True)
+        adjusted_payload = app.layouts.load(affinity_layout_path)
+        assert adjusted_payload["affinity_configuration"]["parameter_status"] == "USER_ADJUSTED"
+        assert adjusted_payload["affinity_configuration"]["minimum_shared_store_days"] == 1
+
         app.slot_location_attributes = {}
         app.load_slotting_configuration(layout_path)
         assert app.slot_location_attributes[special_slot]["chilled"] is True

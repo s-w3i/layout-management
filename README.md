@@ -2,8 +2,8 @@
 
 `rmf_grid_map_editor.py` is a Python desktop application for creating a
 grid-based Open-RMF warehouse map, assigning inventory zones, generating a
-basic ABC slotting layout, and demonstrating inventory search and position
-swaps.
+basic ABC slotting layout, exploring SKU/store affinity, and demonstrating
+inventory search and position swaps.
 
 The application does not require a warehouse drawing. Grid point `(0, 0)` is
 the bottom-left point of a generated map, and positive Y points upward.
@@ -13,13 +13,14 @@ the bottom-left point of a generated map, and positive Y points upward.
 1. [Install and start](#install-and-start)
 2. [Application workflow](#application-workflow)
 3. [Grid Map Editor tab](#1-grid-map-editor-tab)
-4. [Inventory Slotting tab](#2-inventory-slotting-tab)
-5. [Inventory Operations Demo tab](#3-inventory-operations-demo-tab)
-6. [Inventory address rules](#inventory-address-rules)
-7. [Command-line map generation](#command-line-map-generation)
-8. [Files and folders](#files-and-folders)
-9. [Code architecture](#code-architecture)
-10. [Troubleshooting](#troubleshooting)
+4. [SKU Affinity tab](#2-sku-affinity-tab)
+5. [Inventory Slotting tab](#3-inventory-slotting-tab)
+6. [Inventory Operations Demo tab](#4-inventory-operations-demo-tab)
+7. [Inventory address rules](#inventory-address-rules)
+8. [Command-line map generation](#command-line-map-generation)
+9. [Files and folders](#files-and-folders)
+10. [Code architecture](#code-architecture)
+11. [Troubleshooting](#troubleshooting)
 
 ## Install and start
 
@@ -44,12 +45,13 @@ cd layout-management
 python3 rmf_grid_map_editor.py
 ```
 
-The application opens with three tabs:
+The application opens with four tabs:
 
 | Tab | Purpose |
 |---|---|
 | **Grid Map Editor** | Create the grid, place racks and workstations, and export RMF YAML |
-| **Inventory Slotting** | Assign zones and generate an ABC slotting recommendation |
+| **SKU Affinity** | Explore SKU–store frequency and SKU relationships from line-level orders |
+| **Inventory Slotting** | Generate an ABC-only or ABC-plus-affinity recommendation |
 | **Inventory Operations Demo** | Search inventory and demonstrate SKU or AMR-shelf swaps |
 
 ## Application workflow
@@ -59,13 +61,16 @@ For a new warehouse, use the tabs in this order:
 1. Create the warehouse grid in **Grid Map Editor**.
 2. Place rack pickup points and workstation drop-off points.
 3. Save the editable project and export the RMF building YAML.
-4. Open **Inventory Slotting** and load the building YAML.
-5. Group every rack into a zone.
-6. Review the automatically initialized zone capacities and mark real chilled zones.
-7. Load the ABC SKU velocity CSV and optional chilled-requirements CSV, then generate the slotting layout.
-8. Open **Inventory Operations Demo** and load the generated `.slotting.json`.
-9. Search for SKUs or demonstrate position swaps.
-10. Save operation-demo changes to a new JSON file when required.
+4. Open **SKU Affinity**, analyze the order workbook, and review SKU relationships.
+5. Export the affinity snapshot and CSV review files when required.
+6. Open **Inventory Slotting** and load the building YAML.
+7. Group every rack into a zone.
+8. Review the initialized zone capacities and mark real chilled zones.
+9. Load the ABC SKU velocity CSV and optional chilled-requirements CSV. Choose
+   `basic` or `abc_affinity`; for affinity, also select the order-history Excel
+   file and the desired ABC/affinity weight.
+10. Open **Inventory Operations Demo** and load the generated `.slotting.json`.
+11. Search for SKUs or demonstrate position swaps, then save changes when required.
 
 To use the included demonstration map, start directly from the Inventory
 Slotting tab. Its default building file is:
@@ -150,7 +155,48 @@ The editor has two different save formats:
 Use **Load editable project…** to reopen a `.grid.json` project. A building YAML
 is an export format and cannot replace the editable project file.
 
-## 2. Inventory Slotting tab
+## 2. SKU Affinity tab
+
+The **SKU Affinity** tab is an exploratory view and export tool. It never
+modifies racks or layouts directly. The same raw workbook can also be selected
+by the `abc_affinity` slotting strategy, which recalculates affinity from that
+file during generation.
+
+The default workbook is `resources/data/Sample Data.xlsx`. The application
+automatically selects the first worksheet containing `Date`, `Store ID`, and
+`Item or SKU`. Every valid row is one line-order event; quantity is deliberately
+ignored. Blank identifiers and invalid dates are skipped and reported.
+
+For SKU `i` and store `s`, direct line frequency is:
+
+```text
+F(i,s) = number of rows containing SKU i and Store ID s
+```
+
+SKU affinity uses one binary fulfillment group for every `(Store ID, Date)`.
+Duplicate lines for an SKU in the same store-day count once for affinity. Two
+SKUs are scored by cosine similarity of their presence across these groups. The
+UI displays the score together with shared store-day count, total line orders,
+and strongest contributing stores. Relationships require at least three shared
+store-days by default.
+
+Use the tab as follows:
+
+1. Confirm the workbook and click **Analyze**. The first scan runs in the
+   background and writes a source-fingerprinted cache under `.cache/`.
+2. Review the KPI line, then optionally narrow the inclusive date range.
+3. Search for a SKU or select a heatmap cell.
+4. Use **Store–SKU Heatmap** for direct frequencies and **SKU Relationship Map**
+   for the selected SKU's 12 strongest qualifying relationships.
+5. Double-click a related SKU to recenter the graph. Sort either detail table by
+   clicking its column headings.
+6. Click **Export JSON + CSV…** to write a reusable `.affinity.json` snapshot,
+   a SKU–store frequency CSV, and a SKU-pair CSV for the active filters.
+
+See the [SKU affinity analysis guide](docs/sku-affinity-analysis.md) for the
+metric, cache, export, and error-handling details.
+
+## 3. Inventory Slotting tab
 
 ### Input files
 
@@ -161,6 +207,7 @@ The default inputs are:
 | Building YAML | `resources/map/demo.building.yaml` |
 | ABC SKU velocity CSV | `resources/data/sku_velocity_output/sku_velocity_summary.csv` |
 | Chilled SKU CSV | `resources/data/demo_chilled_requirements.csv` |
+| Affinity order workbook | `resources/data/Sample Data.xlsx` |
 | Output layout | `resources/data/basic_slotting_layout.slotting.json` |
 
 The YAML must contain at least one rack with `pickup_dispenser` and at least one
@@ -232,7 +279,11 @@ and `Z02/A02`, even if another zone already uses those aisle numbers.
 
 Select:
 
-- **Strategy** — currently `basic`.
+- **Strategy** — `basic` keeps the existing ABC-only flow; `abc_affinity`
+  preserves ABC and physical constraints, then uses store-day relationships to
+  choose among otherwise eligible locations.
+- **Affinity weight** — user-selected from 0% (service/ABC emphasis) to 100%
+  (affinity emphasis within the ABC constraints).
 - **Handling unit** — `AMR shelf`, `Tote`, or `Pallet`.
 - **Levels** — vertical storage levels in each fixed bay.
 - **Slots per level** — SKU positions on each level.
@@ -299,6 +350,16 @@ and assignments from an existing `.slotting.json`.
 5. Confirm or clear the optional chilled-SKU CSV path.
 6. Click **Generate slotting layout**.
 
+With `abc_affinity`, the initial generation derives these values from the
+selected workbook and current map: minimum shared store-days, minimum affinity
+score, and maximum service-distance increase. It searches empirical relationship
+quantiles, then selects a map-distance quantile from relationship confidence and
+the user-selected affinity weight. No sample-specific threshold
+is reused for another Excel file. The calculated values appear in the UI after
+generation; edit them and click **Regenerate with edited values**, or click
+**Recalculate automatic suggestion** after changing the workbook, map, or
+weight.
+
 The **basic** strategy:
 
 1. Calculates the directed route distance from each rack to every workstation.
@@ -318,6 +379,14 @@ The **basic** strategy:
    those requirements as local child-slot overrides and assigns the SKU.
 9. Uses average workstation distance to rank otherwise equivalent racks and
    returns general not-enough-space only after every storage slot is occupied.
+
+The **abc_affinity** strategy runs that same ABC-first ordering and compatibility
+logic. For eligible locations at the same ABC/physical priority, it minimizes a
+weighted combination of service distance and distance to already placed related
+SKUs. Relationship strength is cosine similarity of binary SKU presence by
+`(Store ID, Date)`, weighted by shared store-days. The generated layout reports
+its selected parameters and compares affinity-pair and service distance against
+the basic baseline.
 
 Chilled SKUs still require chilled slots and ambient SKUs require non-chilled
 slots. If one temperature category has insufficient slots, the result reports a
@@ -360,12 +429,13 @@ show multiple flags. The rack summary also shows chilled and physical-exception
 counts. Use **Show all assignments** to return to the complete table.
 
 The generated v2 `.slotting.json` is self-contained. It stores the building
-map, zone assignments, zone limits, chilled input metadata, strategy settings,
+map, zone assignments, zone limits, chilled and affinity input metadata,
+strategy settings, selected or edited affinity parameters,
 attribute catalog, local hierarchy values, physical SKU requirements,
 generated slot overrides, inventory assignments, and operation log. Existing
 v1 files remain loadable and are normalized with an empty attribute model.
 
-## 3. Inventory Operations Demo tab
+## 4. Inventory Operations Demo tab
 
 ### Load a slotting layout
 
@@ -497,6 +567,7 @@ layout_management_master/
 ├── sku_velocity_analysis.py
 ├── warehouse_layout/
 │   ├── cli.py                                     CLI application controller
+│   ├── affinity.py                                SKU/store affinity analysis and exports
 │   ├── config.py                                  Paths and schema constants
 │   ├── attributes.py                              Inheritance and compatibility service
 │   ├── attribute_editor.py                        Hierarchy attribute editor
@@ -508,6 +579,7 @@ layout_management_master/
 │   └── slotting.py                                Routing, addressing and slotting
 ├── tests/
 │   ├── test_attributes.py                         Attribute and compatibility tests
+│   ├── test_affinity.py                           Affinity analysis and cache tests
 │   └── test_services.py                           Service regression tests
 ├── docs/
 │   ├── README.md                                  Documentation index
@@ -534,9 +606,10 @@ is organized by responsibility inside the `warehouse_layout` package:
 
 | Module | Main class | Responsibility |
 |---|---|---|
+| `affinity.py` | `AffinityService` | Parse line orders, derive SKU/store affinity, cache events and export analysis |
 | `domain.py` | `GridProject`, `GridSpec`, `Marker` | Grid state, validation and RMF dictionary construction |
 | `rmf.py` | `RmfMapService` | Load/save editable projects and import/export building YAML |
-| `slotting.py` | `SlottingService` | Rack routing, zone-local aisles, dynamic addresses and basic slotting |
+| `slotting.py` | `SlottingService` | Rack routing, zone-local aisles, dynamic addresses, ABC slotting and ABC-plus-affinity tuning |
 | `slotting.py` | `SlottingLayoutRepository` | Read/write self-contained slotting JSON |
 | `inventory.py` | `InventoryService` | SKU lookup, SKU-slot swap and AMR-shelf swap |
 | `attributes.py` | `StorageAttributeService` | Inheritance, physical classification and compatibility |
@@ -550,16 +623,17 @@ Run the service regression tests from the repository root:
 python3 -m unittest discover -s tests -v
 ```
 
-On Linux, run the automated three-tab GUI workflow with a virtual display:
+On Linux, run the automated four-tab GUI workflow with a virtual display:
 
 ```bash
 sudo apt install xvfb
 xvfb-run -a python3 -m tests.gui_workflow_smoke
 ```
 
-The GUI smoke test covers grid editing, map loading and drawing, rectangle zone
-selection, all handling-unit address models, rack inspection, SKU search,
-SKU-slot swap, AMR-shelf swap, and operation-layout saving.
+The GUI smoke test covers grid editing, affinity loading and filtering, affinity
+exports, automatic and edited affinity slotting, map loading and drawing, rectangle zone selection, all handling-unit
+address models, rack inspection, SKU search, SKU-slot swap, AMR-shelf swap, and
+operation-layout saving.
 
 ## Troubleshooting
 
@@ -617,4 +691,5 @@ generated files are not automatically migrated when address rules change.
 ## Related documentation
 
 - [SKU velocity analysis](docs/sku-velocity-analysis.md)
+- [SKU affinity analysis](docs/sku-affinity-analysis.md)
 - [Additional RMF editor notes](docs/rmf-grid-map-editor.md)

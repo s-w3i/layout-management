@@ -8,6 +8,7 @@ from .attributes import (
     STANDARD_STORAGE_DEFAULTS,
     StorageAttributeService,
 )
+from .affinity import AffinityAnalysis, AffinityDataset, AffinityService
 from .domain import GridPosition, GridProject, GridSpec, Marker
 from .inventory import InventoryService
 from .rmf import RmfMapService
@@ -15,6 +16,9 @@ from .slotting import SlottingLayoutRepository, SlottingService
 
 __all__ = [
     "AttributeDefinition",
+    "AffinityAnalysis",
+    "AffinityDataset",
+    "AffinityService",
     "CORE_ATTRIBUTE_KEYS",
     "OVERSIZE_STORAGE_DEFAULTS",
     "PHYSICAL_ATTRIBUTE_KEYS",

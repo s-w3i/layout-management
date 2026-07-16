@@ -5,7 +5,10 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
+
+from openpyxl import Workbook
 
 from warehouse_layout import (
     GridProject,
@@ -16,6 +19,7 @@ from warehouse_layout import (
     SlottingLayoutRepository,
     SlottingService,
 )
+from warehouse_layout.affinity import AffinityService
 
 
 class WarehouseServiceTests(unittest.TestCase):
@@ -43,6 +47,25 @@ class WarehouseServiceTests(unittest.TestCase):
             }
             for index in range(6)
         ]
+
+    def affinity_analysis(self, directory):
+        path = Path(directory) / "orders.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Date", "Store ID", "Item or SKU"])
+        picked_date = date(2026, 1, 1)
+        for store, pair, count in (
+            ("STORE_AB", ("SKU_00", "SKU_01"), 5),
+            ("STORE_AC", ("SKU_00", "SKU_02"), 2),
+            ("STORE_BC", ("SKU_01", "SKU_02"), 1),
+        ):
+            for _ in range(count):
+                for sku in pair:
+                    sheet.append([picked_date, store, sku])
+                picked_date += timedelta(days=1)
+        workbook.save(path)
+        service = AffinityService(Path(directory) / "cache")
+        return path, service.analyze(service.load_orders(path))
 
     def test_project_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -149,10 +172,67 @@ class WarehouseServiceTests(unittest.TestCase):
                 levels_per_rack=1,
                 slots_per_level=3,
                 zone_assignments={"G0_0": "Z01", "G2_0": "Z02"},
+                source_affinity="/input/orders.xlsx",
+                affinity_configuration={"minimum_shared_store_days": 4},
             )
             payload = self.layouts.load(path)
         self.assertEqual(payload["assignments"], rows)
         self.assertEqual(payload["summary"], summary)
+        self.assertEqual(
+            payload["sources"]["affinity_order_workbook"], "/input/orders.xlsx"
+        )
+        self.assertEqual(
+            payload["affinity_configuration"]["minimum_shared_store_days"], 4
+        )
+
+    def test_abc_affinity_auto_tunes_and_accepts_user_adjustment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _path, analysis = self.affinity_analysis(directory)
+            baseline_rows, baseline_summary = self.slotting.generate_basic(
+                copy.deepcopy(self.building), copy.deepcopy(self.skus), 1, 3
+            )
+            auto_rows, auto_summary = self.slotting.generate_abc_affinity(
+                copy.deepcopy(self.building),
+                copy.deepcopy(self.skus),
+                analysis,
+                0.6,
+                1,
+                3,
+            )
+            adjusted_rows, adjusted_summary = self.slotting.generate_abc_affinity(
+                copy.deepcopy(self.building),
+                copy.deepcopy(self.skus),
+                analysis,
+                0.6,
+                1,
+                3,
+                tuning_parameters={
+                    "maximum_service_distance_increase": 0.0,
+                    "minimum_shared_store_days": 1,
+                    "minimum_affinity_score": 0.0,
+                },
+            )
+
+        self.assertEqual(auto_summary["affinity_tuning"]["parameter_status"], "AUTO_SUGGESTED")
+        self.assertEqual(auto_summary["strategy"], "abc_affinity")
+        self.assertEqual(auto_summary["assigned_count"], baseline_summary["assigned_count"])
+        self.assertEqual(
+            [row["velocity_class"] for row in auto_rows],
+            [row["velocity_class"] for row in baseline_rows],
+        )
+        self.assertTrue(
+            all(
+                "affinity_weight" in row
+                for row in auto_rows
+                if row["assignment_status"] == "ASSIGNED"
+            )
+        )
+        adjusted = adjusted_summary["affinity_tuning"]
+        self.assertEqual(adjusted["parameter_status"], "USER_ADJUSTED")
+        self.assertEqual(adjusted["minimum_shared_store_days"], 1)
+        self.assertEqual(adjusted["minimum_affinity_score"], 0.0)
+        self.assertEqual(adjusted["maximum_service_distance_increase"], 0.0)
+        self.assertEqual(len(adjusted_rows), len(auto_rows))
 
     def test_zone_id_auto_increment(self):
         self.assertEqual(self.slotting.next_zone_id("Z01"), "Z02")

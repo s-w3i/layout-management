@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime, timezone
+import queue
+import threading
+from datetime import date, datetime, timezone
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import numpy as np
 import yaml
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
+from .affinity import AffinityCancelledError, AffinityService
 from .attribute_editor import HierarchyAttributeEditor
 from .attributes import (
     PHYSICAL_ATTRIBUTE_KEYS,
@@ -18,6 +24,8 @@ from .attributes import (
     StorageAttributeService,
 )
 from .config import (
+    DEFAULT_AFFINITY_INPUT,
+    DEFAULT_AFFINITY_OUTPUT,
     DEFAULT_BUILDING_INPUT,
     DEFAULT_BUILDING_OUTPUT,
     DEFAULT_CHILLED_INPUT,
@@ -32,7 +40,7 @@ from .zone_settings_editor import ZoneStorageSettingsEditor
 
 
 class GridMapEditorApp:
-    """Coordinate the three-tab desktop UI and application services."""
+    """Coordinate the four-tab desktop UI and application services."""
 
     @staticmethod
     def sku_storage_flags(row):
@@ -79,6 +87,7 @@ class GridMapEditorApp:
         self.root.geometry("1220x820")
         self.rmf_maps = RmfMapService()
         self.attributes = StorageAttributeService()
+        self.affinity = AffinityService()
         self.slotting = SlottingService(self.rmf_maps, self.attributes)
         self.layouts = SlottingLayoutRepository()
         self.inventory = InventoryService(self.slotting, self.attributes)
@@ -110,11 +119,14 @@ class GridMapEditorApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         notebook = ttk.Notebook(self.root)
+        self.notebook = notebook
         notebook.grid(row=0, column=0, sticky="nsew")
         map_tab = ttk.Frame(notebook)
+        affinity_tab = ttk.Frame(notebook)
         slotting_tab = ttk.Frame(notebook)
         operations_tab = ttk.Frame(notebook)
         notebook.add(map_tab, text="Grid Map Editor")
+        notebook.add(affinity_tab, text="SKU Affinity")
         notebook.add(slotting_tab, text="Inventory Slotting")
         notebook.add(operations_tab, text="Inventory Operations Demo")
         map_tab.columnconfigure(1, weight=1)
@@ -175,8 +187,694 @@ class GridMapEditorApp:
         self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
         self.canvas.bind("<Configure>", lambda _event: self.redraw())
         ttk.Label(canvas_frame, textvariable=self.status).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._build_affinity_tab(affinity_tab)
         self._build_slotting_tab(slotting_tab)
         self._build_operations_tab(operations_tab)
+
+    def _build_affinity_tab(self, parent):
+        self.affinity_input_path = tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
+        self.affinity_start_date = tk.StringVar()
+        self.affinity_end_date = tk.StringVar()
+        self.affinity_sku_search = tk.StringVar()
+        self.affinity_top_skus = tk.StringVar(value="30")
+        self.affinity_top_stores = tk.StringVar(value="20")
+        self.affinity_min_shared = tk.StringVar(value="3")
+        self.affinity_status = tk.StringVar(
+            value="Choose an order-history workbook and click Analyze."
+        )
+        self.affinity_kpis = tk.StringVar(
+            value=(
+                "Line orders —  ·  SKUs —  ·  Stores —  ·  Store-days —  ·  "
+                "SKU–store pairs —"
+            )
+        )
+        self.affinity_selected_summary = tk.StringVar(
+            value="Select or search for a SKU to inspect its relationships."
+        )
+        self.affinity_progress = tk.DoubleVar(value=0.0)
+        self.affinity_dataset = None
+        self.affinity_analysis = None
+        self.affinity_selected_sku = None
+        self.affinity_heatmap_skus = []
+        self.affinity_heatmap_stores = []
+        self.affinity_worker = None
+        self.affinity_export_worker = None
+        self.affinity_cancel_event = threading.Event()
+        self.affinity_messages = queue.Queue()
+        self.affinity_export_messages = queue.Queue()
+
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(3, weight=1)
+
+        source = ttk.LabelFrame(parent, text="Order history", padding=10)
+        source.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        source.columnconfigure(1, weight=1)
+        ttk.Label(source, text="Workbook").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(source, textvariable=self.affinity_input_path).grid(
+            row=0, column=1, sticky="ew"
+        )
+        ttk.Button(source, text="Browse…", command=self.browse_affinity_input).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+        self.affinity_analyze_button = ttk.Button(
+            source, text="Analyze", command=self.start_affinity_load
+        )
+        self.affinity_analyze_button.grid(row=0, column=3, padx=(8, 0))
+        self.affinity_cancel_button = ttk.Button(
+            source, text="Cancel", command=self.cancel_affinity_load, state="disabled"
+        )
+        self.affinity_cancel_button.grid(row=0, column=4, padx=(6, 0))
+        self.affinity_export_button = ttk.Button(
+            source, text="Export JSON + CSV…", command=self.export_affinity, state="disabled"
+        )
+        self.affinity_export_button.grid(row=0, column=5, padx=(12, 0))
+        ttk.Progressbar(
+            source, variable=self.affinity_progress, maximum=100, mode="determinate"
+        ).grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 3))
+        ttk.Label(source, textvariable=self.affinity_status, foreground="#315b66").grid(
+            row=2, column=0, columnspan=6, sticky="w"
+        )
+
+        filters = ttk.LabelFrame(parent, text="Analysis filters", padding=10)
+        filters.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
+        fields = (
+            ("Start date", self.affinity_start_date, 12),
+            ("End date", self.affinity_end_date, 12),
+            ("Find SKU", self.affinity_sku_search, 14),
+            ("Top SKUs", self.affinity_top_skus, 6),
+            ("Top stores", self.affinity_top_stores, 6),
+            ("Min. shared store-days", self.affinity_min_shared, 6),
+        )
+        column = 0
+        for label, variable, width in fields:
+            ttk.Label(filters, text=label).grid(row=0, column=column, sticky="w", padx=(0, 4))
+            entry = (
+                ttk.Spinbox(filters, from_=1, to=100, textvariable=variable, width=width)
+                if label in {"Top SKUs", "Top stores", "Min. shared store-days"}
+                else ttk.Entry(filters, textvariable=variable, width=width)
+            )
+            entry.grid(row=0, column=column + 1, sticky="w", padx=(0, 10))
+            if label == "Find SKU":
+                entry.bind("<Return>", lambda _event: self.apply_affinity_filters())
+            column += 2
+        self.affinity_filter_button = ttk.Button(
+            filters, text="Apply filters", command=self.apply_affinity_filters,
+            state="disabled",
+        )
+        self.affinity_filter_button.grid(row=0, column=column, padx=(2, 5))
+        self.affinity_reset_button = ttk.Button(
+            filters, text="Reset", command=self.reset_affinity_filters, state="disabled"
+        )
+        self.affinity_reset_button.grid(row=0, column=column + 1)
+        ttk.Label(
+            filters,
+            text="Dates are inclusive (YYYY-MM-DD). Each valid row counts as one order event.",
+            foreground="#5f6d73",
+        ).grid(row=1, column=0, columnspan=column + 2, sticky="w", pady=(7, 0))
+
+        ttk.Label(
+            parent, textvariable=self.affinity_kpis,
+            font=("TkDefaultFont", 10, "bold"), foreground="#234a57",
+        ).grid(row=2, column=0, sticky="w", padx=16, pady=(2, 5))
+
+        body = ttk.Panedwindow(parent, orient="horizontal")
+        body.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        visual = ttk.LabelFrame(body, text="Affinity explorer", padding=8)
+        details = ttk.LabelFrame(body, text="Selected SKU details", padding=8)
+        body.add(visual, weight=3)
+        body.add(details, weight=2)
+        visual.columnconfigure(0, weight=1)
+        visual.rowconfigure(0, weight=1)
+        details.columnconfigure(0, weight=1)
+        details.rowconfigure(2, weight=1)
+
+        views = ttk.Notebook(visual)
+        views.grid(row=0, column=0, sticky="nsew")
+        heatmap_frame = ttk.Frame(views)
+        graph_frame = ttk.Frame(views)
+        views.add(heatmap_frame, text="Store–SKU Heatmap")
+        views.add(graph_frame, text="SKU Relationship Map")
+        heatmap_frame.columnconfigure(0, weight=1)
+        heatmap_frame.rowconfigure(0, weight=1)
+        graph_frame.columnconfigure(0, weight=1)
+        graph_frame.rowconfigure(0, weight=1)
+
+        self.affinity_heatmap_figure = Figure(figsize=(7.2, 5.2), dpi=100)
+        self.affinity_heatmap_canvas = FigureCanvasTkAgg(
+            self.affinity_heatmap_figure, master=heatmap_frame
+        )
+        self.affinity_heatmap_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.affinity_heatmap_canvas.mpl_connect(
+            "button_press_event", self.affinity_heatmap_click
+        )
+
+        self.affinity_graph_canvas = tk.Canvas(
+            graph_frame, background="#071421", highlightthickness=0
+        )
+        self.affinity_graph_canvas.grid(row=0, column=0, sticky="nsew")
+        self.affinity_graph_canvas.bind(
+            "<Configure>", lambda _event: self.draw_affinity_graph()
+        )
+        self.affinity_graph_canvas.tag_bind(
+            "sku_node", "<Button-1>", self.affinity_graph_click
+        )
+        ttk.Label(
+            graph_frame,
+            text="Click a related SKU to recenter. Node size = order frequency; edge width = affinity.",
+            foreground="#5f6d73",
+        ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        ttk.Label(
+            details, textvariable=self.affinity_selected_summary,
+            justify="left", wraplength=480,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Separator(details).grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        detail_tabs = ttk.Notebook(details)
+        detail_tabs.grid(row=2, column=0, sticky="nsew")
+        related_frame = ttk.Frame(detail_tabs)
+        stores_frame = ttk.Frame(detail_tabs)
+        detail_tabs.add(related_frame, text="Related SKUs")
+        detail_tabs.add(stores_frame, text="Store Frequency")
+        self.affinity_related_tree = self._build_affinity_tree(
+            related_frame,
+            ("sku", "affinity", "shared", "selected", "related", "stores"),
+            {
+                "sku": ("Related SKU", 95), "affinity": ("Affinity", 75),
+                "shared": ("Shared store-days", 105), "selected": ("Selected orders", 95),
+                "related": ("Related orders", 95), "stores": ("Strongest stores", 260),
+            },
+        )
+        self.affinity_related_tree.bind(
+            "<Double-1>", self.affinity_related_double_click
+        )
+        self.affinity_store_tree = self._build_affinity_tree(
+            stores_frame,
+            ("store", "orders", "share"),
+            {
+                "store": ("Store ID", 110), "orders": ("Line orders", 100),
+                "share": ("SKU share", 90),
+            },
+        )
+        self.draw_affinity_heatmap()
+        self.draw_affinity_graph()
+
+    def _build_affinity_tree(self, parent, columns, specifications):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(parent, columns=columns, show="headings")
+        tree._affinity_sort_reverse = {}
+        for column in columns:
+            heading, width = specifications[column]
+            tree.heading(
+                column, text=heading,
+                command=lambda c=column, t=tree: self.sort_affinity_tree(t, c),
+            )
+            tree.column(
+                column, width=width,
+                anchor="w" if column in {"sku", "store", "stores"} else "center",
+            )
+        yscroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        xscroll = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        return tree
+
+    @staticmethod
+    def sort_affinity_tree(tree, column):
+        reverse = tree._affinity_sort_reverse.get(column, False)
+
+        def value(item):
+            raw = str(tree.set(item, column)).replace(",", "").rstrip("%")
+            try:
+                return (0, float(raw))
+            except ValueError:
+                return (1, raw.casefold())
+
+        rows = sorted(tree.get_children(""), key=value, reverse=reverse)
+        for position, item in enumerate(rows):
+            tree.move(item, "", position)
+        tree._affinity_sort_reverse[column] = not reverse
+
+    def browse_affinity_input(self):
+        path = filedialog.askopenfilename(
+            title="Select order-history workbook",
+            filetypes=(("Excel workbooks", "*.xlsx"), ("All files", "*")),
+        )
+        if path:
+            self.affinity_input_path.set(path)
+
+    def start_affinity_load(self):
+        if self.affinity_worker and self.affinity_worker.is_alive():
+            return
+        path = Path(self.affinity_input_path.get().strip()).expanduser()
+        if not path.exists():
+            messagebox.showerror("Affinity analysis", f"Workbook not found:\n{path}")
+            return
+        self.affinity_cancel_event.clear()
+        while not self.affinity_messages.empty():
+            try:
+                self.affinity_messages.get_nowait()
+            except queue.Empty:
+                break
+        self.affinity_progress.set(0)
+        self.affinity_status.set("Opening workbook…")
+        self.affinity_dataset = None
+        self.affinity_analysis = None
+        self.affinity_selected_sku = None
+        self.affinity_kpis.set(
+            "Line orders —  ·  SKUs —  ·  Stores —  ·  Store-days —  ·  "
+            "SKU–store pairs —"
+        )
+        self.draw_affinity_heatmap()
+        self.draw_affinity_graph()
+        self.populate_affinity_details()
+        self.affinity_analyze_button.configure(state="disabled")
+        self.affinity_cancel_button.configure(state="normal")
+        self.affinity_export_button.configure(state="disabled")
+        self.affinity_filter_button.configure(state="disabled")
+        self.affinity_reset_button.configure(state="disabled")
+
+        def progress(done, total, message):
+            self.affinity_messages.put(("progress", done, total, message))
+
+        def worker():
+            try:
+                dataset = self.affinity.load_orders(
+                    path,
+                    progress=progress,
+                    cancelled=self.affinity_cancel_event.is_set,
+                )
+                self.affinity_messages.put(("loaded", dataset))
+            except AffinityCancelledError as exc:
+                self.affinity_messages.put(("cancelled", str(exc)))
+            except Exception as exc:
+                self.affinity_messages.put(("error", exc))
+
+        self.affinity_worker = threading.Thread(target=worker, daemon=True)
+        self.affinity_worker.start()
+        self.root.after(80, self.poll_affinity_load)
+
+    def poll_affinity_load(self):
+        finished = False
+        while True:
+            try:
+                message = self.affinity_messages.get_nowait()
+            except queue.Empty:
+                break
+            kind = message[0]
+            if kind == "progress":
+                _kind, done, total, status = message
+                self.affinity_progress.set(min(100.0, float(done) * 100.0 / max(1, total)))
+                self.affinity_status.set(status)
+            elif kind == "loaded":
+                self.complete_affinity_load(message[1])
+                finished = True
+            elif kind == "cancelled":
+                self.affinity_status.set("Analysis cancelled; no partial cache was saved.")
+                finished = True
+            elif kind == "error":
+                self.affinity_status.set("Unable to analyze the selected workbook.")
+                messagebox.showerror("Affinity analysis", str(message[1]))
+                finished = True
+        if not finished and self.affinity_worker and self.affinity_worker.is_alive():
+            self.root.after(80, self.poll_affinity_load)
+            return
+        if finished or not (self.affinity_worker and self.affinity_worker.is_alive()):
+            self.affinity_analyze_button.configure(state="normal")
+            self.affinity_cancel_button.configure(state="disabled")
+            if self.affinity_analysis is not None:
+                self.affinity_export_button.configure(state="normal")
+                self.affinity_filter_button.configure(state="normal")
+                self.affinity_reset_button.configure(state="normal")
+
+    def cancel_affinity_load(self):
+        self.affinity_cancel_event.set()
+        self.affinity_status.set("Cancelling after the current workbook row…")
+        self.affinity_cancel_button.configure(state="disabled")
+
+    def complete_affinity_load(self, dataset):
+        self.affinity_dataset = dataset
+        self.affinity_start_date.set(dataset.min_date.isoformat())
+        self.affinity_end_date.set(dataset.max_date.isoformat())
+        self.affinity_sku_search.set("")
+        source = "local cache" if dataset.cache_used else "workbook"
+        self.affinity_status.set(
+            f"Loaded {dataset.valid_rows:,} line orders from {dataset.worksheet} "
+            f"using {source}."
+        )
+        self.affinity_progress.set(100)
+        self.apply_affinity_filters(show_errors=False)
+
+    def _affinity_filter_values(self):
+        try:
+            start = date.fromisoformat(self.affinity_start_date.get().strip())
+            end = date.fromisoformat(self.affinity_end_date.get().strip())
+        except ValueError as exc:
+            raise ValueError("Start and end dates must use YYYY-MM-DD") from exc
+        try:
+            top_skus = int(self.affinity_top_skus.get())
+            top_stores = int(self.affinity_top_stores.get())
+            min_shared = int(self.affinity_min_shared.get())
+        except ValueError as exc:
+            raise ValueError(
+                "Top counts and minimum shared store-days must be whole numbers"
+            ) from exc
+        if not 1 <= top_skus <= 100 or not 1 <= top_stores <= 100:
+            raise ValueError("Top SKU and store counts must be between 1 and 100")
+        if not 1 <= min_shared <= 10000:
+            raise ValueError("Minimum shared store-days must be at least 1")
+        return start, end, top_skus, top_stores, min_shared
+
+    def apply_affinity_filters(self, show_errors=True):
+        if self.affinity_dataset is None:
+            if show_errors:
+                messagebox.showinfo("Affinity analysis", "Analyze an order workbook first.")
+            return
+        try:
+            start, end, _top_skus, _top_stores, _min_shared = self._affinity_filter_values()
+            analysis = self.affinity.analyze(self.affinity_dataset, start, end)
+        except ValueError as exc:
+            self.affinity_status.set(str(exc))
+            self.affinity_analysis = None
+            self.affinity_selected_sku = None
+            self.affinity_kpis.set(
+                "Line orders 0  ·  SKUs 0  ·  Stores 0  ·  Store-days 0  ·  "
+                "SKU–store pairs 0"
+            )
+            self.affinity_export_button.configure(state="disabled")
+            self.draw_affinity_heatmap()
+            self.draw_affinity_graph()
+            self.populate_affinity_details()
+            if show_errors:
+                messagebox.showerror("Affinity filters", str(exc))
+            return
+        self.affinity_analysis = analysis
+        selected = analysis.resolve_sku(self.affinity_sku_search.get())
+        if self.affinity_sku_search.get().strip() and selected is None:
+            self.affinity_status.set(
+                f"No active SKU matches: {self.affinity_sku_search.get().strip()}"
+            )
+            self.affinity_selected_sku = None
+        else:
+            self.affinity_selected_sku = selected
+            self.affinity_status.set(
+                f"Showing {analysis.event_count:,} line orders from "
+                f"{analysis.start_date.isoformat()} through {analysis.end_date.isoformat()}."
+            )
+        self.affinity_kpis.set(
+            f"Line orders {analysis.event_count:,}  ·  "
+            f"SKUs {np.count_nonzero(analysis.sku_totals):,}  ·  "
+            f"Stores {np.count_nonzero(analysis.store_totals):,}  ·  "
+            f"Store-days {analysis.store_day_count:,}  ·  "
+            f"SKU–store pairs {analysis.observed_pairs:,}  ·  "
+            f"Skipped source rows {analysis.dataset.skipped_rows:,}"
+        )
+        self.draw_affinity_heatmap()
+        self.draw_affinity_graph()
+        self.populate_affinity_details()
+        self.affinity_export_button.configure(state="normal")
+        self.affinity_filter_button.configure(state="normal")
+        self.affinity_reset_button.configure(state="normal")
+
+    def reset_affinity_filters(self):
+        if self.affinity_dataset is None:
+            return
+        self.affinity_start_date.set(self.affinity_dataset.min_date.isoformat())
+        self.affinity_end_date.set(self.affinity_dataset.max_date.isoformat())
+        self.affinity_sku_search.set("")
+        self.affinity_top_skus.set("30")
+        self.affinity_top_stores.set("20")
+        self.affinity_min_shared.set("3")
+        self.apply_affinity_filters()
+
+    def draw_affinity_heatmap(self):
+        figure = self.affinity_heatmap_figure
+        figure.clear()
+        axis = figure.add_subplot(111)
+        analysis = self.affinity_analysis
+        if analysis is None:
+            axis.set_axis_off()
+            axis.text(
+                0.5, 0.5, "Analyze an order workbook to view SKU–store frequency.",
+                ha="center", va="center", color="#5f6d73", transform=axis.transAxes,
+            )
+            self.affinity_heatmap_skus = []
+            self.affinity_heatmap_stores = []
+            self.affinity_heatmap_canvas.draw_idle()
+            return
+        try:
+            _start, _end, top_sku_count, top_store_count, _shared = self._affinity_filter_values()
+        except ValueError:
+            top_sku_count, top_store_count = 30, 20
+        sku_indices = analysis.top_skus(top_sku_count)
+        if self.affinity_selected_sku is not None and self.affinity_selected_sku not in sku_indices:
+            sku_indices = [self.affinity_selected_sku] + sku_indices[: max(0, top_sku_count - 1)]
+        totals = analysis.frequency[sku_indices].sum(axis=0)
+        store_indices = [int(index) for index in np.argsort(-totals, kind="stable") if totals[index] > 0]
+        store_indices = store_indices[:top_store_count]
+        self.affinity_heatmap_skus = sku_indices
+        self.affinity_heatmap_stores = store_indices
+        if not sku_indices or not store_indices:
+            axis.set_axis_off()
+            axis.text(0.5, 0.5, "No frequency data for this selection.", ha="center", va="center")
+            self.affinity_heatmap_canvas.draw_idle()
+            return
+        values = np.log1p(analysis.frequency[np.ix_(sku_indices, store_indices)])
+        image = axis.imshow(values, aspect="auto", cmap="viridis", interpolation="nearest")
+        axis.set_xticks(range(len(store_indices)))
+        axis.set_xticklabels(
+            [analysis.dataset.stores[index] for index in store_indices],
+            rotation=55, ha="right", fontsize=7,
+        )
+        axis.set_yticks(range(len(sku_indices)))
+        axis.set_yticklabels(
+            [analysis.dataset.skus[index] for index in sku_indices], fontsize=7
+        )
+        axis.set_xlabel("Store ID")
+        axis.set_ylabel("SKU")
+        axis.set_title("Line-order frequency (log colour scale)")
+        figure.colorbar(image, ax=axis, fraction=0.03, pad=0.02, label="log(1 + orders)")
+        figure.tight_layout()
+        self.affinity_heatmap_canvas.draw_idle()
+
+    def affinity_heatmap_click(self, event):
+        if event.xdata is None or event.ydata is None:
+            return
+        row = int(round(event.ydata))
+        column = int(round(event.xdata))
+        if not (0 <= row < len(self.affinity_heatmap_skus)):
+            return
+        if not (0 <= column < len(self.affinity_heatmap_stores)):
+            return
+        sku_index = self.affinity_heatmap_skus[row]
+        store_index = self.affinity_heatmap_stores[column]
+        self.select_affinity_sku(sku_index)
+        count = int(self.affinity_analysis.frequency[sku_index, store_index])
+        self.affinity_status.set(
+            f"{self.affinity_analysis.dataset.stores[store_index]} ordered SKU "
+            f"{self.affinity_analysis.dataset.skus[sku_index]} on {count:,} line(s) "
+            "in the selected date range."
+        )
+
+    def select_affinity_sku(self, sku_index):
+        if self.affinity_analysis is None:
+            return
+        if int(self.affinity_analysis.sku_totals[sku_index]) <= 0:
+            return
+        self.affinity_selected_sku = int(sku_index)
+        self.affinity_sku_search.set(self.affinity_analysis.dataset.skus[sku_index])
+        self.draw_affinity_graph()
+        self.populate_affinity_details()
+
+    def draw_affinity_graph(self):
+        canvas = self.affinity_graph_canvas
+        canvas.delete("all")
+        width = max(500, canvas.winfo_width())
+        height = max(380, canvas.winfo_height())
+        analysis = self.affinity_analysis
+        selected = self.affinity_selected_sku
+        if analysis is None or selected is None:
+            canvas.create_text(
+                width / 2, height / 2,
+                text="Select or search for a SKU to view its relationship map.",
+                fill="#93a7b5", font=("TkDefaultFont", 11),
+            )
+            return
+        try:
+            min_shared = int(self.affinity_min_shared.get())
+        except ValueError:
+            min_shared = 3
+        related = analysis.related_skus(selected, min_shared, 12)
+        center_x, center_y = width / 2, height / 2
+        if not related:
+            canvas.create_text(
+                center_x, center_y + 75,
+                text=f"No related SKU meets the {min_shared}-shared-store-day threshold.",
+                fill="#93a7b5", font=("TkDefaultFont", 10),
+            )
+        ring = max(125, min(width, height) * 0.35)
+        positions = {}
+        for position, row in enumerate(related):
+            angle = -math.pi / 2 + 2 * math.pi * position / max(1, len(related))
+            positions[row["sku_index"]] = (
+                center_x + ring * math.cos(angle), center_y + ring * math.sin(angle)
+            )
+            edge_width = 1.0 + 5.0 * row["affinity"]
+            canvas.create_line(
+                center_x, center_y, *positions[row["sku_index"]],
+                fill="#1cc8d8", width=edge_width,
+            )
+            mid_x = (center_x + positions[row["sku_index"]][0]) / 2
+            mid_y = (center_y + positions[row["sku_index"]][1]) / 2
+            canvas.create_text(
+                mid_x, mid_y, text=f"{row['affinity_percent']:.0f}%",
+                fill="#91dae0", font=("TkDefaultFont", 8),
+            )
+        maximum = max(
+            [int(analysis.sku_totals[selected])]
+            + [int(analysis.sku_totals[row["sku_index"]]) for row in related]
+        )
+
+        def node(index, x, y, selected_node=False):
+            total = int(analysis.sku_totals[index])
+            radius = (25 if selected_node else 16) + 12 * math.sqrt(total / max(1, maximum))
+            tags = ("sku_node", f"sku:{index}")
+            canvas.create_oval(
+                x - radius, y - radius, x + radius, y + radius,
+                fill="#00d7e7" if selected_node else "#365f8c",
+                outline="#d7fbff", width=2, tags=tags,
+            )
+            canvas.create_text(
+                x, y - 3, text=analysis.dataset.skus[index],
+                fill="#05131f" if selected_node else "white",
+                font=("TkDefaultFont", 9, "bold"), tags=tags,
+            )
+            canvas.create_text(
+                x, y + 12, text=f"{total:,}",
+                fill="#16414c" if selected_node else "#c8deef",
+                font=("TkDefaultFont", 7), tags=tags,
+            )
+
+        for row in related:
+            node(row["sku_index"], *positions[row["sku_index"]])
+        node(selected, center_x, center_y, selected_node=True)
+
+    def affinity_graph_click(self, _event):
+        current = self.affinity_graph_canvas.find_withtag("current")
+        if not current:
+            return
+        for tag in self.affinity_graph_canvas.gettags(current[0]):
+            if tag.startswith("sku:"):
+                self.select_affinity_sku(int(tag.split(":", 1)[1]))
+                return
+
+    def populate_affinity_details(self):
+        for tree in (self.affinity_related_tree, self.affinity_store_tree):
+            for item in tree.get_children():
+                tree.delete(item)
+        analysis = self.affinity_analysis
+        selected = self.affinity_selected_sku
+        if analysis is None or selected is None:
+            self.affinity_selected_summary.set(
+                "Select or search for a SKU to inspect its relationships."
+            )
+            return
+        try:
+            min_shared = int(self.affinity_min_shared.get())
+        except ValueError:
+            min_shared = 3
+        related = analysis.related_skus(selected, min_shared, 100)
+        stores = analysis.store_rows(selected)
+        self.affinity_selected_summary.set(
+            f"SKU {analysis.dataset.skus[selected]}\n"
+            f"{int(analysis.sku_totals[selected]):,} line orders from {len(stores):,} stores · "
+            f"{int(analysis.sku_store_day_totals[selected]):,} store-days · "
+            f"{len(related):,} qualifying related SKUs"
+        )
+        for row in related:
+            self.affinity_related_tree.insert("", "end", values=(
+                row["sku"], f"{row['affinity_percent']:.2f}%",
+                f"{row['shared_store_days']:,}", f"{row['selected_orders']:,}",
+                f"{row['related_orders']:,}", "; ".join(row["top_stores"]),
+            ))
+        for row in stores:
+            self.affinity_store_tree.insert("", "end", values=(
+                row["store"], f"{row['orders']:,}", f"{row['share_percent']:.2f}%",
+            ))
+
+    def affinity_related_double_click(self, _event=None):
+        selection = self.affinity_related_tree.selection()
+        if not selection or self.affinity_analysis is None:
+            return
+        sku = self.affinity_related_tree.item(selection[0], "values")[0]
+        index = self.affinity_analysis.resolve_sku(str(sku))
+        if index is not None:
+            self.select_affinity_sku(index)
+
+    def export_affinity(self):
+        if self.affinity_analysis is None:
+            return
+        if self.affinity_export_worker and self.affinity_export_worker.is_alive():
+            return
+        initial = (
+            f"sku_affinity_{self.affinity_analysis.start_date.isoformat()}_"
+            f"{self.affinity_analysis.end_date.isoformat()}.affinity.json"
+        )
+        path = filedialog.asksaveasfilename(
+            title="Export affinity analysis",
+            initialdir=str(DEFAULT_AFFINITY_OUTPUT.parent),
+            initialfile=initial,
+            defaultextension=".affinity.json",
+            filetypes=(("Affinity JSON", "*.affinity.json"), ("JSON", "*.json")),
+        )
+        if not path:
+            return
+        min_shared = int(self.affinity_min_shared.get())
+        analysis = self.affinity_analysis
+        self.affinity_status.set("Exporting affinity JSON and CSV files…")
+        self.affinity_export_button.configure(state="disabled")
+        self.affinity_analyze_button.configure(state="disabled")
+        self.affinity_filter_button.configure(state="disabled")
+        self.affinity_reset_button.configure(state="disabled")
+
+        def worker():
+            try:
+                paths = self.affinity.export(
+                    analysis, Path(path), min_shared_store_days=min_shared
+                )
+                self.affinity_export_messages.put(("done", paths))
+            except Exception as exc:
+                self.affinity_export_messages.put(("error", exc))
+
+        self.affinity_export_worker = threading.Thread(target=worker, daemon=True)
+        self.affinity_export_worker.start()
+        self.root.after(80, self.poll_affinity_export)
+
+    def poll_affinity_export(self):
+        try:
+            kind, payload = self.affinity_export_messages.get_nowait()
+        except queue.Empty:
+            if self.affinity_export_worker and self.affinity_export_worker.is_alive():
+                self.root.after(80, self.poll_affinity_export)
+                return
+            return
+        self.affinity_analyze_button.configure(state="normal")
+        self.affinity_filter_button.configure(state="normal")
+        self.affinity_reset_button.configure(state="normal")
+        self.affinity_export_button.configure(state="normal")
+        if kind == "error":
+            self.affinity_status.set("Affinity export failed.")
+            messagebox.showerror("Affinity export", str(payload))
+            return
+        json_path, store_path, pair_path = payload
+        self.affinity_status.set(f"Exported affinity analysis to {json_path.parent}")
+        messagebox.showinfo(
+            "Affinity export",
+            "Created:\n"
+            f"{json_path.name}\n{store_path.name}\n{pair_path.name}",
+        )
 
     def _build_slotting_tab(self, parent):
         self.slot_building_path = tk.StringVar(value=str(DEFAULT_BUILDING_INPUT))
@@ -184,6 +882,15 @@ class GridMapEditorApp:
         self.slot_chilled_path = tk.StringVar(value=str(DEFAULT_CHILLED_INPUT))
         self.slot_output_path = tk.StringVar(value=str(DEFAULT_SLOTTING_OUTPUT))
         self.slot_strategy = tk.StringVar(value="basic")
+        self.slot_affinity_path = tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
+        self.slot_affinity_weight = tk.StringVar(value="50")
+        self.slot_affinity_max_service = tk.StringVar()
+        self.slot_affinity_min_shared = tk.StringVar()
+        self.slot_affinity_min_score = tk.StringVar()
+        self.slot_affinity_parameter_status = tk.StringVar(
+            value="Automatic values will be calculated after generation."
+        )
+        self.slot_affinity_recommendation = None
         self.slot_handling_unit = tk.StringVar(value="AMR shelf")
         self.slot_zone = tk.StringVar(value="Z01")
         self.slot_levels = tk.StringVar(value="1")
@@ -225,35 +932,134 @@ class GridMapEditorApp:
         ttk.Button(form, text="Browse…", command=lambda: self.browse_slot_input(self.slot_chilled_path, [("CSV", "*.csv"), ("All files", "*")])).grid(row=2, column=2, padx=(8, 0), pady=4)
 
         ttk.Label(form, text="Strategy").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(form, textvariable=self.slot_strategy, state="readonly", values=("basic",), width=18).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(form, text="Handling unit").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(form, textvariable=self.slot_handling_unit, state="readonly", values=("AMR shelf", "Tote", "Pallet"), width=18).grid(row=4, column=1, sticky="w", pady=4)
-        ttk.Label(form, text="Zone ID").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.slot_zone, width=20).grid(row=5, column=1, sticky="w", pady=4)
+        strategy_box = ttk.Combobox(
+            form,
+            textvariable=self.slot_strategy,
+            state="readonly",
+            values=("basic", "abc_affinity"),
+            width=18,
+        )
+        strategy_box.grid(row=3, column=1, sticky="w", pady=4)
+        strategy_box.bind("<<ComboboxSelected>>", self.slot_strategy_changed)
+
+        affinity_panel = ttk.LabelFrame(
+            form, text="ABC + affinity settings", padding=(8, 5)
+        )
+        affinity_panel.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(3, 7))
+        affinity_panel.columnconfigure(1, weight=1)
+        ttk.Label(affinity_panel, text="Order-history Excel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        affinity_path_entry = ttk.Entry(
+            affinity_panel, textvariable=self.slot_affinity_path
+        )
+        affinity_path_entry.grid(row=0, column=1, sticky="ew", pady=2)
+        affinity_browse = ttk.Button(
+            affinity_panel,
+            text="Browse…",
+            command=lambda: self.browse_slot_input(
+                self.slot_affinity_path,
+                [("Excel workbook", "*.xlsx"), ("All files", "*")],
+            ),
+        )
+        affinity_browse.grid(row=0, column=2, padx=(8, 0), pady=2)
+        ttk.Label(affinity_panel, text="Affinity weight (%)").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        affinity_weight_entry = ttk.Spinbox(
+            affinity_panel,
+            from_=0,
+            to=100,
+            increment=1,
+            textvariable=self.slot_affinity_weight,
+            width=7,
+        )
+        affinity_weight_entry.grid(row=1, column=1, sticky="w", pady=2)
+        ttk.Label(
+            affinity_panel,
+            text="0 = ABC/service only · 100 = strongest affinity influence within ABC constraints",
+            foreground="#4d646d",
+        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(75, 0), pady=2)
+
+        tuning = ttk.Frame(affinity_panel)
+        tuning.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 1))
+        ttk.Label(tuning, text="Auto-suggested after generation:").pack(side="left")
+        ttk.Label(tuning, text="Max service increase %").pack(side="left", padx=(10, 4))
+        max_service_entry = ttk.Entry(
+            tuning, textvariable=self.slot_affinity_max_service, width=8
+        )
+        max_service_entry.pack(side="left")
+        ttk.Label(tuning, text="Min shared store-days").pack(side="left", padx=(10, 4))
+        min_shared_entry = ttk.Entry(
+            tuning, textvariable=self.slot_affinity_min_shared, width=8
+        )
+        min_shared_entry.pack(side="left")
+        ttk.Label(tuning, text="Min affinity %").pack(side="left", padx=(10, 4))
+        min_score_entry = ttk.Entry(
+            tuning, textvariable=self.slot_affinity_min_score, width=8
+        )
+        min_score_entry.pack(side="left")
+        affinity_actions = ttk.Frame(affinity_panel)
+        affinity_actions.grid(row=3, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        ttk.Label(
+            affinity_actions,
+            textvariable=self.slot_affinity_parameter_status,
+            foreground="#315b66",
+        ).pack(side="left")
+        self.slot_affinity_auto_button = ttk.Button(
+            affinity_actions,
+            text="Recalculate automatic suggestion",
+            command=lambda: self.run_slotting(use_adjusted=False),
+        )
+        self.slot_affinity_auto_button.pack(side="left", padx=(12, 0))
+        self.slot_affinity_adjusted_button = ttk.Button(
+            affinity_actions,
+            text="Regenerate with edited values",
+            command=lambda: self.run_slotting(use_adjusted=True),
+        )
+        self.slot_affinity_adjusted_button.pack(side="left", padx=(6, 0))
+        self.slot_affinity_source_widgets = [
+            affinity_path_entry,
+            affinity_browse,
+            affinity_weight_entry,
+            self.slot_affinity_auto_button,
+        ]
+        self.slot_affinity_tuning_widgets = [
+            max_service_entry,
+            min_shared_entry,
+            min_score_entry,
+            self.slot_affinity_adjusted_button,
+        ]
+
+        ttk.Label(form, text="Handling unit").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(form, textvariable=self.slot_handling_unit, state="readonly", values=("AMR shelf", "Tote", "Pallet"), width=18).grid(row=5, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Zone ID").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.slot_zone, width=20).grid(row=6, column=1, sticky="w", pady=4)
         zone_actions = ttk.Frame(form)
-        zone_actions.grid(row=5, column=2, columnspan=2, sticky="w")
+        zone_actions.grid(row=6, column=2, columnspan=2, sticky="w")
         ttk.Checkbutton(zone_actions, text="Rectangle zone selection", variable=self.slot_zone_mode, command=self.zone_mode_changed).pack(side="left")
         ttk.Checkbutton(zone_actions, text="Auto next ID", variable=self.slot_zone_auto).pack(side="left", padx=(6,0))
         ttk.Button(zone_actions, text="Clear zones", command=self.clear_slot_zones).pack(side="left", padx=(6,0))
 
         capacity = ttk.Frame(form)
-        capacity.grid(row=6, column=1, sticky="w", pady=4)
-        ttk.Label(form, text="Rack capacity").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
+        capacity.grid(row=7, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Rack capacity").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Label(capacity, text="Levels").pack(side="left")
         ttk.Spinbox(capacity, from_=1, to=100, textvariable=self.slot_levels, width=5).pack(side="left", padx=(5, 14))
         ttk.Label(capacity, text="Slots per level").pack(side="left")
         ttk.Spinbox(capacity, from_=1, to=100, textvariable=self.slot_slots, width=5).pack(side="left", padx=5)
 
-        ttk.Label(form, text="Output layout JSON").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.slot_output_path).grid(row=7, column=1, sticky="ew", pady=4)
-        ttk.Button(form, text="Browse…", command=self.browse_slot_output).grid(row=7, column=2, padx=(8, 0), pady=4)
+        ttk.Label(form, text="Output layout JSON").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.slot_output_path).grid(row=8, column=1, sticky="ew", pady=4)
+        ttk.Button(form, text="Browse…", command=self.browse_slot_output).grid(row=8, column=2, padx=(8, 0), pady=4)
         slot_actions = ttk.Frame(form)
-        slot_actions.grid(row=8, column=1, columnspan=3, sticky="w", pady=(10, 4))
+        slot_actions.grid(row=9, column=1, columnspan=3, sticky="w", pady=(10, 4))
         ttk.Button(slot_actions, text="Zone storage settings…", command=self.open_zone_storage_settings).pack(side="left")
         ttk.Button(slot_actions, text="Advanced attributes…", command=self.open_attribute_editor).pack(side="left", padx=(6, 0))
         ttk.Button(slot_actions, text="Load previous layout…", command=self.load_slotting_configuration).pack(side="left", padx=(6, 0))
         ttk.Button(slot_actions, text="Generate slotting layout", command=self.run_slotting, style="Accent.TButton").pack(side="left", padx=(12, 0))
-        ttk.Label(form, textvariable=self.slot_summary, foreground="#315b66").grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(form, textvariable=self.slot_summary, foreground="#315b66").grid(row=10, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.slot_strategy_changed()
 
         result = ttk.LabelFrame(parent, text="Interactive slotting layout", padding=8)
         result.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -672,17 +1478,36 @@ class GridMapEditorApp:
         source_building = payload.get("sources", {}).get("building_yaml", "")
         source_velocity = payload.get("sources", {}).get("sku_velocity_csv", "")
         source_chilled = payload.get("sources", {}).get("chilled_requirements_csv", "")
+        source_affinity = payload.get("sources", {}).get(
+            "affinity_order_workbook", ""
+        )
         if source_building:
             self.slot_building_path.set(source_building)
         if source_velocity:
             self.slot_velocity_path.set(source_velocity)
         self.slot_chilled_path.set(source_chilled)
+        if source_affinity:
+            self.slot_affinity_path.set(source_affinity)
         self.slot_building = building
         self.slot_racks = racks
         self.slot_loaded_path = Path(self.slot_building_path.get()).expanduser().resolve()
         self.slot_zone_assignments = zones
         self.slot_levels.set(str(levels)); self.slot_slots.set(str(slots))
         self.slot_strategy.set(payload.get("strategy", "basic"))
+        affinity_configuration = payload.get("affinity_configuration") or payload.get(
+            "summary", {}
+        ).get("affinity_tuning", {})
+        if affinity_configuration:
+            self.slot_affinity_weight.set(
+                f"{float(affinity_configuration.get('affinity_weight', 0.5)) * 100:g}"
+            )
+            self.set_slot_affinity_tuning(affinity_configuration)
+        else:
+            self.slot_affinity_recommendation = None
+            self.slot_affinity_max_service.set("")
+            self.slot_affinity_min_shared.set("")
+            self.slot_affinity_min_score.set("")
+            self.slot_strategy_changed()
         self.slot_handling_unit.set(payload.get("handling_unit_type", "AMR shelf"))
         self.slot_attribute_catalog = catalog or self.attributes.starter_catalog()
         self.slot_location_attributes = local
@@ -730,6 +1555,40 @@ class GridMapEditorApp:
         self.slot_zone_drag_start=None; self.slot_zone_drag_current=None
         self.draw_slotting_layout()
 
+    def slot_strategy_changed(self, _event=None):
+        affinity_enabled = self.slot_strategy.get() == "abc_affinity"
+        for widget in self.slot_affinity_source_widgets:
+            widget.configure(state="normal" if affinity_enabled else "disabled")
+        tuning_enabled = affinity_enabled and self.slot_affinity_recommendation is not None
+        for widget in self.slot_affinity_tuning_widgets:
+            widget.configure(state="normal" if tuning_enabled else "disabled")
+        if not affinity_enabled:
+            self.slot_affinity_parameter_status.set(
+                "Basic keeps the current ABC-only allocation; affinity settings are not used."
+            )
+        elif self.slot_affinity_recommendation is None:
+            self.slot_affinity_parameter_status.set(
+                "Automatic values will be calculated from the selected workbook and map."
+            )
+
+    def set_slot_affinity_tuning(self, tuning):
+        self.slot_affinity_recommendation = dict(tuning)
+        self.slot_affinity_max_service.set(
+            f"{float(tuning['maximum_service_distance_increase']) * 100:.4g}"
+        )
+        self.slot_affinity_min_shared.set(
+            str(int(tuning["minimum_shared_store_days"]))
+        )
+        self.slot_affinity_min_score.set(
+            f"{float(tuning['minimum_affinity_score']) * 100:.4g}"
+        )
+        status = str(tuning.get("parameter_status", "AUTO_SUGGESTED"))
+        label = "Automatically suggested" if status == "AUTO_SUGGESTED" else "User adjusted"
+        self.slot_affinity_parameter_status.set(
+            f"{label} for this workbook and warehouse map. Edit values and regenerate if needed."
+        )
+        self.slot_strategy_changed()
+
     def clear_slot_zones(self):
         if not self.slot_building: return
         self.slot_zone_assignments={}; self.slot_rows=[]; self.slot_selected_rack=None; self.slot_zone_mode.set(True)
@@ -772,10 +1631,13 @@ class GridMapEditorApp:
         self.slot_rack_detail.set(f"Zone {zone}: selected {len(selected)} rack(s). The next rectangle will use {self.slot_zone.get()}.")
         self.draw_slotting_layout()
 
-    def run_slotting(self):
+    def run_slotting(self, use_adjusted=False):
         try:
-            if self.slot_strategy.get() != "basic":
-                raise ValueError("only the basic strategy is available in this demo")
+            strategy = self.slot_strategy.get()
+            if strategy not in {"basic", "abc_affinity"}:
+                raise ValueError(f"unsupported slotting strategy: {strategy}")
+            if use_adjusted and strategy != "abc_affinity":
+                raise ValueError("adjusted affinity values require ABC + affinity strategy")
             current_path=Path(self.slot_building_path.get()).expanduser().resolve()
             if self.slot_building is None or self.slot_loaded_path!=current_path:
                 raise ValueError("load the selected building YAML before generating")
@@ -791,11 +1653,62 @@ class GridMapEditorApp:
                 ),
             )
             levels=int(self.slot_levels.get()); slots=int(self.slot_slots.get())
-            rows, summary = self.slotting.generate_basic(
-                building, skus, levels, slots, self.slot_handling_unit.get(),
-                self.slot_zone.get(), self.slot_zone_assignments,
-                self.slot_attribute_catalog, self.slot_location_attributes,
-            )
+            source_affinity = ""
+            if strategy == "abc_affinity":
+                affinity_weight = float(self.slot_affinity_weight.get()) / 100.0
+                if not 0.0 <= affinity_weight <= 1.0:
+                    raise ValueError("affinity weight must be between 0% and 100%")
+                affinity_path = Path(
+                    self.slot_affinity_path.get()
+                ).expanduser().resolve()
+                source_affinity = str(affinity_path)
+
+                def report_affinity_progress(current, total, message):
+                    percent = 100.0 * current / max(1, total)
+                    self.slot_summary.set(f"{message} · {percent:.0f}%")
+                    self.root.update_idletasks()
+
+                affinity_dataset = self.affinity.load_orders(
+                    affinity_path, progress=report_affinity_progress
+                )
+                affinity_analysis = self.affinity.analyze(affinity_dataset)
+                tuning_parameters = None
+                if use_adjusted:
+                    tuning_parameters = {
+                        "maximum_service_distance_increase": (
+                            float(self.slot_affinity_max_service.get()) / 100.0
+                        ),
+                        "minimum_shared_store_days": int(
+                            self.slot_affinity_min_shared.get()
+                        ),
+                        "minimum_affinity_score": (
+                            float(self.slot_affinity_min_score.get()) / 100.0
+                        ),
+                    }
+                self.slot_summary.set(
+                    "Evaluating ABC-preserving affinity layouts and map-derived parameters…"
+                )
+                self.root.update_idletasks()
+                rows, summary = self.slotting.generate_abc_affinity(
+                    building,
+                    skus,
+                    affinity_analysis,
+                    affinity_weight,
+                    levels,
+                    slots,
+                    self.slot_handling_unit.get(),
+                    self.slot_zone.get(),
+                    self.slot_zone_assignments,
+                    self.slot_attribute_catalog,
+                    self.slot_location_attributes,
+                    tuning_parameters,
+                )
+            else:
+                rows, summary = self.slotting.generate_basic(
+                    building, skus, levels, slots, self.slot_handling_unit.get(),
+                    self.slot_zone.get(), self.slot_zone_assignments,
+                    self.slot_attribute_catalog, self.slot_location_attributes,
+                )
             self.layouts.save(
                 rows, building, summary, Path(self.slot_output_path.get()).expanduser(),
                 strategy=self.slot_strategy.get(),
@@ -811,6 +1724,8 @@ class GridMapEditorApp:
                     if self.slot_chilled_path.get().strip()
                     else ""
                 ),
+                source_affinity=source_affinity,
+                affinity_configuration=summary.get("affinity_tuning", {}),
             )
         except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
             messagebox.showerror("Slotting generation failed", str(exc)); return
@@ -822,6 +1737,21 @@ class GridMapEditorApp:
         self.show_slotting_rows(rows)
         self.draw_slotting_layout()
         self.slot_rack_detail.set("Click a coloured rack point on the map to inspect its assignments.")
+        affinity_summary = ""
+        if strategy == "abc_affinity":
+            tuning = summary["affinity_tuning"]
+            self.set_slot_affinity_tuning(tuning)
+            comparison = summary["baseline_comparison"]
+            affinity_summary = (
+                f"affinity parameters: service +{tuning['maximum_service_distance_increase'] * 100:.2f}%, "
+                f"shared store-days ≥{tuning['minimum_shared_store_days']}, "
+                f"score ≥{tuning['minimum_affinity_score'] * 100:.2f}% "
+                f"({tuning['parameter_status'].lower().replace('_', ' ')})"
+                f" · affinity distance change "
+                f"{comparison['weighted_pair_distance_change_fraction'] * 100:+.1f}%"
+                f" · service distance change "
+                f"{comparison['weighted_service_distance_change_fraction'] * 100:+.1f}%"
+            )
         self.slot_summary.set(
             f"Assigned {summary['assigned_count']:,}/{summary['sku_count']:,} SKUs · "
             f"unassigned {summary['unassigned_count']:,} · "
@@ -838,6 +1768,7 @@ class GridMapEditorApp:
                 f"{zone}={storage_type}"
                 for zone, storage_type in summary["zone_storage_types"].items()
             )
+            + (f" · {affinity_summary}" if affinity_summary else "")
             + " · "
             f"saved to {self.slot_output_path.get()}"
         )
