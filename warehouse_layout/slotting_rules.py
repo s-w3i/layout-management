@@ -181,6 +181,20 @@ def physical_allocation_bucket(profile: dict, physical_enabled: bool) -> str:
     return storage_class or "EXCEPTION"
 
 
+def planned_storage_type(profile: dict, physical_enabled: bool = True) -> str:
+    """Return the non-mixed storage segment required by a physical profile."""
+    return (
+        "OVERSIZE"
+        if physical_allocation_bucket(profile, physical_enabled) != "STANDARD"
+        else "STANDARD"
+    )
+
+
+def overweight_storage_level(levels_per_rack: int) -> int:
+    """Return the shared ergonomic hard level for known overweight stock."""
+    return min(2, max(1, int(levels_per_rack)))
+
+
 def allocation_candidate_key(
     candidate: dict,
     profile: dict,
@@ -235,7 +249,7 @@ def allocation_candidate_key(
         physical_mix_penalty = 2
 
     preferred_oversize_level = min(3, levels_per_rack)
-    preferred_overweight_level = min(2, levels_per_rack)
+    preferred_overweight_level = overweight_storage_level(levels_per_rack)
     overweight_level_penalty = 0
     if (
         physical_enabled

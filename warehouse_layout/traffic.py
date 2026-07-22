@@ -18,12 +18,12 @@ from .affinity import AffinityAnalysis, AffinityDataset
 from .attributes import (
     PHYSICAL_ATTRIBUTE_KEYS,
     PHYSICAL_DIMENSION_KEYS,
-    PHYSICAL_WEIGHT_KEY,
     STANDARD_STORAGE_DEFAULTS,
     StorageAttributeService,
 )
 from .config import SLOTTING_SCHEMA
 from .slotting import SlottingService
+from .slotting_rules import overweight_storage_level, planned_storage_type
 
 
 NETWORK_SCHEMA = "warehouse_movement_network/v1"
@@ -38,7 +38,7 @@ class TrafficCancelledError(RuntimeError):
 
 
 class InsufficientStorageError(ValueError):
-    """Raised when strict slotting cannot place every SKU."""
+    """Raised when the full pipeline cannot place every SKU."""
 
     def __init__(self, summary: dict):
         self.summary = summary
@@ -148,10 +148,14 @@ class TrafficAwareSlottingService:
     """Analyze expected traffic and reposition complete handling units."""
 
     LOCATION_FIELDS = (
+        "static_address", "storage_location_address", "buffer_id", "buffer_level",
         "rmf_grid_address", "zone_id", "aisle_id", "static_bay_id", "rack_id",
         "rack_waypoint", "pickup_dispenser_id", "rack_vertex_index", "rack_rank",
         "workstations_evaluated", "average_workstation_distance_m", "routing_status",
-        "storage_area_type", "occupied_static_addresses",
+        "storage_area_type", "planned_zone_id", "planned_storage_type",
+        "zone_storage_type", "effective_location_attributes",
+        "auto_attribute_overrides", "occupied_static_addresses",
+        "occupied_storage_location_addresses", "occupied_buffer_ids",
     )
 
     def __init__(
@@ -588,17 +592,32 @@ class TrafficAwareSlottingService:
             if len(target_addresses) != shape[2]:
                 return False, "target multi-slot reservation is incomplete"
             profile = self.attributes.physical_profile(requirements)
-            overweight = profile["storage_class"] in {
-                "OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"
-            }
+            required_storage_type = planned_storage_type(profile)
+            target_storage_type = str(
+                target.get("planned_storage_type")
+                or target.get("zone_storage_type")
+                or target.get("storage_area_type")
+                or ""
+            ).upper()
+            if (
+                target_storage_type
+                and target_storage_type != required_storage_type
+            ):
+                return False, (
+                    f"SKU {row.get('sku', '')}: {required_storage_type} inventory "
+                    f"cannot move into a {target_storage_type} segment"
+                )
             for target_address in target_addresses:
                 effective, _sources = self.attributes.effective_attributes(
-                    str(target_address), local
+                    str(
+                        target.get("storage_location_address")
+                        or target_address
+                    ),
+                    local,
                 )
                 generic_requirements = {
                     key: value for key, value in requirements.items()
                     if key not in PHYSICAL_DIMENSION_KEYS
-                    and not (overweight and key == PHYSICAL_WEIGHT_KEY)
                 }
                 issues = self.attributes.compatibility_issues(
                     generic_requirements, effective, catalog
@@ -619,8 +638,16 @@ class TrafficAwareSlottingService:
                     )
                 if issues:
                     return False, f"SKU {row.get('sku', '')}: " + "; ".join(issues)
-            if profile["storage_class"] in {"OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"} and shape[0] != 1:
-                return False, f"SKU {row.get('sku', '')}: overweight inventory requires level 1"
+            if profile["storage_class"] in {"OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"}:
+                levels_per_rack = int(
+                    payload.get("rack_capacity", {}).get("levels") or 1
+                )
+                required_level = overweight_storage_level(levels_per_rack)
+                if shape[0] != required_level:
+                    return False, (
+                        f"SKU {row.get('sku', '')}: overweight inventory requires "
+                        f"level {required_level}"
+                    )
         return True, ""
 
     @staticmethod
@@ -698,22 +725,15 @@ class TrafficAwareSlottingService:
             }
             for unit, group in grouped.items()
         }
-        local = payload.get("location_attributes", {})
         for source, target in ((first, second), (second, first)):
             for shape, row in grouped[source].items():
                 row.update(snapshots[target][shape])
                 level, slot = shape
-                row["static_address"] = (
-                    f"{row['zone_id']}/{row['aisle_id']}/{row['static_bay_id']}"
-                    f"/L{level:02d}/S{slot:02d}"
-                )
                 row["dynamic_address"], row["dynamic_address_level"] = self.slotting.build_dynamic_address(
                     str(row["zone_id"]), str(row["aisle_id"]), str(row["static_bay_id"]),
                     level, slot, str(row.get("handling_unit_type", "")), source,
+                    buffer_model=bool(payload.get("storage_layout")),
                 )
-                effective, _sources = self.attributes.effective_attributes(row["static_address"], local)
-                row["effective_location_attributes"] = effective
-                row["auto_attribute_overrides"] = {}
                 row["compatibility_status"] = "COMPATIBLE"
                 row["compatibility_issues"] = []
 
@@ -1118,7 +1138,8 @@ class TrafficAwareSlottingService:
             str(address)
             for row in result if row.get("assignment_status") == "ASSIGNED"
             for address in (
-                row.get("occupied_static_addresses")
+                row.get("occupied_storage_location_addresses")
+                or row.get("occupied_static_addresses")
                 or [row.get("static_address", "")]
             )
         ]
@@ -1152,16 +1173,16 @@ class TrafficAwareSlottingService:
         zone_assignments: dict[str, str] | None = None,
         attribute_catalog=None,
         location_attributes: dict[str, dict] | None = None,
+        storage_layout=None,
         start_date=None,
         end_date=None,
         optimize_traffic: bool = True,
         maximum_travel_increase: float | None = None,
         hotspot_percentile: float | None = None,
-        source_building: str = "",
+        source_grid_project: str = "",
         source_velocity: str = "",
         source_chilled: str = "",
         source_orders: str = "",
-        source_storage_rules: str = "",
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TrafficPipelineResult:
@@ -1178,8 +1199,8 @@ class TrafficAwareSlottingService:
         configured_locations = copy.deepcopy(location_attributes or {})
         if not configured_locations:
             # A fresh standalone run starts conservatively as standard ambient
-            # storage. Chilled inventory remains unassigned until the optional
-            # storage-rules input defines real chilled locations.
+            # storage. Chilled inventory remains unassigned unless the caller
+            # supplies warehouse location attributes for real chilled zones.
             configured_locations[zone_id] = {
                 "chilled": False,
                 **STANDARD_STORAGE_DEFAULTS,
@@ -1190,9 +1211,10 @@ class TrafficAwareSlottingService:
             copy.deepcopy(building), copy.deepcopy(sku_rows),
             levels_per_rack, slots_per_level, handling_unit_type,
             zone_id, zones, catalog, basic_locations,
-            strict_compatibility=True,
-            ergonomic_weight_heuristic=False,
-            auto_plan_oversize=False,
+            storage_layout=storage_layout,
+            strict_compatibility=False,
+            ergonomic_weight_heuristic=True,
+            auto_plan_oversize=True,
         )
         stage(2, "Stage 2/7 · grouping SKUs by affinity and ABC priority")
         affinity_locations = copy.deepcopy(configured_locations)
@@ -1200,9 +1222,10 @@ class TrafficAwareSlottingService:
             copy.deepcopy(building), copy.deepcopy(sku_rows), affinity_analysis,
             affinity_weight, levels_per_rack, slots_per_level,
             handling_unit_type, zone_id, zones, catalog, affinity_locations,
-            strict_compatibility=True,
-            ergonomic_weight_heuristic=False,
-            auto_plan_oversize=False,
+            storage_layout=storage_layout,
+            strict_compatibility=False,
+            ergonomic_weight_heuristic=True,
+            auto_plan_oversize=True,
         )
         if affinity_summary.get("unassigned_count", 0):
             raise InsufficientStorageError(affinity_summary)
@@ -1214,6 +1237,19 @@ class TrafficAwareSlottingService:
                 continue
             requirements = row.get("sku_requirements") or {}
             profile = self.attributes.physical_profile(requirements)
+            required_storage_type = planned_storage_type(profile)
+            actual_storage_type = str(
+                row.get("planned_storage_type")
+                or row.get("zone_storage_type")
+                or row.get("storage_area_type")
+                or ""
+            ).upper()
+            if actual_storage_type != required_storage_type:
+                invalid.append(
+                    f"{row.get('sku', '')}: {required_storage_type} inventory "
+                    f"cannot use a {actual_storage_type or 'UNPLANNED'} segment"
+                )
+                continue
             if profile["data_status"] != "COMPLETE":
                 unverified += 1
                 continue
@@ -1225,15 +1261,11 @@ class TrafficAwareSlottingService:
             generic_requirements = {
                 key: value for key, value in requirements.items()
                 if key not in PHYSICAL_DIMENSION_KEYS
-                and not (
-                    profile["storage_class"]
-                    in {"OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"}
-                    and key == PHYSICAL_WEIGHT_KEY
-                )
             }
             for address in occupied_addresses:
                 effective, _sources = self.attributes.effective_attributes(
-                    str(address), affinity_locations
+                    str(row.get("storage_location_address") or address),
+                    affinity_locations,
                 )
                 primary_effective = primary_effective or effective
                 issues.extend(self.attributes.compatibility_issues(
@@ -1255,9 +1287,13 @@ class TrafficAwareSlottingService:
             if (
                 profile["storage_class"]
                 in {"OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"}
-                and int(row.get("storage_level") or 1) != 1
+                and int(row.get("storage_level") or 1)
+                != overweight_storage_level(levels_per_rack)
             ):
-                issues.append("overweight inventory requires level 1")
+                issues.append(
+                    "overweight inventory requires level "
+                    f"{overweight_storage_level(levels_per_rack)}"
+                )
             if issues:
                 invalid.append(
                     f"{row.get('sku', '')}: " + "; ".join(dict.fromkeys(issues))
@@ -1289,6 +1325,26 @@ class TrafficAwareSlottingService:
             "unverified_physical_sku_count": unverified,
             "hard_validation_status": "PASSED",
         }
+        occupied_units: dict[str, set[str]] = {}
+        for row in affinity_rows:
+            if row.get("assignment_status") != "ASSIGNED":
+                continue
+            unit_id = str(row.get("handling_unit_id", ""))
+            for buffer_id in row.get("occupied_buffer_ids", []):
+                occupied_units.setdefault(str(buffer_id), set()).add(unit_id)
+        buffer_records = []
+        if storage_layout is not None:
+            for source in storage_layout.buffers:
+                buffer_id = str(source.get("buffer_id", ""))
+                buffer_records.append({
+                    **dict(source),
+                    "status": (
+                        "OCCUPIED" if buffer_id in occupied_units else "EMPTY"
+                    ),
+                    "handling_unit_ids": sorted(
+                        unit for unit in occupied_units.get(buffer_id, set()) if unit
+                    ),
+                })
         pretraffic_payload = {
             "schema": SLOTTING_SCHEMA,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1299,15 +1355,18 @@ class TrafficAwareSlottingService:
                 "slots_per_level": slots_per_level,
             },
             "sources": {
-                "building_yaml": source_building,
+                "grid_project_json": source_grid_project,
                 "sku_velocity_csv": source_velocity,
                 "chilled_requirements_csv": source_chilled,
                 "affinity_order_workbook": source_orders,
-                "storage_rules_layout": source_storage_rules,
             },
             "affinity_configuration": affinity_summary.get("affinity_tuning", {}),
             "storage_defaults": {"standard": STANDARD_STORAGE_DEFAULTS},
             "zone_assignments": zones,
+            "storage_layout": (
+                storage_layout.to_dict() if storage_layout is not None else {}
+            ),
+            "buffers": buffer_records,
             "attribute_catalog": self.attributes.serialize_catalog(catalog),
             "location_attributes": affinity_locations,
             "summary": {**affinity_summary, "pipeline_grouping": grouping_metrics},

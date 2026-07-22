@@ -63,25 +63,24 @@ For a new warehouse, use the tabs in this order:
 1. Create the warehouse grid in **Grid Map Editor**.
 2. Place rack pickup points and workstation drop-off points.
 3. Select the storage-system type, configure capacity, and assign empty buffers.
-4. Save the editable grid project. Export the unchanged RMF building YAML when
-   it is needed by RMF or Traffic-Aware Slotting.
-5. Open **SKU Affinity**, analyze the order workbook, and review SKU relationships.
-6. Export the affinity snapshot and CSV review files when required.
-7. Open **Inventory Slotting** and load the editable grid JSON.
-8. Group every rack into a zone.
-9. Review the initialized zone capacities and mark real chilled zones.
-10. Load the ABC SKU velocity CSV and optional chilled-requirements CSV. Choose
+4. Assign every rack to a warehouse zone, configure chilled/capacity settings,
+   and add any advanced hierarchy attributes.
+5. Save the editable grid project. Export the unchanged RMF building YAML only
+   when it is needed by RMF.
+6. Open **SKU Affinity**, analyze the order workbook, and review SKU relationships.
+7. Export the affinity snapshot and CSV review files when required.
+8. Open **Inventory Slotting** and load the configured grid JSON.
+9. Load the ABC SKU velocity CSV and optional chilled-requirements CSV. Choose
    `basic` or `abc_affinity`; for affinity, also select the order-history Excel
    file and the desired ABC/affinity weight.
-11. Open **Traffic-Aware Slotting** and select the building YAML, velocity CSV, and
-    order workbook. The tab independently reruns ABC and affinity grouping before
-    generating a complete-unit traffic recommendation.
-12. Save the traffic-aware layout when required.
-13. Open **Inventory Operations Demo**, search for SKUs or demonstrate position
+10. Open **Traffic-Aware Slotting** and select the editable grid JSON, velocity
+    CSV, and order workbook. The tab independently reruns ABC and affinity
+    grouping before generating a complete-unit traffic recommendation.
+11. Save the traffic-aware layout when required.
+12. Open **Inventory Operations Demo**, search for SKUs or demonstrate position
     swaps, then save changes when required.
 
-To use the included demonstration map, start directly from the Inventory
-Slotting tab. Its default grid project is:
+The included demonstration map can be opened and completed in Grid Map Editor:
 
 ```text
 resources/map/demo.grid.json
@@ -120,12 +119,10 @@ default.
 
 ### Place rack pickup points
 
-Set **Rack ID prefix**, then choose one of these tools:
-
-- **Paint rack pickups (drag)** — hold the left mouse button and paint rack
-  points individually or along an irregular shape.
-- **Fill rack rectangle (2 clicks)** — click two opposite corners to fill every
-  grid point in the rectangle with racks.
+Set **Rack ID prefix**, then choose **Fill racks (drag rectangle)**. Press at
+one corner, drag to the opposite corner, and release to fill every grid point
+in the rectangle with racks. Press and release on the same point to place one
+rack.
 
 Rack IDs are generated from the prefix and grid location. They can be changed
 later with **Select / edit**.
@@ -146,6 +143,36 @@ Mini-load and pallet ASRS create an empty slot buffer for every configured rack,
 level, and slot (`B-G11_11/L01/S01`). Shelves, totes, pallets and SKUs are not
 created in this tab. Changing rack markers invalidates the buffer catalog and
 requires this step to be run again.
+
+### Configure warehouse zones and attributes
+
+Grid Map Editor is the authoritative warehouse-settings editor. Choose
+**Assign rack zone (drag rectangle)**, enter a zone ID, then press and drag a
+rectangle around a group of racks. Repeat until every rack is assigned. With automatic
+advancement enabled, `Z01` advances to `Z02`, while IDs such as `ZONE_001`
+preserve their numeric width.
+
+Rack points are intentionally shown without overlaid rack IDs. A yellow dot is
+unassigned, a red dot belongs to an ambient zone, and a blue dot belongs to a
+chilled zone. Each assigned zone is surrounded by its own coloured boundary.
+The zone ID is shown once as a filled badge immediately above the top-left of
+that boundary.
+A persistent legend below the map explains the rack and workstation dot colours.
+
+After buffers and zones exist, use **Zone settings…** to configure chilled
+storage and maximum item length, width, height, and weight. A blank physical
+maximum means no configured maximum. Use **Advanced attributes…** to add typed
+warehouse attributes or set inherited values at zone, aisle, bay, level, or
+slot scope:
+
+```text
+Zone → Aisle → Bay → Level → Slot
+```
+
+These user-authored settings are saved in `.grid.json`. Slotting may generate
+standard/oversize child zones and SKU-specific capacity overrides, but those
+recommendations are written only to `.slotting.json` and never overwrite the
+warehouse project.
 
 ### Edit or remove points
 
@@ -170,13 +197,14 @@ operation.
 
 The editor has two different save formats:
 
-- **Save editable project…** writes a `.grid.json` containing the editable map,
-  storage-system profile, and empty buffers. Inventory Slotting uses this file.
+- **Save grid project JSON…** writes a `.grid.json` containing the editable map,
+  storage-system profile, empty buffers, rack zones, attribute definitions, and
+  hierarchy values. Inventory and Traffic-Aware Slotting both use this file.
 - **Export RMF building YAML…** writes the same RMF-compatible `.building.yaml`
   structure as before. Every rack remains a `pickup_dispenser`; buffer metadata
   is deliberately excluded.
 
-Use **Load editable project…** to reopen a `.grid.json` project. A building YAML
+Use **Load grid project JSON…** to reopen a `.grid.json` project. A building YAML
 is an export format and cannot replace the editable project file.
 
 ## 2. SKU Affinity tab
@@ -254,9 +282,10 @@ SKU_002,80,B,20,10,8,270
 ```
 
 A blank custom requirement means that the SKU does not constrain that custom
-attribute. Missing physical data remains unverified but is classified
-conservatively: unknown weight as `OVERWEIGHT`, unknown size as `OVERSIZE`, and
-missing both usable size and weight as `OVERSIZE_AND_OVERWEIGHT`. Set
+attribute. Missing physical data remains unverified and is classified explicitly
+as `UNKNOWN_WEIGHT`, `UNKNOWN_SIZE`, or `NON_VOLUMETRIC_DATA`. These categories
+use exception storage planning without displaying a verified overweight or
+oversize measurement. Set
 `req_max_item_weight` to `0` to explicitly disable ergonomic weight placement
 for that SKU. Requirement keys must exist in the attribute catalog before
 generation.
@@ -272,13 +301,16 @@ generated demand plots are intentionally excluded from the public repository.
 2. Click **Load project**.
 3. Confirm that the status reports the expected rack and workstation counts.
 
-### Assign rack zones
+### Warehouse configuration source
 
-Every rack must have a zone before slotting can be generated.
+Every rack must already have a zone before slotting can be generated. Zone
+assignment, chilled settings, physical capacities, and advanced attributes are
+edited and saved in **Grid Map Editor**, not Inventory Slotting.
 
-1. Leave **Rectangle zone selection** enabled.
+1. In Grid Map Editor, choose **Assign rack zone (drag rectangle)**.
 2. Enter the first **Zone ID**, normally `Z01`.
-3. Drag a rectangle around a group of rack points.
+3. Press at one corner, drag around the rack points, and release at the
+   opposite corner.
 4. Repeat until the status reports zero unassigned racks.
 
 With **Auto next ID** enabled, the zone advances automatically after each
@@ -289,7 +321,7 @@ Z01 → Z02 → Z03
 ```
 
 IDs such as `ZONE_001` also advance while preserving their numeric width. Use
-**Clear zones** to restart zone assignment.
+**Clear rack zones** to restart zone assignment.
 
 ### Aisle and bay rules
 
@@ -303,7 +335,7 @@ IDs such as `ZONE_001` also advance while preserving their numeric width. Use
 For example, racks in two columns inside `Z02` are addressed under `Z02/A01`
 and `Z02/A02`, even if another zone already uses those aisle numbers.
 
-### Confirm storage-system capacity and handling units
+### Select the slotting strategy
 
 Select:
 
@@ -311,15 +343,15 @@ Select:
   directly balances affinity-based bay consolidation against ABC bay purity.
 - **Affinity weight** — user-selected from 0% (ABC bay purity) to 100%
   (place strongly related SKUs in the same bay whenever feasible).
-- **Handling unit**, **Levels**, and **Slots per level** are read-only values
-  inherited from the buffers generated in Grid Map Editor.
+- Handling unit, levels, and slots per level are inherited from the grid project
+  and intentionally omitted from the Inventory Slotting form.
 
 The handling-unit choice controls where the dynamic identity appears in the
 address. See [Inventory address rules](#inventory-address-rules).
 
-### Configure zone storage settings
+### Zone storage settings in Grid Map Editor
 
-Click **Zone storage settings…** after grouping the racks. The application
+Click **Zone settings…** in Grid Map Editor after grouping the racks. The application
 initializes all zones with these source-unit demo limits:
 
 | Storage | Length | Width | Height | Weight |
@@ -348,10 +380,10 @@ created automatically and never change the chilled/ambient role.
 Use **Advanced attributes…** for optional operational attributes. The generated
 `oversize_capable` child-slot values are normally managed by the algorithm.
 
-### Configure advanced hierarchy attributes
+### Advanced hierarchy attributes in Grid Map Editor
 
-After assigning every rack to a zone and setting the rack capacity, click
-**Advanced attributes…**. The editor uses the static hierarchy:
+After assigning every rack to a zone and setting the buffer capacity, click
+**Advanced attributes…** in Grid Map Editor. The editor uses the static hierarchy:
 
 ```text
 Zone → Aisle → Bay → Level → Slot
@@ -369,21 +401,18 @@ removes the override so inheritance applies again. The effective-values table
 shows both the final value and the ancestor that supplied it. Values never
 inherit upward.
 
-If zones or rack capacity change, values on unchanged address paths are kept.
-The application asks before discarding values whose paths no longer exist.
-Use **Load saved layout…** in **Interactive Slotting Layout** to restore zones,
-capacity, catalog, local values, and assignments from an existing
-`.slotting.json`. The result canvas is read-only; switch back to Inventory
-Slotting to edit its zone plan.
+If zones or buffer capacity change, the editor asks before discarding values
+whose hierarchy paths no longer exist. **Interactive Slotting Layout** can load
+a generated `.slotting.json` for viewing, but warehouse configuration changes
+belong in the source `.grid.json`.
 
 ### Generate the slotting layout
 
-1. Confirm that every rack has a zone.
+1. Load a grid project with buffers, zones, and warehouse attributes.
 2. Confirm the SKU CSV and output paths.
-3. Confirm the handling unit and rack capacity loaded from the grid project.
-4. Review zone limits and chilled areas; optionally add advanced attributes.
-5. Confirm or clear the optional chilled-SKU CSV path.
-6. Click **Generate slotting layout**.
+3. Confirm or clear the optional chilled-SKU CSV path.
+4. Select `basic` or `abc_affinity` and configure affinity inputs when needed.
+5. Click **Generate slotting layout**.
 
 With `abc_affinity`, the initial generation derives these values from the
 selected workbook and current map: minimum shared store-days, minimum affinity
@@ -414,7 +443,7 @@ The **basic** strategy:
    allocated as complete `STANDARD` or `OVERSIZE` zones; the planner chooses the
    nearest combination with just enough capacity while preserving standard
    capacity where possible. A chilled source zone may be partitioned into
-   separate `*_STANDARD` and `*_OVERSIZE` generated zones.
+   separate `*_chill_normal` and `*_chill_oversize` generated zones.
 8. Uses SKU weight as a soft ergonomic heuristic: a positive weight prefers
    the middle rack level and then expands outward toward lower and upper
    levels. This is not a hard constraint; weight `0` disables the preference.
@@ -491,16 +520,13 @@ v1 files remain loadable and are normalized with an empty attribute model.
 The tab runs the complete recommendation pipeline independently. It does not use
 assignments generated by the Inventory Slotting tab.
 
-1. Select the building YAML, ABC velocity CSV, and order-history workbook.
-2. Optionally select a chilled-SKU CSV and a storage-rules `.slotting.json`.
-   Assignments in that file are ignored; only real zones, chilled areas,
-   capacities, and attribute definitions are imported. Without it, all map
-   storage starts as standard ambient storage.
-3. Click **Load map / label chilled zones** when temperature zoning is required,
-   then rectangle-label the real ambient and chilled racks. This editor controls
-   chilled zoning only; standard versus oversize placement is selected by the
-   slotting algorithm.
-4. Select affinity weight, handling-unit type, levels, and slots per level.
+1. Select the editable `.grid.json` project, ABC velocity CSV, and order-history
+   workbook. The project must already contain generated storage buffers, rack
+   zones, chilled/capacity settings, and advanced attributes.
+2. Optionally select a chilled-SKU CSV.
+3. Click **Load warehouse project** to review its configured zones on the map.
+4. Select affinity weight. Handling-unit type, levels, and slots per level are
+   loaded from the grid project's buffer configuration.
 5. Keep **Use embedded RMF map** for an RMF layout, or select a generic
    `warehouse_movement_network/v1` JSON for ASRS, conveyors, cranes, lifts, or
    another delivery system.
@@ -522,14 +548,18 @@ endpoints. Endpoint weights are equal for RMF maps and configurable in generic
 networks.
 
 Every relocation is an atomic pairwise unit swap. Chilled/ambient separation,
-rotation-aware dimensions, maximum weight, slot shape, and capacity are strict
-move gates. The traffic stage never creates a capacity override. A unit with
-incomplete physical data remains fixed and is reported. This conservative rule
-does not invalidate an unchanged generated row that is reported as unverified.
+standard/oversize segment separation, rotation-aware dimensions, maximum
+weight, slot shape, and capacity are strict move gates. The traffic stage never
+creates a capacity override. A unit with incomplete physical data remains fixed
+and is reported. This conservative rule does not invalidate an unchanged
+generated row that is reported as unverified.
 
-Oversize inventory remains subject to ABC and affinity placement and reserves
-the required contiguous horizontal slots and vertical levels automatically.
-Overweight and oversize-plus-overweight footprints start on the bottom level.
+Traffic baseline generation uses the same rules as basic and affinity slotting:
+standard inventory is placed before exceptions, ambient zones remain non-mixed,
+chilled normal and oversize stock use separate racks, and known overweight or
+oversize-plus-overweight stock is intentionally placed at level 2 when present.
+Generated buffers from the grid project are enforced and their occupancy is
+included in the result.
 Generation is rejected if even one SKU remains unassigned, so a partial result
 cannot be saved as a valid traffic-aware layout.
 
@@ -791,8 +821,9 @@ Inventory Slotting.
 
 ### Slotting says racks remain unassigned
 
-Every rack must belong to a zone. Enable **Rectangle zone selection** and group
-the remaining grey rack points before generating.
+Every rack must belong to a zone. In Grid Map Editor, use **Assign rack zone
+(drag rectangle)** for the remaining rack points, then save and reload the grid
+project before generating.
 
 ### Some racks are unreachable
 

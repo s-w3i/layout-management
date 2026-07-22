@@ -37,10 +37,29 @@ def main() -> None:
     assert app.notebook.tab(app.notebook.tabs()[1], "text") == "SKU Affinity"
     assert app.notebook.tab(app.notebook.tabs()[3], "text") == "Interactive Slotting Layout"
     assert app.notebook.tab(app.notebook.tabs()[4], "text") == "Traffic-Aware Slotting"
+    assert app.grid_sidebar_canvas.cget("yscrollcommand")
+    assert app.grid_sidebar_scrollbar.cget("command")
+    assert app.grid_sidebar_canvas.bind("<MouseWheel>")
+    assert [label.cget("text") for label in app.grid_dot_legend_labels] == [
+        "● Unassigned rack",
+        "● Ambient rack",
+        "● Chilled rack",
+        "● Workstation",
+    ]
+    assert set(app.grid_sidebar_sections) == {
+        "grid", "tools", "point", "buffers", "settings", "files"
+    }
+    app.toggle_grid_sidebar_section("files")
+    assert not app.grid_sidebar_sections["files"]["expanded"]
+    assert all(
+        not widget.winfo_manager()
+        for widget in app.grid_sidebar_sections["files"]["widgets"]
+    )
+    app.toggle_grid_sidebar_section("files")
+    assert app.grid_sidebar_sections["files"]["expanded"]
     layout_canvases = (
         app.canvas,
         app.affinity_graph_canvas,
-        app.slot_zone_canvas,
         app.slot_canvas,
         app.traffic_canvas,
         app.ops_canvas,
@@ -72,11 +91,19 @@ def main() -> None:
             x, y = app.canvas_viewport_point(app.canvas, x, y)
             return SimpleNamespace(x=x, y=y)
 
-        app.tool.set("rack")
-        app.canvas_click(grid_event((1, 1)))
+        # Click mapping must remain correct even when Tk's visible canvas
+        # origin no longer matches canvas coordinate (0, 0).
+        app.canvas.configure(scrollregion=(-500, -400, 900, 700))
+        app.canvas.xview_moveto(0.45)
+        app.canvas.yview_moveto(0.35)
+        assert app.nearest_position(grid_event((1, 1))) == (1, 1)
+
         app.tool.set("rack_rectangle")
+        app.canvas_click(grid_event((1, 1)))
+        app.canvas_release(grid_event((1, 1)))
         app.canvas_click(grid_event((2, 0)))
-        app.canvas_click(grid_event((3, 1)))
+        app.canvas_drag(grid_event((3, 1)))
+        app.canvas_release(grid_event((3, 1)))
         app.tool.set("workstation")
         app.canvas_click(grid_event((4, 2)))
         app.selected = (4, 2)
@@ -84,6 +111,10 @@ def main() -> None:
         app.endpoint_id.set("WS_TEST")
         app.apply_edit()
         assert app.project.markers[(4, 2)].endpoint_id == "WS_TEST"
+        assert {
+            app.canvas.itemcget(item, "fill")
+            for item in app.canvas.find_withtag("rack_point")
+        } == {"#f3a712"}
         marker_count = len(app.project.markers)
         app.undo()
         app.redo()
@@ -157,43 +188,57 @@ def main() -> None:
         assert (temp / "gui-affinity_sku_store.csv").exists()
         assert (temp / "gui-affinity_sku_pairs.csv").exists()
 
-        # Inventory Slotting owns editable zone selection. The separate
-        # Interactive Slotting Layout canvas is a read-only result viewer.
-        app.slot_building_path.set(str(project_path))
-        app.load_slot_building()
-        root.update_idletasks()
-        assert app.slot_racks
-        app.canvas_wheel_zoom(
-            app.slot_zone_canvas,
-            SimpleNamespace(x=150, y=120, delta=120, num=None),
+        # Grid Map Editor owns warehouse zones and all hierarchy attributes.
+        app.tool.set("zone_rectangle")
+        app.grid_zone_id.set("Z01")
+        app.canvas_click(grid_event((0, 0)))
+        app.canvas_drag(grid_event((4, 2)))
+        app.canvas_release(grid_event((4, 2)))
+        assert len(app.project.zone_assignments) == 5
+        assert len(app.canvas.find_withtag("grid_zone_boundary")) == 1
+        assert [
+            app.canvas.itemcget(item, "text")
+            for item in app.canvas.find_withtag("grid_zone_label")
+        ] == ["Z01"]
+        boundary = app.canvas.coords(
+            app.canvas.find_withtag("grid_zone_boundary")[0]
         )
-        app.canvas_pan_start(app.slot_zone_canvas, SimpleNamespace(x=30, y=30))
-        app.canvas_pan_drag(app.slot_zone_canvas, SimpleNamespace(x=55, y=45))
-        app.canvas_pan_end(app.slot_zone_canvas)
-        zone_start = SimpleNamespace(x=-10000, y=-10000)
-        zone_end = SimpleNamespace(x=10000, y=10000)
-        assert app.slot_zone_canvas.bind("<B1-Motion>")
-        assert not app.slot_canvas.bind("<B1-Motion>")
-        app.slot_canvas_press(zone_start)
-        app.slot_canvas_drag(zone_end)
-        app.slot_canvas_release(zone_end)
-        assert len(app.slot_zone_assignments) == len(app.slot_racks)
-        app.slot_levels.set("1")
-        app.slot_slots.set("12")
-        hierarchy_paths = app.prepare_slot_attribute_hierarchy()
+        badge = app.canvas.coords(
+            app.canvas.find_withtag("grid_zone_label_badge")[0]
+        )
+        assert badge[0] == boundary[0]
+        assert badge[3] < boundary[1]
+        assert {
+            app.canvas.itemcget(item, "fill")
+            for item in app.canvas.find_withtag("rack_point")
+        } == {"#d1495b"}
+        assert not any(
+            app.canvas.type(item) == "text"
+            and app.canvas.itemcget(item, "text").startswith("RACK")
+            for item in app.canvas.find_all()
+        )
+        app.project.location_attributes["Z01"]["chilled"] = True
+        app.redraw()
+        assert {
+            app.canvas.itemcget(item, "fill")
+            for item in app.canvas.find_withtag("rack_point")
+        } == {"#277da1"}
+        app.project.location_attributes["Z01"]["chilled"] = False
+        app.redraw()
+        hierarchy_paths = app.prepare_grid_attribute_hierarchy()
         zone_paths = [path for path in hierarchy_paths if "/" not in path]
         assert all(
-            key in app.slot_location_attributes[zone_paths[0]]
+            key in app.project.location_attributes[zone_paths[0]]
             for key in (
                 "chilled", "oversize_capable", "max_item_length", "max_item_width",
                 "max_item_height", "max_item_weight",
             )
         )
         assert not app.attributes.is_oversize_location(
-            app.slot_location_attributes[zone_paths[0]]
+            app.project.location_attributes[zone_paths[0]]
         )
         assert {
-            key: app.slot_location_attributes[zone_paths[0]][key]
+            key: app.project.location_attributes[zone_paths[0]][key]
             for key in (
                 "max_item_length", "max_item_width", "max_item_height",
                 "max_item_weight",
@@ -206,18 +251,22 @@ def main() -> None:
         }
         zone_state = {}
         zone_editor = gui.ZoneStorageSettingsEditor(
-            root, app.attributes, zone_paths, app.slot_location_attributes,
+            root, app.attributes, zone_paths, app.project.location_attributes,
             lambda local: zone_state.update({"local": local}),
         )
         root.update_idletasks()
         zone_editor.tree.selection_set(zone_paths[0])
         zone_editor._selected()
-        zone_editor.chilled.set(False)
+        zone_editor.chilled.set(True)
         zone_editor.capacity_values["max_item_weight"].set("")
         zone_editor.update_selected()
         zone_editor.commit()
-        app.apply_zone_storage_settings(zone_state["local"])
-        assert app.slot_location_attributes[zone_paths[0]]["max_item_weight"] is None
+        app.apply_grid_zone_storage_settings(zone_state["local"])
+        assert app.project.location_attributes[zone_paths[0]]["max_item_weight"] is None
+        assert {
+            app.canvas.itemcget(item, "fill")
+            for item in app.canvas.find_withtag("rack_point")
+        } == {"#277da1"}
         saved_attribute_state = {}
 
         def capture_attributes(catalog, local_values):
@@ -227,8 +276,8 @@ def main() -> None:
         editor = gui.HierarchyAttributeEditor(
             root,
             app.attributes,
-            app.slot_attribute_catalog,
-            app.slot_location_attributes,
+            app.project.attribute_catalog,
+            app.project.location_attributes,
             hierarchy_paths,
             capture_attributes,
         )
@@ -243,12 +292,8 @@ def main() -> None:
         assert "storage_class" in editor.catalog
 
         zone_path = next(path for path in hierarchy_paths if "/" not in path)
-        special_rack = next(
-            rack for rack in app.slot_racks if rack["distance_m"] < float("inf")
-        )
-        special_slot = (
-            f"{special_rack['zone_id']}/{special_rack['aisle_id']}/"
-            f"{special_rack['static_bay_id']}/L01/S01"
+        special_slot = next(
+            path for path in hierarchy_paths if path.endswith("/L01/S01")
         )
         editor.hierarchy_tree.selection_set(zone_path)
         editor.assignment_attribute.set("chilled")
@@ -263,24 +308,34 @@ def main() -> None:
         editor.assignment_value.set("100")
         editor.apply_local_value()
         editor.commit()
-        app.apply_slot_attributes(
+        app.apply_grid_attributes(
             saved_attribute_state["catalog"], saved_attribute_state["local"]
         )
-        assert app.slot_location_attributes[zone_path]["chilled"] is False
-        assert app.slot_location_attributes[special_slot]["chilled"] is True
+        assert app.project.location_attributes[zone_path]["chilled"] is False
+        assert app.project.location_attributes[special_slot]["chilled"] is True
         assert all(
-            app.slot_location_attributes[path]["max_item_weight"] == 100
+            app.project.location_attributes[path]["max_item_weight"] == 100
             for path in bulk_slots
         )
+        app.rmf_maps.save_project(app.project, project_path)
+
+        # Inventory Slotting consumes the saved warehouse configuration and
+        # keeps only SKU/strategy/output controls.
+        app.slot_building_path.set(str(project_path))
+        app.load_slot_building()
+        root.update_idletasks()
+        assert app.slot_racks
+        assert app.slot_zone_assignments == app.project.zone_assignments
+        assert app.slot_location_attributes[special_slot]["chilled"] is True
+        assert not hasattr(app, "slot_zone_canvas")
+        assert not app.slot_canvas.bind("<B1-Motion>")
 
         layout_path = temp / "workflow-AMR-shelf.slotting.json"
         app.slot_output_path.set(str(layout_path))
         app.run_slotting()
         root.update_idletasks()
         assert layout_path.exists()
-        assert app.slot_zone_mode.get() is True
         assert "Viewing generated layout:" in app.slot_viewer_status.get()
-        assert app.slot_zone_canvas.find_withtag("rack")
         assert app.slot_canvas.find_withtag("rack")
         assert all(
             row["dynamic_address_level"] == "shelf_slot"
@@ -353,13 +408,11 @@ def main() -> None:
         assert adjusted_payload["affinity_configuration"]["parameter_status"] == "USER_ADJUSTED"
         assert adjusted_payload["affinity_configuration"]["minimum_shared_store_days"] == 1
 
-        # Traffic-aware tab: load the storage rules into its own rack-area
-        # editor, run the independent pipeline, and persist/export the result.
-        app.traffic_building_path.set(str(yaml_path))
+        # Traffic-aware tab: reuse the warehouse configuration saved by the
+        # Grid Map Editor, run the independent pipeline, and persist the result.
+        app.traffic_grid_project_path.set(str(project_path))
         app.traffic_velocity_path.set(str(affinity_velocity_path))
         app.traffic_order_path.set(str(slot_affinity_path))
-        # Traffic remains on its existing YAML/legacy-address input path in this phase.
-        app.traffic_storage_config_path.set("")
         app.traffic_handling_unit.set("AMR shelf")
         app.traffic_levels.set("1")
         app.traffic_slots.set("12")
@@ -367,19 +420,11 @@ def main() -> None:
         assert app.load_traffic_area_map()
         root.update_idletasks()
         assert app.traffic_building is not None
+        assert app.traffic_storage_layout is not None
+        assert app.traffic_storage_layout.to_dict() == app.project.storage_layout.to_dict()
+        assert app.traffic_zone_assignments == app.project.zone_assignments
+        assert app.traffic_location_attributes[special_slot]["chilled"] is True
         assert app.traffic_canvas.find_withtag("traffic_area_rack")
-        first_traffic_rack = app.traffic_racks[0]
-        first_traffic_node = app.traffic_network.nodes[
-            f"v:{first_traffic_rack['vertex_index']}"
-        ]
-        rack_x, rack_y = app._traffic_point(
-            first_traffic_node, app._traffic_geometry()
-        )
-        app.traffic_area_id.set("ZONE_009")
-        app.traffic_canvas_press(SimpleNamespace(x=rack_x - 5, y=rack_y - 5))
-        app.traffic_canvas_release(SimpleNamespace(x=rack_x + 5, y=rack_y + 5))
-        assert app.traffic_area_id.get() == "ZONE_010"
-        assert app.traffic_zone_assignments[first_traffic_rack["waypoint"]] == "ZONE_009"
         app.traffic_area_mode.set(False)
         app.draw_traffic_map()
         app.start_traffic_analysis()
@@ -410,6 +455,9 @@ def main() -> None:
         assert app.traffic_pipeline_result.grouping_metrics[
             "hard_validation_status"
         ] == "PASSED"
+        assert app.traffic_pipeline_result.pretraffic_payload["sources"][
+            "grid_project_json"
+        ] == str(project_path.resolve())
         app.start_traffic_generation()
         deadline = time.monotonic() + 10
         while app.traffic_worker and app.traffic_worker.is_alive():
@@ -440,7 +488,17 @@ def main() -> None:
         app.save_traffic_layout()
         traffic_layout_path = Path(app.traffic_output_path.get())
         assert traffic_layout_path.exists()
-        assert app.layouts.load(traffic_layout_path)["traffic_configuration"]
+        saved_traffic_layout = app.layouts.load(traffic_layout_path)
+        assert saved_traffic_layout["traffic_configuration"]
+        assert saved_traffic_layout["sources"]["grid_project_json"] == str(
+            project_path.resolve()
+        )
+        assert saved_traffic_layout["storage_layout"] == (
+            app.project.storage_layout.to_dict()
+        )
+        assert len(saved_traffic_layout["buffers"]) == len(
+            app.project.storage_layout.buffers
+        )
         traffic_export = temp / "workflow-traffic.traffic.json"
         gui.filedialog.asksaveasfilename = lambda **_kwargs: str(traffic_export)
         app.export_traffic_report()

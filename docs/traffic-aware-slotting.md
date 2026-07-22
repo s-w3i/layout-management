@@ -1,38 +1,41 @@
 # Traffic-Aware Slotting
 
 The **Traffic-Aware Slotting** tab runs the complete recommendation pipeline
-from raw building, velocity, and order-history inputs. It does not require an
-assignment from the Inventory Slotting tab.
+from an editable grid project, velocity data, and order history. It does not
+require an assignment from the Inventory Slotting tab or a building YAML.
 
-The stages are ABC baseline generation, affinity-based SKU grouping, hard-rule
+The stages are ABC baseline generation, affinity-based SKU grouping, shared hard-rule
 validation, handling-unit visit calculation, traffic-aware complete-unit
-placement, and final comparison. An optional `.slotting.json` can supply storage
-zones and attributes, but its assignments are explicitly ignored.
+placement, and final comparison. The `.grid.json` project supplies the physical
+map, generated buffers, rack zones, chilled/capacity settings, attribute
+catalog, and inherited hierarchy values.
 
-## Chilled-zone setup and complete assignment
+## Warehouse configuration and complete assignment
 
-Use **Load map / label chilled zones** when the tab has no imported storage-rule
-file. The editor controls temperature zoning only: choose Ambient or Chilled,
-then drag a rectangle around the real racks belonging to that zone. After a
-rectangle labels at least one rack, the zone ID advances automatically (`Z01`
-to `Z02`, or `ZONE_009` to `ZONE_010`); an empty selection leaves it unchanged.
+The grid project must be completed in Grid Map Editor first. Its storage system,
+handling-unit type, levels, slots, zones, temperature settings, physical
+capacities, and advanced attributes are authoritative. Traffic-Aware Slotting
+provides **Load warehouse project** for reviewing this configuration but does
+not duplicate its editors.
 
-Before processing orders, the tab compares the SKU requirements with the
-currently labeled chilled areas and available slot capacity. If a chilled SKU
-has no chilled location, the pipeline pauses and asks the operator to finish
-temperature-zone labeling.
+If chilled or compatible capacity is insufficient, generation stops and directs
+the operator to update and resave the grid project before rerunning.
 
-Standard versus oversize placement is decided by the ABC/affinity slotting
-algorithm, not zone labels. An oversize item remains in normal demand and
-affinity ordering but reserves a contiguous rectangle of horizontal slots and
-vertical levels when required. The assignment stores `occupied_slot_count`,
-the horizontal and vertical spans, and `occupied_static_addresses`. Overweight
-and oversize-plus-overweight footprints start at level 1 instead of being
-rejected for exceeding the standard upper-level weight threshold. If cumulative
+The generated ABC and affinity baselines use the same allocator and hard rules
+as Inventory Slotting. Standard inventory is placed before exception inventory.
+Ambient user zones remain non-mixed `STANDARD` or `OVERSIZE` zones. A chilled
+zone can split by whole rack into `*_chill_normal` and `*_chill_oversize`, with
+standard chilled demand receiving capacity first. Known overweight and
+oversize-plus-overweight inventory is assigned to level 2 when that level
+exists (otherwise level 1). Unknown-size, unknown-weight, and non-volumetric
+records use the exception segment and remain visibly unverified. If cumulative
 compatible capacity is insufficient,
 generation stops with a warning and does not expose a partial layout for saving.
-Missing physical measurements remain explicitly unverified because fit cannot
-be guaranteed from absent source data.
+
+Traffic optimization swaps complete handling units only. It preserves the
+destination's zone, segment, buffer, capacity, and static address metadata.
+Standard and exception segments cannot be crossed, weight capacity is never
+bypassed, and units with incomplete physical data remain fixed and reported.
 
 ## Demand definition
 

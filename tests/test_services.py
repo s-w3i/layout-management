@@ -102,6 +102,37 @@ class WarehouseServiceTests(unittest.TestCase):
             loaded = self.rmf.load_project(path)
         self.assertEqual(loaded.to_project_dict(), self.project.to_project_dict())
 
+    def test_project_round_trip_preserves_warehouse_configuration(self):
+        self.project.assign_storage_buffers("AMR", 2, 4)
+        self.project.zone_assignments = {
+            "G0_0": "Z01",
+            "G2_0": "Z02",
+        }
+        self.project.attribute_catalog = self.slotting.attributes.serialize_catalog(
+            self.slotting.attributes.starter_catalog()
+        )
+        self.project.location_attributes = {
+            "Z01": {"chilled": False, "max_item_weight": None},
+            "Z02": {"chilled": True, "max_item_weight": 250},
+            "Z02/A01/B-G2_0/L01/S01": {"max_item_weight": 100},
+        }
+        building_before = self.project.to_building_dict()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "warehouse.grid.json"
+            self.rmf.save_project(self.project, path)
+            loaded = self.rmf.load_project(path)
+        self.assertEqual(loaded.zone_assignments, self.project.zone_assignments)
+        self.assertEqual(loaded.attribute_catalog, self.project.attribute_catalog)
+        self.assertEqual(
+            loaded.location_attributes, self.project.location_attributes
+        )
+        self.assertEqual(loaded.to_building_dict(), building_before)
+
+    def test_project_rejects_zone_assignment_for_non_rack_grid_point(self):
+        self.project.zone_assignments = {"G1_1": "Z01"}
+        with self.assertRaisesRegex(ValueError, "non-rack"):
+            self.project.validate()
+
     def test_grid_spec_uses_short_final_interval_for_odd_spacing(self):
         spec = GridSpec(20, 10, 3, "odd_spacing", "L1")
         spec.validate()

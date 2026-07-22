@@ -153,6 +153,9 @@ class GridProject:
     grid: GridSpec = field(default_factory=GridSpec)
     markers: Dict[GridPosition, Marker] = field(default_factory=dict)
     storage_layout: StorageLayout | None = None
+    zone_assignments: dict[str, str] = field(default_factory=dict)
+    attribute_catalog: list[dict[str, Any]] = field(default_factory=list)
+    location_attributes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def validate(self) -> None:
         self.grid.validate()
@@ -165,6 +168,28 @@ class GridProject:
         duplicates = sorted({item for item in endpoint_ids if endpoint_ids.count(item) > 1})
         if duplicates:
             raise ValueError(f"duplicate endpoint IDs: {', '.join(duplicates)}")
+        rack_waypoints = {
+            self.vertex_name(column, row)
+            for (column, row), marker in self.markers.items()
+            if marker.role == "rack"
+        }
+        unknown_zone_racks = sorted(set(self.zone_assignments) - rack_waypoints)
+        if unknown_zone_racks:
+            raise ValueError(
+                "zone assignments reference non-rack grid points: "
+                + ", ".join(unknown_zone_racks)
+            )
+        if any(not str(zone).strip() for zone in self.zone_assignments.values()):
+            raise ValueError("rack zone IDs cannot be blank")
+        if not isinstance(self.attribute_catalog, list) or any(
+            not isinstance(item, dict) for item in self.attribute_catalog
+        ):
+            raise ValueError("attribute catalog must be a list of objects")
+        if not isinstance(self.location_attributes, dict) or any(
+            not str(path).strip() or not isinstance(values, dict)
+            for path, values in self.location_attributes.items()
+        ):
+            raise ValueError("location attributes must map hierarchy paths to objects")
         if self.storage_layout is not None:
             self.storage_layout.validate()
             rack_positions = {
@@ -228,6 +253,15 @@ class GridProject:
         }
         if self.storage_layout is not None:
             result["storage_layout"] = self.storage_layout.to_dict()
+        if self.zone_assignments:
+            result["zone_assignments"] = dict(sorted(self.zone_assignments.items()))
+        if self.attribute_catalog:
+            result["attribute_catalog"] = [dict(item) for item in self.attribute_catalog]
+        if self.location_attributes:
+            result["location_attributes"] = {
+                path: dict(values)
+                for path, values in sorted(self.location_attributes.items())
+            }
         return result
 
     @classmethod
@@ -242,6 +276,17 @@ class GridProject:
             project.markers[position] = Marker(item["role"], item["endpoint_id"])
         if data.get("storage_layout") is not None:
             project.storage_layout = StorageLayout.from_dict(data["storage_layout"])
+        project.zone_assignments = {
+            str(waypoint): str(zone)
+            for waypoint, zone in (data.get("zone_assignments") or {}).items()
+        }
+        project.attribute_catalog = [
+            dict(item) for item in (data.get("attribute_catalog") or [])
+        ]
+        project.location_attributes = {
+            str(path): dict(values)
+            for path, values in (data.get("location_attributes") or {}).items()
+        }
         project.validate()
         return project
 

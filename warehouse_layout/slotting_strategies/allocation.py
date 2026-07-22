@@ -23,6 +23,7 @@ from ..slotting_rules import (
     allocation_candidate_key,
     apply_rack_frequency_ranks,
     physical_allocation_bucket,
+    overweight_storage_level,
     required_slot_footprint,
 )
 from .affinity_support import (
@@ -224,9 +225,8 @@ def allocate(
             position["planned_zone_id"] = (
                 f"{position['zone_id']}_{storage_type}"
             )
-    # In the strict full pipeline, oversize is an occupancy requirement,
-    # not a separate placement class. ABC/affinity therefore keeps control
-    # of ordering and bay selection while contiguous slots enforce fit.
+    # The legacy strict compatibility mode models oversize as a contiguous
+    # occupancy requirement instead of a separately planned placement class.
     physical_grouping_enabled = physical_enabled and not strict_compatibility
 
     def physical_group_rank(row):
@@ -418,20 +418,22 @@ def allocate(
                 )
                 if (
                     overweight_level_required
-                    and int(candidate["level"]) != min(2, levels_per_rack)
+                    and int(candidate["level"]) != overweight_storage_level(
+                        levels_per_rack
+                    )
                 ):
                     issue = (
                         f"overweight inventory requires level "
-                        f"{min(2, levels_per_rack)}"
+                        f"{overweight_storage_level(levels_per_rack)}"
                     )
                     if issue not in hard_issues:
                         hard_issues.append(issue)
                     continue
                 if (
                     strict_compatibility
-                    and not ergonomic_weight_heuristic
                     and overweight
-                    and candidate["level"] != 1
+                    and candidate["level"]
+                    != overweight_storage_level(levels_per_rack)
                 ):
                     continue
                 occupied_positions = [candidate]

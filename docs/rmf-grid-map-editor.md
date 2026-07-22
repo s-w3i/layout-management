@@ -33,10 +33,8 @@ to its horizontal and vertical neighbours, and every lane is bidirectional.
 
 Choose a placement tool:
 
-- **Paint rack pickups** lets you hold the mouse button and drag across a row
-  or irregular set of grid points.
-- **Fill rack rectangle** takes two clicks on opposite corners and marks every
-  grid point inside the rectangle as a pickup.
+- **Fill racks (drag rectangle)** marks every grid point inside a dragged
+  rectangle as a pickup. Press and release on one point to place one rack.
 - **Place workstation drop-off** adds `dropoff_ingestor: [1, WORKSTATION_ID]`
 - **Clear markers** can also be dragged over many points.
 - **Select / edit** lets you change the role or endpoint ID
@@ -117,35 +115,25 @@ interchange artifacts.
 The **Inventory Slotting** tab accepts:
 
 - An editable `.grid.json` containing the RMF grid, rack/workstation markers,
-  storage-system profile, and empty buffers
+  storage-system profile, empty buffers, rack zones, and warehouse attributes
 - The ABC SKU velocity summary CSV
 - An optional selected-SKU chilled requirements CSV
 - A strategy selected from the dropdown
-- The handling-unit model and levels/slots generated in Grid Map Editor
-- Optional typed hierarchy attributes and matching `req_<attribute_key>` CSV
-  columns
+- Optional typed SKU requirements using `req_<attribute_key>` CSV columns that
+  match the attribute catalog saved in the grid project
 
 Use this workflow:
 
-1. Browse for the grid project JSON and click **Load project**.
-2. The first zone ID defaults to `Z01`.
-3. In the **Slotting zone editor**, drag over a group of racks.
-4. Repeat until every rack belongs to a zone. After each successful rectangle,
-   the ID advances automatically to `Z02`, `Z03`, and so on. IDs such as
-   `ZONE_001` advance to `ZONE_002` while preserving their numeric width.
-5. Confirm the read-only levels and slots, then click **Zone storage settings…**.
-   Limits default to 25.0 × 19.3 × 19.2 and weight 465.0 in unconfirmed source units.
-   Any maximum may be cleared; blank means no configured maximum, not zero.
-6. Mark actual chilled zones. Chilled is the only storage role predefined by
-   the user; oversize segments are planned automatically during slotting.
-7. Use **Advanced attributes…** for extra inherited values or lower-level
-   overrides. Generated oversize segment attributes also appear at child slots.
-8. Browse for the ABC SKU velocity CSV and optional chilled CSV. Physical
+1. In Grid Map Editor, generate buffers, assign every rack to a zone, configure
+   chilled/capacity settings, and add any advanced hierarchy attributes.
+2. Save the `.grid.json`, then browse for it in Inventory Slotting and click
+   **Load project**.
+3. Browse for the ABC SKU velocity CSV and optional chilled CSV. Physical
    requirement columns are `req_max_item_length`, `req_max_item_width`,
    `req_max_item_height`, and `req_max_item_weight`. A positive SKU weight
    enables a soft preference for middle rack levels; weight `0` disables this
    ergonomic preference for that SKU.
-9. Select the strategy, then generate the layout.
+4. Select the strategy, then generate the layout.
 
 For `abc_affinity`, select the order-history workbook and an affinity weight.
 The weight directly balances same-bay affinity consolidation against ABC bay
@@ -158,9 +146,8 @@ warehouse map. The values appear after generation and become editable. Use
 **Regenerate with edited values** to test an adjustment or **Recalculate
 automatic suggestion** after changing the source data.
 
-Racks are coloured by zone while grouping. Generation is blocked until all
-racks have a zone. After generation, rectangle mode turns off and rack colours
-change to their assigned ABC class. Aisles are derived from rack columns
+Generation is blocked until the grid project supplies a zone for every rack.
+The generated result viewer colours racks by assigned ABC class. Aisles are derived from rack columns
 (common X coordinates), and bays are ordered along each column. Aisles are
 numbered independently inside every zone, so each zone starts at `A01`.
 
