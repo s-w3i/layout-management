@@ -100,6 +100,9 @@ class ZoneStorageSettingsEditor(tk.Toplevel):
         ttk.Label(
             frame,
             text=(
+                "Only chilled storage is predefined by the user. Maximum fields "
+                "may remain empty (unbounded), or be entered as planning inputs. "
+                "Oversize segments are generated automatically during slotting. "
                 "Units are intentionally preserved as unconfirmed source length and "
                 "source weight units. Production limits must be checked against the racks."
             ),
@@ -118,7 +121,10 @@ class ZoneStorageSettingsEditor(tk.Toplevel):
                 "", "end", iid=zone,
                 values=(
                     zone, "Yes" if values.get("chilled") is True else "No",
-                    *(values.get(key, "") for key in PHYSICAL_ATTRIBUTE_KEYS),
+                    *(
+                        "" if values.get(key) is None else values.get(key, "")
+                        for key in PHYSICAL_ATTRIBUTE_KEYS
+                    ),
                 ),
             )
         if self.zones:
@@ -138,25 +144,26 @@ class ZoneStorageSettingsEditor(tk.Toplevel):
         self.selected_zone.set(zone)
         self.chilled.set(values.get("chilled") is True)
         for key in PHYSICAL_ATTRIBUTE_KEYS:
-            self.capacity_values[key].set(str(values.get(key, "")))
+            value = values.get(key, "")
+            self.capacity_values[key].set("" if value is None else str(value))
 
     def update_selected(self) -> bool:
         zone = self.selected_zone.get()
         if not zone:
             return False
         try:
-            parsed = {
-                key: float(variable.get())
-                for key, variable in self.capacity_values.items()
-            }
-            if any(value <= 0 for value in parsed.values()):
-                raise ValueError("all dimensions and weight limits must be greater than zero")
+            parsed = {}
+            for key, variable in self.capacity_values.items():
+                raw = variable.get().strip()
+                parsed[key] = None if not raw else float(raw)
+            if any(value is not None and value <= 0 for value in parsed.values()):
+                raise ValueError("entered dimensions and weight limits must be greater than zero")
         except ValueError as exc:
             messagebox.showerror("Invalid zone capacity", str(exc), parent=self)
             return False
         values = self._zone_values(zone)
         values.update({
-            key: int(value) if value.is_integer() else value
+            key: None if value is None else int(value) if value.is_integer() else value
             for key, value in parsed.items()
         })
         values["chilled"] = self.chilled.get()

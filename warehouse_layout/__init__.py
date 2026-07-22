@@ -3,16 +3,27 @@
 from .attributes import (
     AttributeDefinition,
     CORE_ATTRIBUTE_KEYS,
+    OVERSIZE_CAPABLE_KEY,
     OVERSIZE_STORAGE_DEFAULTS,
     PHYSICAL_ATTRIBUTE_KEYS,
     STANDARD_STORAGE_DEFAULTS,
     StorageAttributeService,
 )
 from .affinity import AffinityAnalysis, AffinityDataset, AffinityService
-from .domain import GridPosition, GridProject, GridSpec, Marker
+from .domain import GridPosition, GridProject, GridSpec, Marker, StorageLayout
 from .inventory import InventoryService
 from .rmf import RmfMapService
 from .slotting import SlottingLayoutRepository, SlottingService
+from .traffic import (
+    InsufficientStorageError,
+    MovementNetwork,
+    TrafficAnalysis,
+    TrafficAwareSlottingService,
+    TrafficCancelledError,
+    TrafficDemand,
+    TrafficOptimizationResult,
+    TrafficPipelineResult,
+)
 
 __all__ = [
     "AttributeDefinition",
@@ -20,6 +31,7 @@ __all__ = [
     "AffinityDataset",
     "AffinityService",
     "CORE_ATTRIBUTE_KEYS",
+    "OVERSIZE_CAPABLE_KEY",
     "OVERSIZE_STORAGE_DEFAULTS",
     "PHYSICAL_ATTRIBUTE_KEYS",
     "STANDARD_STORAGE_DEFAULTS",
@@ -31,5 +43,14 @@ __all__ = [
     "RmfMapService",
     "SlottingLayoutRepository",
     "SlottingService",
+    "StorageLayout",
     "StorageAttributeService",
+    "MovementNetwork",
+    "InsufficientStorageError",
+    "TrafficAnalysis",
+    "TrafficAwareSlottingService",
+    "TrafficCancelledError",
+    "TrafficDemand",
+    "TrafficOptimizationResult",
+    "TrafficPipelineResult",
 ]

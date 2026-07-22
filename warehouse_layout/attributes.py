@@ -18,12 +18,13 @@ PHYSICAL_DIMENSION_KEYS = (
 )
 PHYSICAL_WEIGHT_KEY = "max_item_weight"
 PHYSICAL_ATTRIBUTE_KEYS = (*PHYSICAL_DIMENSION_KEYS, PHYSICAL_WEIGHT_KEY)
-CORE_ATTRIBUTE_KEYS = ("chilled", *PHYSICAL_ATTRIBUTE_KEYS)
+OVERSIZE_CAPABLE_KEY = "oversize_capable"
+CORE_ATTRIBUTE_KEYS = ("chilled", OVERSIZE_CAPABLE_KEY, *PHYSICAL_ATTRIBUTE_KEYS)
 STANDARD_STORAGE_DEFAULTS = {
-    "max_item_length": 15,
-    "max_item_width": 16,
-    "max_item_height": 13,
-    "max_item_weight": 250,
+    "max_item_length": 25.0,
+    "max_item_width": 19.3,
+    "max_item_height": 19.2,
+    "max_item_weight": 465.0,
 }
 OVERSIZE_STORAGE_DEFAULTS = {
     "max_item_length": 150,
@@ -104,6 +105,12 @@ class StorageAttributeService:
         definitions = (
             AttributeDefinition("chilled", "Chilled", "boolean", "exact"),
             AttributeDefinition(
+                OVERSIZE_CAPABLE_KEY,
+                "Oversize-capable storage",
+                "boolean",
+                "exact",
+            ),
+            AttributeDefinition(
                 "max_item_length", "Maximum item length", "number", "capacity",
                 "source length unit",
             ),
@@ -135,6 +142,13 @@ class StorageAttributeService:
         """Classify one-unit physical requirements against standard storage."""
         requirements = requirements or {}
         defaults = standard_defaults or STANDARD_STORAGE_DEFAULTS
+        raw_weight = requirements.get(PHYSICAL_WEIGHT_KEY)
+        try:
+            weight_heuristic_disabled = (
+                raw_weight not in (None, "") and float(raw_weight) == 0
+            )
+        except (TypeError, ValueError):
+            weight_heuristic_disabled = False
         values: dict[str, float] = {}
         missing: list[str] = []
         for key in PHYSICAL_ATTRIBUTE_KEYS:
@@ -147,19 +161,48 @@ class StorageAttributeService:
                 missing.append(key)
             else:
                 values[key] = value
+        dimensions_complete = all(key in values for key in PHYSICAL_DIMENSION_KEYS)
+        weight_known = PHYSICAL_WEIGHT_KEY in values
+        volumetric_oversize = False
+        if dimensions_complete:
+            item_dimensions = sorted(
+                values[key] for key in PHYSICAL_DIMENSION_KEYS
+            )
+            standard_dimensions = sorted(
+                float(defaults[key]) for key in PHYSICAL_DIMENSION_KEYS
+            )
+            volumetric_oversize = any(
+                item > capacity
+                for item, capacity in zip(item_dimensions, standard_dimensions)
+            )
         if missing:
+            if not dimensions_complete and not weight_known:
+                missing_data_type = "NON_VOLUMETRIC_DATA"
+                storage_class = "NON_VOLUMETRIC_DATA"
+            elif not dimensions_complete:
+                missing_data_type = "UNKNOWN_SIZE"
+                storage_class = (
+                    "OVERSIZE_AND_OVERWEIGHT"
+                    if values.get(PHYSICAL_WEIGHT_KEY, 0)
+                    > float(defaults[PHYSICAL_WEIGHT_KEY])
+                    else "OVERSIZE"
+                )
+            else:
+                missing_data_type = "UNKNOWN_WEIGHT"
+                storage_class = (
+                    "OVERSIZE"
+                    if volumetric_oversize else "UNKNOWN_WEIGHT"
+                )
             return {
                 "data_status": "MISSING",
-                "storage_class": "UNVERIFIED_OVERSIZE",
+                "missing_data_type": missing_data_type,
+                "storage_class": storage_class,
                 "missing_fields": missing,
                 "values": values,
+                "volumetric_oversize": volumetric_oversize,
+                "weight_heuristic_disabled": weight_heuristic_disabled,
             }
-        item_dimensions = sorted(values[key] for key in PHYSICAL_DIMENSION_KEYS)
-        standard_dimensions = sorted(float(defaults[key]) for key in PHYSICAL_DIMENSION_KEYS)
-        oversize = any(
-            item > capacity
-            for item, capacity in zip(item_dimensions, standard_dimensions)
-        )
+        oversize = volumetric_oversize
         overweight = values[PHYSICAL_WEIGHT_KEY] > float(
             defaults[PHYSICAL_WEIGHT_KEY]
         )
@@ -173,9 +216,12 @@ class StorageAttributeService:
             storage_class = "STANDARD"
         return {
             "data_status": "COMPLETE",
+            "missing_data_type": "",
             "storage_class": storage_class,
             "missing_fields": [],
             "values": values,
+            "volumetric_oversize": volumetric_oversize,
+            "weight_heuristic_disabled": weight_heuristic_disabled,
         }
 
     @staticmethod
@@ -183,17 +229,27 @@ class StorageAttributeService:
         effective: dict[str, Any],
         standard_defaults: dict[str, float] | None = None,
     ) -> bool:
-        """Return whether a location provides capacity above the standard profile."""
-        defaults = standard_defaults or STANDARD_STORAGE_DEFAULTS
-        try:
-            return all(
-                float(effective[key]) > 0 for key in PHYSICAL_ATTRIBUTE_KEYS
-            ) and any(
-                float(effective[key]) > float(defaults[key])
-                for key in PHYSICAL_ATTRIBUTE_KEYS
-            )
-        except (KeyError, TypeError, ValueError):
-            return False
+        """Return whether a location is explicitly dedicated to oversize stock."""
+        return effective.get(OVERSIZE_CAPABLE_KEY) is True
+
+    @staticmethod
+    def is_volumetric_oversize(profile: dict[str, Any]) -> bool:
+        """Return whether known SKU dimensions exceed the standard envelope."""
+        if profile.get("missing_data_type") in {
+            "UNKNOWN_SIZE", "NON_VOLUMETRIC_DATA",
+        }:
+            return True
+        if "volumetric_oversize" in profile:
+            return profile.get("volumetric_oversize") is True
+        return str(profile.get("storage_class", "")).upper() in {
+            "OVERSIZE", "OVERSIZE_AND_OVERWEIGHT",
+        }
+
+    @staticmethod
+    def physical_capacity(effective: dict[str, Any], key: str) -> float:
+        """Return infinity for a blank/unset physical maximum."""
+        raw = effective.get(key)
+        return math.inf if raw in (None, "") else float(raw)
 
     def evaluate_location(
         self,
@@ -237,7 +293,10 @@ class StorageAttributeService:
             ]
             if not allow_unverified:
                 issues.append("physical data is incomplete: " + ", ".join(missing_labels))
-            elif not oversize_location:
+            elif not oversize_location and not all(
+                key not in effective or effective.get(key) in (None, "")
+                for key in profile["missing_fields"]
+            ):
                 issues.append(
                     "physical data is incomplete and the target is not oversize-capable: "
                     + ", ".join(missing_labels)
@@ -248,35 +307,30 @@ class StorageAttributeService:
                 "physical fit is unverified; missing " + ", ".join(missing_labels)
             ], "UNVERIFIED"
 
-        for key in PHYSICAL_ATTRIBUTE_KEYS:
-            if key not in effective:
-                issues.append(f"{definitions[key].label}: location value is not defined")
-        if not any(key not in effective for key in PHYSICAL_ATTRIBUTE_KEYS):
-            item_dimensions = sorted(
-                float(requirements[key]) for key in PHYSICAL_DIMENSION_KEYS
+        item_dimensions = sorted(
+            float(requirements[key]) for key in PHYSICAL_DIMENSION_KEYS
+        )
+        location_dimensions = sorted(
+            self.physical_capacity(effective, key)
+            for key in PHYSICAL_DIMENSION_KEYS
+        )
+        if any(
+            item > capacity
+            for item, capacity in zip(item_dimensions, location_dimensions)
+        ):
+            issues.append(
+                "item dimensions "
+                + " × ".join(f"{value:g}" for value in item_dimensions)
+                + " do not fit configured location dimensions in any allowed rotation"
             )
-            location_dimensions = sorted(
-                float(effective[key]) for key in PHYSICAL_DIMENSION_KEYS
+        if float(requirements[PHYSICAL_WEIGHT_KEY]) > self.physical_capacity(
+            effective, PHYSICAL_WEIGHT_KEY
+        ):
+            issues.append(
+                f"Maximum item weight: requires {requirements[PHYSICAL_WEIGHT_KEY]} "
+                f"source weight unit, location provides "
+                f"{effective[PHYSICAL_WEIGHT_KEY]} source weight unit"
             )
-            if any(
-                item > capacity
-                for item, capacity in zip(item_dimensions, location_dimensions)
-            ):
-                issues.append(
-                    "item dimensions "
-                    + " × ".join(f"{value:g}" for value in item_dimensions)
-                    + " do not fit location dimensions "
-                    + " × ".join(f"{value:g}" for value in location_dimensions)
-                    + " in any allowed rotation"
-                )
-            if float(requirements[PHYSICAL_WEIGHT_KEY]) > float(
-                effective[PHYSICAL_WEIGHT_KEY]
-            ):
-                issues.append(
-                    f"Maximum item weight: requires {requirements[PHYSICAL_WEIGHT_KEY]} "
-                    f"source weight unit, location provides "
-                    f"{effective[PHYSICAL_WEIGHT_KEY]} source weight unit"
-                )
         return not issues, issues, "COMPATIBLE" if not issues else "INCOMPATIBLE"
 
     @staticmethod
@@ -313,15 +367,14 @@ class StorageAttributeService:
             if key in requirements
         }
         dimensions_fit = False
-        if len(dimension_requirements) == len(PHYSICAL_DIMENSION_KEYS) and all(
-            key in effective for key in PHYSICAL_DIMENSION_KEYS
-        ):
+        if len(dimension_requirements) == len(PHYSICAL_DIMENSION_KEYS):
             item_dimensions = sorted(
                 float(dimension_requirements[key])
                 for key in PHYSICAL_DIMENSION_KEYS
             )
             location_dimensions = sorted(
-                float(effective[key]) for key in PHYSICAL_DIMENSION_KEYS
+                self.physical_capacity(effective, key)
+                for key in PHYSICAL_DIMENSION_KEYS
             )
             dimensions_fit = all(
                 item <= capacity
@@ -329,6 +382,8 @@ class StorageAttributeService:
             )
         if not dimensions_fit:
             for key, required in dimension_requirements.items():
+                if key not in effective or effective.get(key) in (None, ""):
+                    continue
                 try:
                     actual = float(effective.get(key, 0))
                 except (TypeError, ValueError):
@@ -343,6 +398,8 @@ class StorageAttributeService:
             if definition is None:
                 continue
             actual = effective.get(key)
+            if key in PHYSICAL_ATTRIBUTE_KEYS and actual in (None, ""):
+                continue
             if definition.match_rule == "capacity":
                 try:
                     satisfied = float(actual) >= float(required)
@@ -475,7 +532,10 @@ class StorageAttributeService:
             for key, raw in values.items():
                 if key not in definitions:
                     raise ValueError(f"location '{path}' uses unknown attribute '{key}'")
-                parsed[key] = self.parse_value(definitions[key], raw)
+                if key in PHYSICAL_ATTRIBUTE_KEYS and raw in (None, ""):
+                    parsed[key] = None
+                else:
+                    parsed[key] = self.parse_value(definitions[key], raw)
             if parsed:
                 normalized[path] = parsed
         return normalized
@@ -521,6 +581,8 @@ class StorageAttributeService:
                 issues.append(f"{definition.label}: location value is not defined")
                 continue
             actual = effective[key]
+            if key in PHYSICAL_ATTRIBUTE_KEYS and actual in (None, ""):
+                continue
             if definition.match_rule == "capacity":
                 try:
                     matches = float(actual) >= float(required)
@@ -589,4 +651,7 @@ class StorageAttributeService:
     def format_values(values: dict[str, Any] | None) -> str:
         if not values:
             return "none"
-        return ", ".join(f"{key}={value}" for key, value in sorted(values.items()))
+        return ", ".join(
+            f"{key}={'no maximum' if key in PHYSICAL_ATTRIBUTE_KEYS and value is None else value}"
+            for key, value in sorted(values.items())
+        )

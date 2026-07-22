@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Tuple
 
 from .config import PROJECT_SCHEMA
 
@@ -19,31 +19,43 @@ class GridSpec:
     spacing_m: float = 1.0
     map_name: str = "warehouse_grid"
     level_name: str = "L1"
+    spacing_y_m: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.spacing_y_m is None:
+            self.spacing_y_m = self.spacing_m
 
     def validate(self) -> None:
         for label, value in (
             ("width", self.width_m),
             ("length", self.length_m),
-            ("grid spacing", self.spacing_m),
+            ("X grid spacing", self.spacing_m),
+            ("Y grid spacing", self.spacing_y_m),
         ):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{label} must be greater than zero")
         if not self.map_name.strip() or not self.level_name.strip():
             raise ValueError("map and level names cannot be blank")
-        for label, value in (("width", self.width_m), ("length", self.length_m)):
-            cells = value / self.spacing_m
-            if not math.isclose(cells, round(cells), abs_tol=1e-7):
-                raise ValueError(f"{label} must be an exact multiple of grid spacing")
         if self.vertex_count > 10_000:
             raise ValueError(f"grid contains {self.vertex_count:,} vertices; maximum is 10,000")
 
     @property
     def columns(self) -> int:
-        return round(self.width_m / self.spacing_m)
+        return max(1, math.ceil(self.width_m / self.spacing_m - 1e-12))
 
     @property
     def rows(self) -> int:
-        return round(self.length_m / self.spacing_m)
+        return max(1, math.ceil(self.length_m / self.spacing_y_m - 1e-12))
+
+    def x_coordinate(self, column: int) -> float:
+        if not 0 <= column <= self.columns:
+            raise ValueError(f"column {column} is outside the grid")
+        return min(column * self.spacing_m, self.width_m)
+
+    def y_coordinate(self, row: int) -> float:
+        if not 0 <= row <= self.rows:
+            raise ValueError(f"row {row} is outside the grid")
+        return min(row * self.spacing_y_m, self.length_m)
 
     @property
     def vertex_count(self) -> int:
@@ -66,10 +78,81 @@ class Marker:
             raise ValueError("endpoint ID cannot be blank")
 
 
+STORAGE_SYSTEMS = {
+    "AMR": ("grid", "AMR shelf"),
+    "Mini-load ASRS": ("slot", "Tote"),
+    "Pallet ASRS": ("slot", "Pallet"),
+}
+
+
+@dataclass
+class StorageLayout:
+    """Empty static buffers generated from rack markers in an editable project."""
+
+    system_type: str = "AMR"
+    levels_per_rack: int = 1
+    slots_per_level: int = 6
+    buffers: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def buffer_level(self) -> str:
+        return STORAGE_SYSTEMS.get(self.system_type, ("", ""))[0]
+
+    @property
+    def handling_unit_type(self) -> str:
+        return STORAGE_SYSTEMS.get(self.system_type, ("", ""))[1]
+
+    def validate(self) -> None:
+        if self.system_type not in STORAGE_SYSTEMS:
+            raise ValueError(f"unsupported storage system: {self.system_type}")
+        if self.levels_per_rack < 1 or self.slots_per_level < 1:
+            raise ValueError("storage levels and slots per level must be at least 1")
+        identifiers: set[str] = set()
+        for item in self.buffers:
+            if not isinstance(item, dict):
+                raise ValueError("storage buffer must be an object")
+            buffer_id = str(item.get("buffer_id", "")).strip()
+            if not buffer_id:
+                raise ValueError("storage buffer ID cannot be blank")
+            if buffer_id in identifiers:
+                raise ValueError(f"duplicate storage buffer ID: {buffer_id}")
+            identifiers.add(buffer_id)
+            if item.get("buffer_level") != self.buffer_level:
+                raise ValueError(
+                    f"buffer {buffer_id} must use {self.buffer_level} level for "
+                    f"{self.system_type}"
+                )
+            if item.get("status") != "EMPTY":
+                raise ValueError(f"grid-project buffer {buffer_id} must be EMPTY")
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "system_type": self.system_type,
+            "buffer_level": self.buffer_level,
+            "handling_unit_type": self.handling_unit_type,
+            "levels_per_rack": self.levels_per_rack,
+            "slots_per_level": self.slots_per_level,
+            "buffers": [dict(item) for item in self.buffers],
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "StorageLayout":
+        layout = cls(
+            system_type=str(value.get("system_type", "AMR")),
+            levels_per_rack=int(value.get("levels_per_rack", 1)),
+            slots_per_level=int(value.get("slots_per_level", 6)),
+            buffers=[dict(item) for item in value.get("buffers", [])],
+        )
+        layout.validate()
+        return layout
+
+
 @dataclass
 class GridProject:
     grid: GridSpec = field(default_factory=GridSpec)
     markers: Dict[GridPosition, Marker] = field(default_factory=dict)
+    storage_layout: StorageLayout | None = None
 
     def validate(self) -> None:
         self.grid.validate()
@@ -82,6 +165,44 @@ class GridProject:
         duplicates = sorted({item for item in endpoint_ids if endpoint_ids.count(item) > 1})
         if duplicates:
             raise ValueError(f"duplicate endpoint IDs: {', '.join(duplicates)}")
+        if self.storage_layout is not None:
+            self.storage_layout.validate()
+            rack_positions = {
+                position for position, marker in self.markers.items()
+                if marker.role == "rack"
+            }
+            buffer_positions = {
+                (int(item["column"]), int(item["row"]))
+                for item in self.storage_layout.buffers
+            }
+            if buffer_positions != rack_positions:
+                raise ValueError(
+                    "every rack marker must have generated storage buffers and "
+                    "buffers cannot exist at non-rack points"
+                )
+            expected_per_rack = (
+                1 if self.storage_layout.buffer_level == "grid"
+                else self.storage_layout.levels_per_rack
+                * self.storage_layout.slots_per_level
+            )
+            if len(self.storage_layout.buffers) != len(rack_positions) * expected_per_rack:
+                raise ValueError("storage buffer catalog is incomplete for its capacity")
+            for item in self.storage_layout.buffers:
+                column, row = int(item["column"]), int(item["row"])
+                waypoint = self.vertex_name(column, row)
+                if item.get("grid_waypoint") != waypoint:
+                    raise ValueError(
+                        f"storage buffer grid waypoint must be {waypoint}"
+                    )
+                root = f"B-{waypoint}"
+                expected_id = root
+                if self.storage_layout.buffer_level == "slot":
+                    expected_id += (
+                        f"/L{int(item.get('level', 0)):02d}"
+                        f"/S{int(item.get('slot', 0)):02d}"
+                    )
+                if item.get("buffer_id") != expected_id:
+                    raise ValueError(f"invalid storage buffer ID: {item.get('buffer_id')}")
 
     def vertex_index(self, column: int, row: int) -> int:
         return row * (self.grid.columns + 1) + column
@@ -95,7 +216,7 @@ class GridProject:
                 yield column, row
 
     def to_project_dict(self) -> dict:
-        return {
+        result = {
             "schema": PROJECT_SCHEMA,
             "grid": asdict(self.grid),
             "markers": [
@@ -105,24 +226,66 @@ class GridProject:
                 )
             ],
         }
+        if self.storage_layout is not None:
+            result["storage_layout"] = self.storage_layout.to_dict()
+        return result
 
     @classmethod
     def from_project_dict(cls, data: dict) -> "GridProject":
-        if data.get("schema") != PROJECT_SCHEMA:
+        from .config import LEGACY_PROJECT_SCHEMA
+
+        if data.get("schema") not in {PROJECT_SCHEMA, LEGACY_PROJECT_SCHEMA}:
             raise ValueError("not a supported RMF grid project file")
         project = cls(grid=GridSpec(**data["grid"]))
         for item in data.get("markers", []):
             position = (int(item["column"]), int(item["row"]))
             project.markers[position] = Marker(item["role"], item["endpoint_id"])
+        if data.get("storage_layout") is not None:
+            project.storage_layout = StorageLayout.from_dict(data["storage_layout"])
         project.validate()
         return project
+
+    def assign_storage_buffers(
+        self, system_type: str, levels_per_rack: int, slots_per_level: int
+    ) -> StorageLayout:
+        """Replace the project buffer catalog using the current rack markers."""
+        layout = StorageLayout(system_type, levels_per_rack, slots_per_level)
+        for (column, row), marker in sorted(
+            self.markers.items(), key=lambda item: (item[0][1], item[0][0])
+        ):
+            if marker.role != "rack":
+                continue
+            waypoint = self.vertex_name(column, row)
+            root_id = f"B-{waypoint}"
+            common = {
+                "column": column,
+                "row": row,
+                "grid_waypoint": waypoint,
+                "rack_endpoint_id": marker.endpoint_id,
+                "buffer_level": layout.buffer_level,
+                "status": "EMPTY",
+            }
+            if layout.buffer_level == "grid":
+                layout.buffers.append({"buffer_id": root_id, **common})
+                continue
+            for level in range(1, levels_per_rack + 1):
+                for slot in range(1, slots_per_level + 1):
+                    layout.buffers.append({
+                        "buffer_id": f"{root_id}/L{level:02d}/S{slot:02d}",
+                        **common,
+                        "level": level,
+                        "slot": slot,
+                    })
+        layout.validate()
+        self.storage_layout = layout
+        return layout
 
     def to_building_dict(self) -> dict:
         self.validate()
         vertices = []
         for column, row in self.iter_positions():
-            x = round(column * self.grid.spacing_m, 9)
-            y = round(row * self.grid.spacing_m, 9)
+            x = round(self.grid.x_coordinate(column), 9)
+            y = round(self.grid.y_coordinate(row), 9)
             vertex = [x, y, 0, self.vertex_name(column, row)]
             marker = self.markers.get((column, row))
             if marker:

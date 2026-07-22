@@ -70,9 +70,12 @@ python3 sku_velocity_analysis.py \
 
 The summary includes `req_max_item_length`, `req_max_item_width`,
 `req_max_item_height`, `req_max_item_weight`, `physical_data_status`, and
-`physical_storage_class`. Against the demo standard limits 15 × 16 × 13 and
-weight 250, complete SKUs are classified as standard, oversize, overweight, or
-both. Any missing physical field produces `UNVERIFIED_OVERSIZE`.
+`physical_storage_class`. Against the demo standard limits 25.0 × 19.3 × 19.2 and
+weight 465.0, complete SKUs are classified as standard, oversize, overweight, or
+both. Missing weight is conservatively classified as overweight, missing size
+as oversize, and missing both usable size and weight as oversize plus
+overweight; the data status remains `MISSING`. During inventory slotting,
+weight `0` also disables the ergonomic weight heuristic for that SKU.
 
 The chilled demo selects 10% of sorted unique SKU IDs uniformly with seed 42.
 For the included 1,524-SKU summary this produces exactly 152 selected-only rows;

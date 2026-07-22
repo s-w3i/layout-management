@@ -6,6 +6,10 @@
   C using pick frequency and generate a demand graph for every SKU.
 - [SKU affinity analysis](sku-affinity-analysis.md) — explore direct SKU–store
   order frequency and use data-calibrated store-day relationships in slotting.
+- [Traffic-aware slotting](traffic-aware-slotting.md) — balance expected shared
+  movement-resource load while preserving complete ABC/affinity handling units.
+- [Inventory slotting architecture](slotting-architecture.md) — understand the
+  strategy modules, shared hard rules, and extension points.
 - [RMF grid map editor](rmf-grid-map-editor.md) — create and edit the warehouse
   grid, place racks and workstations, assign zones, generate slotting layouts,
   inspect inventory, and demonstrate SKU or shelf swaps.

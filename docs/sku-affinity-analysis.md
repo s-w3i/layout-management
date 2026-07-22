@@ -81,9 +81,13 @@ own data.
 
 ## Use in slotting
 
-The `abc_affinity` strategy keeps ABC class, physical compatibility, temperature
-compatibility, and capacity logic ahead of affinity. The user chooses only the
-strategy and affinity weight for the initial run. The service then derives the
+The `abc_affinity` strategy keeps physical compatibility, temperature
+compatibility, and capacity as eligibility rules. Affinity and ABC grouping are
+competing soft objectives: 0% preserves ABC bay purity, while 100% prioritizes
+placing strongly related SKUs in the same bay and uses ABC only as a tie-breaker.
+For AMR shelves, same-bay placement can reduce the number of shelf pickups needed
+to satisfy related order lines. The user chooses only the strategy and affinity
+weight for the initial run. The service then derives the
 minimum shared store-days and affinity score from empirical quantiles of the
 current workbook's relationships. It derives service-distance allowance
 candidates from the current warehouse map and selects a candidate from the

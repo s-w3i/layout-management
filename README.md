@@ -2,8 +2,8 @@
 
 `rmf_grid_map_editor.py` is a Python desktop application for creating a
 grid-based Open-RMF warehouse map, assigning inventory zones, generating a
-basic ABC slotting layout, exploring SKU/store affinity, and demonstrating
-inventory search and position swaps.
+basic ABC slotting layout, exploring SKU/store affinity, traffic-aware
+complete-unit repositioning, and demonstrating inventory search and swaps.
 
 The application does not require a warehouse drawing. Grid point `(0, 0)` is
 the bottom-left point of a generated map, and positive Y points upward.
@@ -15,7 +15,8 @@ the bottom-left point of a generated map, and positive Y points upward.
 3. [Grid Map Editor tab](#1-grid-map-editor-tab)
 4. [SKU Affinity tab](#2-sku-affinity-tab)
 5. [Inventory Slotting tab](#3-inventory-slotting-tab)
-6. [Inventory Operations Demo tab](#4-inventory-operations-demo-tab)
+6. [Traffic-Aware Slotting tab](#4-traffic-aware-slotting-tab)
+7. [Inventory Operations Demo tab](#5-inventory-operations-demo-tab)
 7. [Inventory address rules](#inventory-address-rules)
 8. [Command-line map generation](#command-line-map-generation)
 9. [Files and folders](#files-and-folders)
@@ -45,13 +46,14 @@ cd layout-management
 python3 rmf_grid_map_editor.py
 ```
 
-The application opens with four tabs:
+The application opens with five tabs:
 
 | Tab | Purpose |
 |---|---|
 | **Grid Map Editor** | Create the grid, place racks and workstations, and export RMF YAML |
 | **SKU Affinity** | Explore SKU–store frequency and SKU relationships from line-level orders |
 | **Inventory Slotting** | Generate an ABC-only or ABC-plus-affinity recommendation |
+| **Traffic-Aware Slotting** | Reduce expected movement-resource congestion by repositioning complete handling units |
 | **Inventory Operations Demo** | Search inventory and demonstrate SKU or AMR-shelf swaps |
 
 ## Application workflow
@@ -60,26 +62,36 @@ For a new warehouse, use the tabs in this order:
 
 1. Create the warehouse grid in **Grid Map Editor**.
 2. Place rack pickup points and workstation drop-off points.
-3. Save the editable project and export the RMF building YAML.
-4. Open **SKU Affinity**, analyze the order workbook, and review SKU relationships.
-5. Export the affinity snapshot and CSV review files when required.
-6. Open **Inventory Slotting** and load the building YAML.
-7. Group every rack into a zone.
-8. Review the initialized zone capacities and mark real chilled zones.
-9. Load the ABC SKU velocity CSV and optional chilled-requirements CSV. Choose
+3. Select the storage-system type, configure capacity, and assign empty buffers.
+4. Save the editable grid project. Export the unchanged RMF building YAML when
+   it is needed by RMF or Traffic-Aware Slotting.
+5. Open **SKU Affinity**, analyze the order workbook, and review SKU relationships.
+6. Export the affinity snapshot and CSV review files when required.
+7. Open **Inventory Slotting** and load the editable grid JSON.
+8. Group every rack into a zone.
+9. Review the initialized zone capacities and mark real chilled zones.
+10. Load the ABC SKU velocity CSV and optional chilled-requirements CSV. Choose
    `basic` or `abc_affinity`; for affinity, also select the order-history Excel
    file and the desired ABC/affinity weight.
-10. Open **Inventory Operations Demo** and load the generated `.slotting.json`.
-11. Search for SKUs or demonstrate position swaps, then save changes when required.
+11. Open **Traffic-Aware Slotting** and select the building YAML, velocity CSV, and
+    order workbook. The tab independently reruns ABC and affinity grouping before
+    generating a complete-unit traffic recommendation.
+12. Save the traffic-aware layout when required.
+13. Open **Inventory Operations Demo**, search for SKUs or demonstrate position
+    swaps, then save changes when required.
 
 To use the included demonstration map, start directly from the Inventory
-Slotting tab. Its default building file is:
+Slotting tab. Its default grid project is:
 
 ```text
-resources/map/demo.building.yaml
+resources/map/demo.grid.json
 ```
 
 ## 1. Grid Map Editor tab
+
+All map and layout canvases use the same navigation controls: hold the right
+mouse button and drag to pan, and scroll the mouse wheel to zoom around the
+pointer. Editing and rectangle selection continue to use the left mouse button.
 
 ### Create the warehouse grid
 
@@ -91,11 +103,13 @@ Enter the following values:
 | **Level name** | RMF floor or level name, such as `L1` |
 | **Total width (m)** | Warehouse size along the X axis |
 | **Total length (m)** | Warehouse size along the Y axis |
-| **Distance per grid (m)** | Real distance between neighbouring grid points |
+| **Grid distance X / Y (m)** | Independent horizontal and vertical distances between neighbouring grid points |
 
-Width and length must be exact multiples of the grid distance. For example, a
-20 m width with 1 m spacing produces points from X=0 through X=20, including
-both boundaries.
+X and Y grid distances can differ, allowing rectangular as well as square grid
+cells. Width and length do not need to be exact multiples of their respective
+distance. The editor shortens only the last interval to meet the exact outer
+boundary. For example, width 20 m with X distance 3 m produces
+X=`0, 3, 6, 9, 12, 15, 18, 20`.
 
 Click **Generate / reset grid**. The editor creates horizontal and vertical
 edges between neighbouring points. All generated lanes are bidirectional by
@@ -124,6 +138,15 @@ RMF vertex is exported with a `dropoff_ingestor` property.
 Use **Select / edit** to give the workstation a meaningful endpoint ID, such as
 `WS_INBOUND_01` or `WS_PACKING_01`.
 
+### Assign empty storage buffers
+
+Choose the layout type and capacity, then click **Assign empty storage
+buffers**. AMR creates one grid buffer (`B-G11_11`) for every rack pickup.
+Mini-load and pallet ASRS create an empty slot buffer for every configured rack,
+level, and slot (`B-G11_11/L01/S01`). Shelves, totes, pallets and SKUs are not
+created in this tab. Changing rack markers invalidates the buffer catalog and
+requires this step to be run again.
+
 ### Edit or remove points
 
 - Choose **Select / edit** and click a point.
@@ -147,10 +170,11 @@ operation.
 
 The editor has two different save formats:
 
-- **Save editable project…** writes a `.grid.json` file. Use this format when
-  you want to continue editing the grid later.
-- **Export RMF building YAML…** writes a `.building.yaml` file for RMF and the
-  Inventory Slotting tab.
+- **Save editable project…** writes a `.grid.json` containing the editable map,
+  storage-system profile, and empty buffers. Inventory Slotting uses this file.
+- **Export RMF building YAML…** writes the same RMF-compatible `.building.yaml`
+  structure as before. Every rack remains a `pickup_dispenser`; buffer metadata
+  is deliberately excluded.
 
 Use **Load editable project…** to reopen a `.grid.json` project. A building YAML
 is an export format and cannot replace the editable project file.
@@ -204,14 +228,15 @@ The default inputs are:
 
 | Input | Default path |
 |---|---|
-| Building YAML | `resources/map/demo.building.yaml` |
+| Grid project JSON | `resources/map/demo.grid.json` |
 | ABC SKU velocity CSV | `resources/data/sku_velocity_output/sku_velocity_summary.csv` |
 | Chilled SKU CSV | `resources/data/demo_chilled_requirements.csv` |
 | Affinity order workbook | `resources/data/Sample Data.xlsx` |
 | Output layout | `resources/data/basic_slotting_layout.slotting.json` |
 
-The YAML must contain at least one rack with `pickup_dispenser` and at least one
-workstation with `dropoff_ingestor`.
+The grid JSON must contain generated empty buffers, at least one rack pickup,
+and at least one workstation. Inventory Slotting reconstructs the RMF graph in
+memory for route calculations.
 
 The SKU CSV must contain these columns:
 
@@ -229,19 +254,22 @@ SKU_002,80,B,20,10,8,270
 ```
 
 A blank custom requirement means that the SKU does not constrain that custom
-attribute. A blank core dimension or weight is instead treated as missing
-physical data and classifies the SKU as `UNVERIFIED_OVERSIZE`. Requirement keys
-must exist in the attribute catalog before generation.
+attribute. Missing physical data remains unverified but is classified
+conservatively: unknown weight as `OVERWEIGHT`, unknown size as `OVERSIZE`, and
+missing both usable size and weight as `OVERSIZE_AND_OVERWEIGHT`. Set
+`req_max_item_weight` to `0` to explicitly disable ergonomic weight placement
+for that SKU. Requirement keys must exist in the attribute catalog before
+generation.
 
 The included compact CSV is ready for the demo. To analyse another warehouse,
 place its transaction workbook under `resources/data/` and follow the
 [SKU velocity analysis guide](docs/sku-velocity-analysis.md). Raw workbooks and
 generated demand plots are intentionally excluded from the public repository.
 
-### Load the building map
+### Load the grid project
 
-1. Confirm or browse for the **Building YAML**.
-2. Click **Load map**.
+1. Confirm or browse for the **Grid project JSON**.
+2. Click **Load project**.
 3. Confirm that the status reports the expected rack and workstation counts.
 
 ### Assign rack zones
@@ -275,18 +303,16 @@ IDs such as `ZONE_001` also advance while preserving their numeric width. Use
 For example, racks in two columns inside `Z02` are addressed under `Z02/A01`
 and `Z02/A02`, even if another zone already uses those aisle numbers.
 
-### Configure rack capacity and handling units
+### Confirm storage-system capacity and handling units
 
 Select:
 
 - **Strategy** — `basic` keeps the existing ABC-only flow; `abc_affinity`
-  preserves ABC and physical constraints, then uses store-day relationships to
-  choose among otherwise eligible locations.
-- **Affinity weight** — user-selected from 0% (service/ABC emphasis) to 100%
-  (affinity emphasis within the ABC constraints).
-- **Handling unit** — `AMR shelf`, `Tote`, or `Pallet`.
-- **Levels** — vertical storage levels in each fixed bay.
-- **Slots per level** — SKU positions on each level.
+  directly balances affinity-based bay consolidation against ABC bay purity.
+- **Affinity weight** — user-selected from 0% (ABC bay purity) to 100%
+  (place strongly related SKUs in the same bay whenever feasible).
+- **Handling unit**, **Levels**, and **Slots per level** are read-only values
+  inherited from the buffers generated in Grid Map Editor.
 
 The handling-unit choice controls where the dynamic identity appears in the
 address. See [Inventory address rules](#inventory-address-rules).
@@ -300,20 +326,27 @@ initializes all zones with these source-unit demo limits:
 |---|---:|---:|---:|---:|
 | Standard | 15 | 16 | 13 | 250 |
 
-No zone is designated as oversize before generation. Change the capacity values
-only to match real storage limits. The units are deliberately labelled as
-unconfirmed source units; the demo does not perform a centimetre, millimetre,
-gram or kilogram conversion.
+Only chilled storage is predefined by the user. The slotting algorithm plans
+standard and oversize/overweight segments inside the selected ambient or
+chilled zones. Units are deliberately labelled as unconfirmed source units;
+the demo does not perform a centimetre, millimetre, gram or kilogram conversion.
+
+Length, width, height, and weight maximums may be left empty. An empty field
+means that no maximum is configured for that property; it does not mean zero
+capacity. A numeric value continues to act as the maximum inherited by child
+locations.
+
+Maximums are planning inputs for normal storage. When an outlier needs more
+capacity—or has unknown size or weight—the generated child-slot segment records
+an oversize-capable override and the required or unbounded physical properties.
 
 Mark only physically chilled zones with the **Chilled area** checkbox. Chilled
-defaults to false because it cannot be inferred safely from an RMF map. Zone
-values inherit down to every aisle, bay, level and slot.
+defaults to false because it cannot be inferred safely from an RMF map. Chilled
+values inherit down to every aisle, bay, level, and slot. Oversize segments are
+created automatically and never change the chilled/ambient role.
 
-Use **Advanced attributes…** to give a particular aisle, bay, level, or slot a
-larger capacity than its parent. For the sample data, 150 × 50 × 95 and weight
-640 are available as reference maximum values, but they are not automatically
-applied to a zone. An oversize SKU can therefore use an enlarged child slot
-inside an otherwise normal zone.
+Use **Advanced attributes…** for optional operational attributes. The generated
+`oversize_capable` child-slot values are normally managed by the algorithm.
 
 ### Configure advanced hierarchy attributes
 
@@ -338,14 +371,16 @@ inherit upward.
 
 If zones or rack capacity change, values on unchanged address paths are kept.
 The application asks before discarding values whose paths no longer exist.
-Use **Load previous layout…** to restore zones, capacity, catalog, local values,
-and assignments from an existing `.slotting.json`.
+Use **Load saved layout…** in **Interactive Slotting Layout** to restore zones,
+capacity, catalog, local values, and assignments from an existing
+`.slotting.json`. The result canvas is read-only; switch back to Inventory
+Slotting to edit its zone plan.
 
 ### Generate the slotting layout
 
 1. Confirm that every rack has a zone.
 2. Confirm the SKU CSV and output paths.
-3. Select the handling unit and rack capacity.
+3. Confirm the handling unit and rack capacity loaded from the grid project.
 4. Review zone limits and chilled areas; optionally add advanced attributes.
 5. Confirm or clear the optional chilled-SKU CSV path.
 6. Click **Generate slotting layout**.
@@ -364,29 +399,45 @@ The **basic** strategy:
 
 1. Calculates the directed route distance from each rack to every workstation.
 2. Uses the average distance across all workstations as the rack score.
-3. Sorts and allocates all class A inventory before B, and all B before C.
-4. Within each ABC class, groups standard and physical-exception SKUs, then
-   applies descending pick frequency.
-5. Fills an existing rack of the same ABC and physical group before opening a
-   new rack. Another ABC class enters that rack only when dedicated capacity is
-   exhausted, so mixing is limited to transition racks.
-6. Uses ambient versus chilled as the only hard location boundary.
-7. Prefers a slot that already satisfies dimensions, weight, and custom
-   requirements. When oversize inventory must share a rack with standard
-   inventory, oversize and unverified-oversize SKUs use L03 (or the highest
-   available level when the rack has fewer than three levels).
-8. If a matching-temperature slot needs different soft attributes, writes
-   those requirements as local child-slot overrides and assigns the SKU.
-9. Uses average workstation distance to rank otherwise equivalent racks and
+3. Calculates logical ABC rank with A before B before C and descending pick
+   frequency, then physically places all standard inventory before any
+   oversize/overweight exception inventory.
+4. Preserves that logical ABC rank in the output after physical planning.
+5. Fills an already-open compatible rack before opening another rack. ABC
+   classes may mix inside that rack; efficient rack utilization has priority
+   over ABC purity.
+6. Enforces the user-defined ambient/chilled separation. Exception inventory is
+   planned inside a matching-temperature zone, so chilled outliers remain in a
+   chilled zone.
+7. Reserves oversize capacity during zone planning but slots those oversize and
+   overweight exceptions last. Ambient source zones are
+   allocated as complete `STANDARD` or `OVERSIZE` zones; the planner chooses the
+   nearest combination with just enough capacity while preserving standard
+   capacity where possible. A chilled source zone may be partitioned into
+   separate `*_STANDARD` and `*_OVERSIZE` generated zones.
+8. Uses SKU weight as a soft ergonomic heuristic: a positive weight prefers
+   the middle rack level and then expands outward toward lower and upper
+   levels. This is not a hard constraint; weight `0` disables the preference.
+9. Records known outlier requirements as generated segment capacities. Unknown
+   properties become unbounded planning assumptions on that segment.
+10. Uses average workstation distance to rank otherwise equivalent racks and
    returns general not-enough-space only after every storage slot is occupied.
 
-The **abc_affinity** strategy runs that same ABC-first ordering and compatibility
-logic. For eligible locations at the same ABC/physical priority, it minimizes a
-weighted combination of service distance and distance to already placed related
-SKUs. Relationship strength is cosine similarity of binary SKU presence by
-`(Store ID, Date)`, weighted by shared store-days. The generated layout reports
-its selected parameters and compares affinity-pair and service distance against
-the basic baseline.
+The **abc_affinity** strategy keeps temperature, physical-fit, and capacity
+requirements as eligibility rules, then directly balances two soft objectives:
+same-bay affinity consolidation and ABC bay purity. It also follows affinity
+clusters during placement, so at a high affinity weight a strongly related B or
+C SKU can be processed immediately after an A SKU and placed in the same bay.
+At 0%, placement matches ABC grouping; at 100%, ABC is only a tie-breaker after
+affinity. Relationship strength is cosine similarity of binary SKU presence by
+`(Store ID, Date)`, weighted by shared store-days.
+
+For an AMR shelf, a related pair in the same bay belongs to the same movable
+shelf unit. This can let an AMR satisfy more order lines with one shelf pickup
+instead of visiting several bays. A different bay incurs an affinity cost first;
+physical distance between different bays is the secondary affinity cost. The
+generated layout reports weighted same-bay relationship coverage, mixed-ABC bay
+count, selected parameters, and service distance against the basic baseline.
 
 Chilled SKUs still require chilled slots and ambient SKUs require non-chilled
 slots. If one temperature category has insufficient slots, the result reports a
@@ -397,16 +448,16 @@ SKUs need rows; all absent SKUs are ambient. The included file selects 10% of
 the 1,524 sample SKUs with seed 42. Invalid booleans, duplicates, unknown SKUs,
 or conflicts with `req_chilled` stop generation.
 
-An SKU with missing physical data is assigned to an available slot and remains
-`UNVERIFIED`. Complete oversize, overweight, and custom requirements can produce
-`COMPATIBLE_AUTO_OVERRIDE`. The generated local override records what the slot
-would need to support; it does not physically increase rack capacity. Production
-users must validate generated overrides against the actual equipment.
+Missing physical data is classified conservatively: unknown weight is treated
+as overweight, unknown size as oversize, and missing both usable size and weight
+as oversize plus overweight. These SKUs remain visibly `UNVERIFIED`, but the
+algorithm gives them generated exception segments rather than normal storage.
+Production users must validate planned capacities against actual equipment.
 
-After allocation, each zone receives a generated result type: `STANDARD` when
-it holds only standard SKUs, `OVERSIZE` when it holds only exception or
-unverified SKUs, `MIXED` when it holds both, and `UNUSED` when empty. This is
-output metadata—not a zone setting used to restrict allocation.
+Each generated zone has exactly one result type: `STANDARD` or `OVERSIZE`.
+`MIXED` zones are not generated. `planned_zone_id` identifies the generated
+subzone while `zone_id` retains the user-defined source zone used for chilled
+inheritance and static addressing.
 
 If a rack cannot reach every workstation through the directed RMF graph, it
 ranks after reachable racks but remains usable storage. An assignment on it is
@@ -435,7 +486,68 @@ attribute catalog, local hierarchy values, physical SKU requirements,
 generated slot overrides, inventory assignments, and operation log. Existing
 v1 files remain loadable and are normalized with an empty attribute model.
 
-## 4. Inventory Operations Demo tab
+## 4. Traffic-Aware Slotting tab
+
+The tab runs the complete recommendation pipeline independently. It does not use
+assignments generated by the Inventory Slotting tab.
+
+1. Select the building YAML, ABC velocity CSV, and order-history workbook.
+2. Optionally select a chilled-SKU CSV and a storage-rules `.slotting.json`.
+   Assignments in that file are ignored; only real zones, chilled areas,
+   capacities, and attribute definitions are imported. Without it, all map
+   storage starts as standard ambient storage.
+3. Click **Load map / label chilled zones** when temperature zoning is required,
+   then rectangle-label the real ambient and chilled racks. This editor controls
+   chilled zoning only; standard versus oversize placement is selected by the
+   slotting algorithm.
+4. Select affinity weight, handling-unit type, levels, and slots per level.
+5. Keep **Use embedded RMF map** for an RMF layout, or select a generic
+   `warehouse_movement_network/v1` JSON for ASRS, conveyors, cranes, lifts, or
+   another delivery system.
+6. Click **Run stages 1–5** to generate ABC, group by affinity, validate hard
+   rules, calculate handling-unit visits, and analyze pre-optimization traffic.
+7. Click **Run full pipeline** to additionally optimize complete-unit placement,
+   run final validation, and select a traffic/travel Pareto solution.
+8. Review ABC versus grouped visits, lane and rack heatmaps, before/after traffic
+   KPIs, congested resources, relocations, rejected units,
+   and selected parameters. Edit maximum travel increase or hotspot percentile
+   and regenerate when operational policy requires it.
+9. Save the compatible v2 slotting layout and optionally export the traffic JSON
+   plus resource and relocation CSV files.
+
+Demand is grouped by `(Store ID, Date)`. A handling unit is visited at most once
+inside a group even when that shelf, tote, pallet, tray, or bin contains several
+requested SKUs. Routing uses deterministic shortest paths to reachable service
+endpoints. Endpoint weights are equal for RMF maps and configurable in generic
+networks.
+
+Every relocation is an atomic pairwise unit swap. Chilled/ambient separation,
+rotation-aware dimensions, maximum weight, slot shape, and capacity are strict
+move gates. The traffic stage never creates a capacity override. A unit with
+incomplete physical data remains fixed and is reported. This conservative rule
+does not invalidate an unchanged generated row that is reported as unverified.
+
+Oversize inventory remains subject to ABC and affinity placement and reserves
+the required contiguous horizontal slots and vertical levels automatically.
+Overweight and oversize-plus-overweight footprints start on the bottom level.
+Generation is rejected if even one SKU remains unassigned, so a partial result
+cannot be saved as a valid traffic-aware layout.
+
+The map contains two heat layers. Lane colour and width represent expected route
+load. Rack colour represents the handling-unit visits generated at that physical
+location. Before and After use the same demand, while handling-unit relocations
+move rack heat between positions. Purple outlines show all swapped locations;
+selecting a relocation marks its source and destination separately.
+
+When movement-resource capacities exist, the map reports utilization. Otherwise
+it reports relative expected load, allowing the same workflow to operate without
+an AMR, ASRS, or conveyor profile. This is a static expected-flow recommendation,
+not collision-free fleet simulation.
+
+See [Traffic-aware slotting](docs/traffic-aware-slotting.md) for the generic
+network contract and export details.
+
+## 5. Inventory Operations Demo tab
 
 ### Load a slotting layout
 
@@ -443,6 +555,15 @@ v1 files remain loadable and are normalized with an empty attribute model.
 2. Click **Load layout**.
 3. Click any occupied rack to display every SKU in that rack, including the
    same chilled and physical-exception storage flags shown during slotting.
+
+For layouts generated by Traffic-Aware Slotting, rack dots use the same demand
+model as that pipeline: orders are grouped by `(Store ID, Date)`, each handling
+unit is counted at most once per group, and the visits of distinct units at a
+rack are summed. The busiest rack is red and lower-visit racks trend blue. A
+layout without persisted traffic-demand data shows grey racks and an unavailable
+legend instead of substituting ABC velocity. For older traffic-aware layouts,
+the Operations tab first attempts to rebuild the missing per-unit counts from
+the order workbook recorded in the layout's sources.
 
 ### Search for a SKU
 
@@ -497,37 +618,28 @@ operation log.
 
 Every assigned SKU has a static address and a dynamic address.
 
-### Static address
+### Buffer and dynamic addresses
 
-The static address always describes a fixed warehouse position:
-
-```text
-ZONE/AISLE/FIXED-BAY/LEVEL/SLOT
-Z01/A05/BAY-G611/L01/S01
-```
-
-### AMR shelf: dynamic at bay level
-
-An AMR shelf is the movable bay. Every SKU position on the shelf shares the
-same shelf ID:
+The static address stops at the buffer. For AMR the grid is the buffer and the
+shelf owns its internal levels and slots:
 
 ```text
-Static:  Z01/A05/BAY-G611/L01/S01
-Dynamic: Z01/A05/BAY-SHELF_001/L01/S01
+AMR static:  Z03/A08/B-G11_11
+AMR dynamic: SHELF_001/L01/S01
 ```
 
-### Tote and pallet: dynamic at slot level
-
-Each tote or pallet has an independent ID at the storage-slot layer:
+For ASRS the rack slot is the buffer and the tote or pallet is dynamic:
 
 ```text
-Static:         Z01/A05/BAY-G611/L01/S01
-Tote dynamic:   Z01/A05/BAY-G611/L01/SLOT-TOTE_001
-Pallet dynamic: Z01/A05/BAY-G611/L01/SLOT-PALLET_001
+ASRS static:   Z03/A08/B-G11_11/L01/S01
+Tote dynamic:  TOTE_001
+Pallet dynamic: PALLET_001
 ```
 
-The JSON field `dynamic_address_level` records `bay` for an AMR shelf and
-`slot` for a tote or pallet.
+`storage_location_address` retains the full level/slot path used for inherited
+capacity checks. The output also records `buffer_id`, `buffer_level`, and the
+dynamic-unit ID. Buffer occupancy is calculated from distinct occupied buffer
+IDs—not SKU rows—and is reported as total, occupied, empty, and occupancy rate.
 
 ## Command-line map generation
 
@@ -539,7 +651,7 @@ Create an empty 20 m × 15 m grid with 1 m spacing:
 python3 rmf_grid_map_editor.py --generate \
   --width 20 \
   --length 15 \
-  --spacing 1 \
+  --x-spacing 1 --y-spacing 1 \
   --name warehouse_grid \
   --level L1 \
   --output resources/map/new_warehouse.building.yaml
@@ -549,7 +661,7 @@ Add markers using `ROLE,COLUMN,ROW,ENDPOINT_ID`:
 
 ```bash
 python3 rmf_grid_map_editor.py --generate \
-  --width 20 --length 15 --spacing 1 \
+  --width 20 --length 15 --x-spacing 2 --y-spacing 1 \
   --marker rack,3,4,RACK_001 \
   --marker workstation,0,2,WS_OUTBOUND \
   --output resources/map/new_warehouse.building.yaml
@@ -576,15 +688,18 @@ layout_management_master/
 │   ├── gui.py                                     Tkinter application class
 │   ├── inventory.py                               Search and swap service
 │   ├── rmf.py                                     RMF/project persistence service
-│   └── slotting.py                                Routing, addressing and slotting
+│   ├── slotting.py                                Routing, addressing and slotting
+│   └── traffic.py                                 Generic traffic analysis and unit optimization
 ├── tests/
 │   ├── test_attributes.py                         Attribute and compatibility tests
 │   ├── test_affinity.py                           Affinity analysis and cache tests
-│   └── test_services.py                           Service regression tests
+│   ├── test_services.py                           Service regression tests
+│   └── test_traffic.py                            Traffic network, constraints and export tests
 ├── docs/
 │   ├── README.md                                  Documentation index
 │   ├── rmf-grid-map-editor.md                     Additional editor notes
-│   └── sku-velocity-analysis.md                   ABC analysis guide
+│   ├── sku-velocity-analysis.md                   ABC analysis guide
+│   └── traffic-aware-slotting.md                  Traffic algorithm and network contract
 └── resources/
     ├── data/
     │   ├── Sample Data.xlsx                     Optional local input (ignored)
@@ -594,6 +709,7 @@ layout_management_master/
     │       ├── sku_velocity_summary.csv
     │       └── demand_plots/
     ├── map/
+    │   ├── demo.grid.json
     │   ├── demo.building.yaml
     │   └── v6.building.yaml
     └── others/
@@ -611,6 +727,7 @@ is organized by responsibility inside the `warehouse_layout` package:
 | `rmf.py` | `RmfMapService` | Load/save editable projects and import/export building YAML |
 | `slotting.py` | `SlottingService` | Rack routing, zone-local aisles, dynamic addresses, ABC slotting and ABC-plus-affinity tuning |
 | `slotting.py` | `SlottingLayoutRepository` | Read/write self-contained slotting JSON |
+| `traffic.py` | `TrafficAwareSlottingService` | Adapt RMF/generic networks, derive store-day unit visits, balance resource traffic and export audits |
 | `inventory.py` | `InventoryService` | SKU lookup, SKU-slot swap and AMR-shelf swap |
 | `attributes.py` | `StorageAttributeService` | Inheritance, physical classification and compatibility |
 | `zone_settings_editor.py` | `ZoneStorageSettingsEditor` | Chilled and physical capacity input by zone |
@@ -623,7 +740,7 @@ Run the service regression tests from the repository root:
 python3 -m unittest discover -s tests -v
 ```
 
-On Linux, run the automated four-tab GUI workflow with a virtual display:
+On Linux, run the automated five-tab GUI workflow with a virtual display:
 
 ```bash
 sudo apt install xvfb
@@ -631,7 +748,8 @@ xvfb-run -a python3 -m tests.gui_workflow_smoke
 ```
 
 The GUI smoke test covers grid editing, affinity loading and filtering, affinity
-exports, automatic and edited affinity slotting, map loading and drawing, rectangle zone selection, all handling-unit
+exports, automatic and edited affinity slotting, traffic analysis/generation and
+exports, map loading and drawing, rectangle zone selection, all handling-unit
 address models, rack inspection, SKU search, SKU-slot swap, AMR-shelf swap, and
 operation-layout saving.
 
@@ -653,20 +771,23 @@ On Ubuntu or Debian:
 sudo apt install python3-tk
 ```
 
-### Width or length is not an exact multiple
+### The last grid interval is shorter
 
-Change the warehouse dimension or grid distance so division produces a whole
-number. For example, 20 m works with 1 m spacing, while 20 m does not work with
-3 m spacing.
+This is expected when a width or length is not divisible by the configured grid
+distance. Full intervals use the requested distance and the final interval ends
+at the exact warehouse boundary.
 
-### Building YAML has no racks or workstations
+### Grid project has no buffers, racks, or workstations
 
-The slotting input requires:
+Inventory Slotting requires:
 
-- at least one `pickup_dispenser` rack vertex; and
-- at least one `dropoff_ingestor` workstation vertex.
+- at least one rack pickup marker;
+- at least one workstation marker; and
+- an assigned empty-buffer catalog.
 
-Return to Grid Map Editor, add the missing markers, and export the YAML again.
+Return to Grid Map Editor, add the missing markers, click **Assign empty storage
+buffers**, and save the editable grid JSON again. YAML export is not used by
+Inventory Slotting.
 
 ### Slotting says racks remain unassigned
 
@@ -692,4 +813,5 @@ generated files are not automatically migrated when address rules change.
 
 - [SKU velocity analysis](docs/sku-velocity-analysis.md)
 - [SKU affinity analysis](docs/sku-affinity-analysis.md)
+- [Traffic-aware slotting](docs/traffic-aware-slotting.md)
 - [Additional RMF editor notes](docs/rmf-grid-map-editor.md)

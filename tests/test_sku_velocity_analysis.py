@@ -39,29 +39,29 @@ class SkuVelocityPhysicalTests(unittest.TestCase):
 
     def test_physical_classification_boundaries(self):
         standard = {
-            "max_item_length": 15,
-            "max_item_width": 16,
-            "max_item_height": 13,
-            "max_item_weight": 250,
+            "max_item_length": 25.0,
+            "max_item_width": 19.3,
+            "max_item_height": 19.2,
+            "max_item_weight": 465.0,
         }
         self.assertEqual(classify_physical(standard), ("COMPLETE", "STANDARD"))
         self.assertEqual(
-            classify_physical({**standard, "max_item_length": 17})[1],
+            classify_physical({**standard, "max_item_length": 26})[1],
             "OVERSIZE",
         )
         self.assertEqual(
-            classify_physical({**standard, "max_item_weight": 251})[1],
+            classify_physical({**standard, "max_item_weight": 466})[1],
             "OVERWEIGHT",
         )
         self.assertEqual(
             classify_physical({
-                **standard, "max_item_length": 17, "max_item_weight": 251,
+                **standard, "max_item_length": 26, "max_item_weight": 466,
             })[1],
             "OVERSIZE_AND_OVERWEIGHT",
         )
         self.assertEqual(
             classify_physical({**standard, "max_item_weight": None}),
-            ("MISSING", "UNVERIFIED_OVERSIZE"),
+            ("MISSING", "UNKNOWN_WEIGHT"),
         )
 
     def test_chilled_selection_is_deterministic_and_writes_selected_only(self):

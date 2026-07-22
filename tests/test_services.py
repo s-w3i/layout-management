@@ -67,12 +67,176 @@ class WarehouseServiceTests(unittest.TestCase):
         service = AffinityService(Path(directory) / "cache")
         return path, service.analyze(service.load_orders(path))
 
+    def test_affinity_weight_controls_abc_vs_affinity_order_ratio(self):
+        rows = [
+            {"sku": "A_SKU", "velocity_class": "A"},
+            {"sku": "B_SKU", "velocity_class": "B"},
+            {"sku": "C_SKU", "velocity_class": "C"},
+        ]
+        neighbors = {
+            "A_SKU": [("B_SKU", 1.0, 1.0, 1)],
+            "B_SKU": [("A_SKU", 1.0, 1.0, 1)],
+            "C_SKU": [("B_SKU", 10.0, 1.0, 10)],
+        }
+
+        pure_abc = self.slotting._affinity_placement_order(rows, neighbors, 0.0)
+        pure_affinity = self.slotting._affinity_placement_order(
+            rows, neighbors, 1.0
+        )
+        blended = self.slotting._affinity_placement_order(rows, neighbors, 0.7)
+
+        self.assertEqual([row["sku"] for row in pure_abc], [
+            "A_SKU", "B_SKU", "C_SKU",
+        ])
+        self.assertEqual([row["sku"] for row in pure_affinity[:2]], [
+            "C_SKU", "B_SKU",
+        ])
+        self.assertEqual([row["sku"] for row in blended[:2]], [
+            "C_SKU", "B_SKU",
+        ])
+
     def test_project_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "warehouse.grid.json"
             self.rmf.save_project(self.project, path)
             loaded = self.rmf.load_project(path)
         self.assertEqual(loaded.to_project_dict(), self.project.to_project_dict())
+
+    def test_grid_spec_uses_short_final_interval_for_odd_spacing(self):
+        spec = GridSpec(20, 10, 3, "odd_spacing", "L1")
+        spec.validate()
+        self.assertEqual(spec.columns, 7)
+        self.assertEqual(spec.rows, 4)
+        self.assertEqual(
+            [spec.x_coordinate(column) for column in range(spec.columns + 1)],
+            [0, 3, 6, 9, 12, 15, 18, 20],
+        )
+        self.assertEqual(
+            [spec.y_coordinate(row) for row in range(spec.rows + 1)],
+            [0, 3, 6, 9, 10],
+        )
+
+    def test_grid_spec_supports_rectangular_x_y_spacing(self):
+        spec = GridSpec(8, 6, 2, "rectangular", "L1", 3)
+        spec.validate()
+        self.assertEqual((spec.columns, spec.rows), (4, 2))
+        self.assertEqual(
+            [spec.x_coordinate(column) for column in range(spec.columns + 1)],
+            [0, 2, 4, 6, 8],
+        )
+        self.assertEqual(
+            [spec.y_coordinate(row) for row in range(spec.rows + 1)],
+            [0, 3, 6],
+        )
+
+    def test_buffer_assignment_is_saved_without_changing_rmf_building(self):
+        before = self.project.to_building_dict()
+        layout = self.project.assign_storage_buffers("AMR", 2, 4)
+        after = self.project.to_building_dict()
+        self.assertEqual(before, after)
+        self.assertEqual(len(layout.buffers), 2)
+        self.assertTrue(all(item["status"] == "EMPTY" for item in layout.buffers))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "warehouse.grid.json"
+            self.rmf.save_project(self.project, path)
+            loaded = self.rmf.load_project(path)
+        self.assertEqual(loaded.storage_layout.to_dict(), layout.to_dict())
+
+    def test_amr_grid_buffers_use_static_grid_and_dynamic_shelf_addresses(self):
+        layout = self.project.assign_storage_buffers("AMR", 1, 3)
+        rows, summary = self.slotting.generate_basic(
+            copy.deepcopy(self.project.to_building_dict()),
+            copy.deepcopy(self.skus),
+            1,
+            3,
+            "AMR shelf",
+            storage_layout=layout,
+        )
+        self.assertEqual(summary["buffer_count"], 2)
+        self.assertEqual(summary["occupied_buffer_count"], 2)
+        self.assertEqual(summary["buffer_occupancy_rate"], 1.0)
+        self.assertEqual(len({row["static_address"] for row in rows[:3]}), 1)
+        self.assertRegex(rows[0]["static_address"], r"^Z01/A\d{2}/B-G\d+_\d+$")
+        self.assertEqual(rows[0]["dynamic_address"], "SHELF_001/L01/S01")
+        self.assertEqual(rows[2]["dynamic_address"], "SHELF_001/L01/S03")
+
+    def test_racks_are_ranked_by_assigned_pick_frequency_after_slotting(self):
+        layout = self.project.assign_storage_buffers("AMR", 1, 3)
+        rows, summary = self.slotting.generate_basic(
+            copy.deepcopy(self.project.to_building_dict()),
+            copy.deepcopy(self.skus),
+            1,
+            3,
+            "AMR shelf",
+            storage_layout=layout,
+        )
+        ranking = summary["rack_frequency_ranking"]
+        self.assertEqual(len(ranking), 2)
+        self.assertGreater(
+            ranking[0]["rack_pick_frequency"],
+            ranking[1]["rack_pick_frequency"],
+        )
+        self.assertEqual(ranking[0]["rack_frequency_rank"], 1)
+        self.assertEqual(ranking[0]["rack_velocity_class"], "A")
+        self.assertEqual(ranking[1]["rack_velocity_class"], "C")
+
+        by_rack = {item["rack_id"]: item for item in ranking}
+        for row in rows:
+            if row["assignment_status"] != "ASSIGNED":
+                continue
+            rack_record = by_rack[row["rack_id"]]
+            self.assertEqual(
+                row["rack_pick_frequency"],
+                rack_record["rack_pick_frequency"],
+            )
+            self.assertEqual(
+                row["rack_velocity_class"],
+                rack_record["rack_velocity_class"],
+            )
+
+    def test_asrs_slot_buffers_are_counted_independently(self):
+        layout = self.project.assign_storage_buffers("Mini-load ASRS", 1, 3)
+        rows, summary = self.slotting.generate_basic(
+            copy.deepcopy(self.project.to_building_dict()),
+            copy.deepcopy(self.skus[:2]),
+            1,
+            3,
+            "Tote",
+            storage_layout=layout,
+        )
+        self.assertEqual(summary["buffer_count"], 6)
+        self.assertEqual(summary["occupied_buffer_count"], 2)
+        self.assertAlmostEqual(summary["buffer_occupancy_rate"], 2 / 6)
+        self.assertRegex(
+            rows[0]["static_address"],
+            r"^Z01/A\d{2}/B-G\d+_\d+/L01/S01$",
+        )
+        self.assertEqual(rows[0]["dynamic_address"], "TOTE_001")
+
+    def test_slotting_layout_persists_buffer_occupancy_records(self):
+        layout = self.project.assign_storage_buffers("AMR", 1, 3)
+        building = self.project.to_building_dict()
+        rows, summary = self.slotting.generate_basic(
+            copy.deepcopy(building), copy.deepcopy(self.skus[:1]),
+            1, 3, "AMR shelf", storage_layout=layout,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "layout.slotting.json"
+            self.layouts.save(
+                rows, building, summary, path,
+                strategy="basic", handling_unit_type="AMR shelf",
+                levels_per_rack=1, slots_per_level=3,
+                zone_assignments={}, storage_layout=layout,
+                source_grid_project="/input/warehouse.grid.json",
+            )
+            payload = self.layouts.load(path)
+        self.assertEqual(payload["sources"]["grid_project_json"], "/input/warehouse.grid.json")
+        self.assertEqual(
+            sum(item["status"] == "OCCUPIED" for item in payload["buffers"]), 1
+        )
+        self.assertEqual(
+            sum(item["status"] == "EMPTY" for item in payload["buffers"]), 1
+        )
 
     def test_aisles_restart_for_each_zone(self):
         _level, racks, _workstations, _unreachable = self.slotting.rack_distances(
@@ -233,6 +397,74 @@ class WarehouseServiceTests(unittest.TestCase):
         self.assertEqual(adjusted["minimum_affinity_score"], 0.0)
         self.assertEqual(adjusted["maximum_service_distance_increase"], 0.0)
         self.assertEqual(len(adjusted_rows), len(auto_rows))
+
+    def test_high_affinity_weight_consolidates_cross_class_skus_in_one_bay(self):
+        cross_class_skus = [
+            {
+                **copy.deepcopy(self.skus[index]),
+                "velocity_class": velocity_class,
+            }
+            for index, velocity_class in enumerate(("A", "B", "C", "A"))
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            _path, analysis = self.affinity_analysis(directory)
+            basic_rows, basic_summary = self.slotting.generate_basic(
+                copy.deepcopy(self.building),
+                copy.deepcopy(cross_class_skus),
+                1,
+                2,
+            )
+            affinity_rows, affinity_summary = self.slotting.generate_abc_affinity(
+                copy.deepcopy(self.building),
+                copy.deepcopy(cross_class_skus),
+                analysis,
+                0.8,
+                1,
+                2,
+                tuning_parameters={
+                    "maximum_service_distance_increase": 10.0,
+                    "minimum_shared_store_days": 1,
+                    "minimum_affinity_score": 0.0,
+                },
+            )
+            low_affinity_rows, low_affinity_summary = self.slotting.generate_abc_affinity(
+                copy.deepcopy(self.building),
+                copy.deepcopy(cross_class_skus),
+                analysis,
+                0.2,
+                1,
+                2,
+                tuning_parameters={
+                    "maximum_service_distance_increase": 10.0,
+                    "minimum_shared_store_days": 1,
+                    "minimum_affinity_score": 0.0,
+                },
+            )
+
+        basic_by_sku = {row["sku"]: row for row in basic_rows}
+        affinity_by_sku = {row["sku"]: row for row in affinity_rows}
+        low_affinity_by_sku = {row["sku"]: row for row in low_affinity_rows}
+        self.assertNotEqual(
+            basic_by_sku["SKU_00"]["rack_id"],
+            basic_by_sku["SKU_01"]["rack_id"],
+        )
+        self.assertEqual(
+            affinity_by_sku["SKU_00"]["rack_id"],
+            affinity_by_sku["SKU_01"]["rack_id"],
+        )
+        self.assertNotEqual(
+            low_affinity_by_sku["SKU_00"]["rack_id"],
+            low_affinity_by_sku["SKU_01"]["rack_id"],
+        )
+        self.assertGreater(
+            affinity_summary["affinity_metrics"]["affinity_pair_same_bay_fraction"],
+            low_affinity_summary["affinity_metrics"][
+                "affinity_pair_same_bay_fraction"
+            ],
+        )
+        self.assertGreater(
+            affinity_summary["affinity_metrics"]["mixed_abc_rack_count"], 0
+        )
 
     def test_zone_id_auto_increment(self):
         self.assertEqual(self.slotting.next_zone_id("Z01"), "Z02")

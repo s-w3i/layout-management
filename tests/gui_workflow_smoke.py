@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import tempfile
 import time
@@ -32,8 +33,21 @@ def main() -> None:
     root = tk.Tk()
     app = gui.GridMapEditorApp(root)
     root.update_idletasks()
-    assert len(app.notebook.tabs()) == 4
+    assert len(app.notebook.tabs()) == 6
     assert app.notebook.tab(app.notebook.tabs()[1], "text") == "SKU Affinity"
+    assert app.notebook.tab(app.notebook.tabs()[3], "text") == "Interactive Slotting Layout"
+    assert app.notebook.tab(app.notebook.tabs()[4], "text") == "Traffic-Aware Slotting"
+    layout_canvases = (
+        app.canvas,
+        app.affinity_graph_canvas,
+        app.slot_zone_canvas,
+        app.slot_canvas,
+        app.traffic_canvas,
+        app.ops_canvas,
+    )
+    assert all(canvas.bind("<ButtonPress-3>") for canvas in layout_canvases)
+    assert all(canvas.bind("<B3-Motion>") for canvas in layout_canvases)
+    assert all(canvas.bind("<MouseWheel>") for canvas in layout_canvases)
 
     with tempfile.TemporaryDirectory() as directory:
         temp = Path(directory)
@@ -42,11 +56,20 @@ def main() -> None:
         app.width.set("4")
         app.length.set("3")
         app.spacing.set("1")
+        app.spacing_y.set("1.5")
         app.generate_grid()
         root.update_idletasks()
+        assert (app.project.grid.columns, app.project.grid.rows) == (4, 2)
+        app.canvas_wheel_zoom(
+            app.canvas, SimpleNamespace(x=120, y=100, delta=120, num=None)
+        )
+        app.canvas_pan_start(app.canvas, SimpleNamespace(x=40, y=40))
+        app.canvas_pan_drag(app.canvas, SimpleNamespace(x=65, y=55))
+        app.canvas_pan_end(app.canvas)
 
         def grid_event(position):
             x, y = app.screen_point(*position)
+            x, y = app.canvas_viewport_point(app.canvas, x, y)
             return SimpleNamespace(x=x, y=y)
 
         app.tool.set("rack")
@@ -65,6 +88,12 @@ def main() -> None:
         app.undo()
         app.redo()
         assert len(app.project.markers) == marker_count
+        app.grid_storage_system.set("AMR")
+        app.grid_storage_levels.set("1")
+        app.grid_storage_slots.set("12")
+        app.assign_grid_buffers()
+        assert app.project.storage_layout is not None
+        assert len(app.project.storage_layout.buffers) == 5
         project_path = temp / "workflow.grid.json"
         yaml_path = temp / "workflow.building.yaml"
         app.rmf_maps.save_project(app.project, project_path)
@@ -128,15 +157,23 @@ def main() -> None:
         assert (temp / "gui-affinity_sku_store.csv").exists()
         assert (temp / "gui-affinity_sku_pairs.csv").exists()
 
-        # Slotting tab: load/draw map, zone every rack, generate, and inspect.
+        # Inventory Slotting owns editable zone selection. The separate
+        # Interactive Slotting Layout canvas is a read-only result viewer.
+        app.slot_building_path.set(str(project_path))
         app.load_slot_building()
         root.update_idletasks()
         assert app.slot_racks
-        zone_start = SimpleNamespace(x=0, y=0)
-        zone_end = SimpleNamespace(
-            x=max(300, app.slot_canvas.winfo_width()),
-            y=max(300, app.slot_canvas.winfo_height()),
+        app.canvas_wheel_zoom(
+            app.slot_zone_canvas,
+            SimpleNamespace(x=150, y=120, delta=120, num=None),
         )
+        app.canvas_pan_start(app.slot_zone_canvas, SimpleNamespace(x=30, y=30))
+        app.canvas_pan_drag(app.slot_zone_canvas, SimpleNamespace(x=55, y=45))
+        app.canvas_pan_end(app.slot_zone_canvas)
+        zone_start = SimpleNamespace(x=-10000, y=-10000)
+        zone_end = SimpleNamespace(x=10000, y=10000)
+        assert app.slot_zone_canvas.bind("<B1-Motion>")
+        assert not app.slot_canvas.bind("<B1-Motion>")
         app.slot_canvas_press(zone_start)
         app.slot_canvas_drag(zone_end)
         app.slot_canvas_release(zone_end)
@@ -148,7 +185,7 @@ def main() -> None:
         assert all(
             key in app.slot_location_attributes[zone_paths[0]]
             for key in (
-                "chilled", "max_item_length", "max_item_width",
+                "chilled", "oversize_capable", "max_item_length", "max_item_width",
                 "max_item_height", "max_item_weight",
             )
         )
@@ -162,10 +199,10 @@ def main() -> None:
                 "max_item_weight",
             )
         } == {
-            "max_item_length": 15,
-            "max_item_width": 16,
-            "max_item_height": 13,
-            "max_item_weight": 250,
+            "max_item_length": 25.0,
+            "max_item_width": 19.3,
+            "max_item_height": 19.2,
+            "max_item_weight": 465.0,
         }
         zone_state = {}
         zone_editor = gui.ZoneStorageSettingsEditor(
@@ -176,9 +213,11 @@ def main() -> None:
         zone_editor.tree.selection_set(zone_paths[0])
         zone_editor._selected()
         zone_editor.chilled.set(False)
+        zone_editor.capacity_values["max_item_weight"].set("")
         zone_editor.update_selected()
         zone_editor.commit()
         app.apply_zone_storage_settings(zone_state["local"])
+        assert app.slot_location_attributes[zone_paths[0]]["max_item_weight"] is None
         saved_attribute_state = {}
 
         def capture_attributes(catalog, local_values):
@@ -234,21 +273,23 @@ def main() -> None:
             for path in bulk_slots
         )
 
-        generated_layouts = {}
-        for handling_unit in ("Tote", "Pallet", "AMR shelf"):
-            layout_path = temp / f"workflow-{handling_unit.replace(' ', '-')}.slotting.json"
-            app.slot_handling_unit.set(handling_unit)
-            app.slot_output_path.set(str(layout_path))
-            app.run_slotting()
-            root.update_idletasks()
-            assert layout_path.exists()
-            expected_layer = "bay" if handling_unit == "AMR shelf" else "slot"
-            assert all(
-                row["dynamic_address_level"] == expected_layer
-                for row in assigned_rows(app.slot_rows)
-            )
-            generated_layouts[handling_unit] = layout_path
-        layout_path = generated_layouts["AMR shelf"]
+        layout_path = temp / "workflow-AMR-shelf.slotting.json"
+        app.slot_output_path.set(str(layout_path))
+        app.run_slotting()
+        root.update_idletasks()
+        assert layout_path.exists()
+        assert app.slot_zone_mode.get() is True
+        assert "Viewing generated layout:" in app.slot_viewer_status.get()
+        assert app.slot_zone_canvas.find_withtag("rack")
+        assert app.slot_canvas.find_withtag("rack")
+        assert all(
+            row["dynamic_address_level"] == "shelf_slot"
+            for row in assigned_rows(app.slot_rows)
+        )
+        assert all(
+            row["static_address"].count("/") == 2
+            for row in assigned_rows(app.slot_rows)
+        )
         saved_payload = app.layouts.load(layout_path)
         assert saved_payload["schema"] == "inventory_slotting_layout/v2"
         assert saved_payload["location_attributes"][special_slot]["chilled"] is True
@@ -312,11 +353,113 @@ def main() -> None:
         assert adjusted_payload["affinity_configuration"]["parameter_status"] == "USER_ADJUSTED"
         assert adjusted_payload["affinity_configuration"]["minimum_shared_store_days"] == 1
 
+        # Traffic-aware tab: load the storage rules into its own rack-area
+        # editor, run the independent pipeline, and persist/export the result.
+        app.traffic_building_path.set(str(yaml_path))
+        app.traffic_velocity_path.set(str(affinity_velocity_path))
+        app.traffic_order_path.set(str(slot_affinity_path))
+        # Traffic remains on its existing YAML/legacy-address input path in this phase.
+        app.traffic_storage_config_path.set("")
+        app.traffic_handling_unit.set("AMR shelf")
+        app.traffic_levels.set("1")
+        app.traffic_slots.set("12")
+        app.traffic_output_path.set(str(temp / "workflow-traffic.slotting.json"))
+        assert app.load_traffic_area_map()
+        root.update_idletasks()
+        assert app.traffic_building is not None
+        assert app.traffic_canvas.find_withtag("traffic_area_rack")
+        first_traffic_rack = app.traffic_racks[0]
+        first_traffic_node = app.traffic_network.nodes[
+            f"v:{first_traffic_rack['vertex_index']}"
+        ]
+        rack_x, rack_y = app._traffic_point(
+            first_traffic_node, app._traffic_geometry()
+        )
+        app.traffic_area_id.set("ZONE_009")
+        app.traffic_canvas_press(SimpleNamespace(x=rack_x - 5, y=rack_y - 5))
+        app.traffic_canvas_release(SimpleNamespace(x=rack_x + 5, y=rack_y + 5))
+        assert app.traffic_area_id.get() == "ZONE_010"
+        assert app.traffic_zone_assignments[first_traffic_rack["waypoint"]] == "ZONE_009"
+        app.traffic_area_mode.set(False)
+        app.draw_traffic_map()
+        app.start_traffic_analysis()
+        deadline = time.monotonic() + 10
+        while app.traffic_worker and app.traffic_worker.is_alive():
+            root.update()
+            time.sleep(0.01)
+            assert time.monotonic() < deadline
+        app.poll_traffic_work()
+        root.update_idletasks()
+        assert app.traffic_analysis is not None, (app.traffic_status.get(), errors)
+        assert app.traffic_demand.fulfillment_groups > 0
+        assert "Groups" in app.traffic_kpis.get()
+        assert app.traffic_resource_tree.get_children()
+        app.draw_traffic_map()
+        traffic_links = app.traffic_canvas.find_withtag("traffic_link")
+        assert traffic_links
+        assert all(
+            app.traffic_canvas.itemcget(item, "arrow") in {"", "none"}
+            for item in traffic_links
+        )
+        assert app.traffic_canvas.find_withtag("traffic_rack")
+        rack_heat_colours = {
+            app.traffic_canvas.itemcget(item, "fill")
+            for item in app.traffic_canvas.find_withtag("traffic_rack")
+        }
+        assert len(rack_heat_colours) >= 2  # active-visit heat plus empty racks
+        assert app.traffic_pipeline_result.grouping_metrics[
+            "hard_validation_status"
+        ] == "PASSED"
+        app.start_traffic_generation()
+        deadline = time.monotonic() + 10
+        while app.traffic_worker and app.traffic_worker.is_alive():
+            root.update()
+            time.sleep(0.01)
+            assert time.monotonic() < deadline
+        app.poll_traffic_work()
+        root.update_idletasks()
+        assert app.traffic_result is not None
+        assert app.traffic_max_travel.get()
+        assert app.traffic_hotspot_percentile.get()
+        # Swapped source/destination racks remain highlighted in both views.
+        rack_records = list(app._traffic_racks_for_view().values())
+        assert len(rack_records) >= 2
+        original_relocations = app.traffic_result.relocations
+        app.traffic_result.relocations = [{
+            "handling_unit_id": "GUI_TEST_UNIT",
+            "from": rack_records[0]["bay"],
+            "to": rack_records[1]["bay"],
+            "swap_with": "GUI_TEST_OTHER",
+        }]
+        for traffic_view in ("Before", "After"):
+            app.traffic_view_mode.set(traffic_view)
+            app.draw_traffic_map("GUI_TEST_UNIT")
+            assert len(app.traffic_canvas.find_withtag("swapped_rack")) >= 2
+        app.traffic_result.relocations = original_relocations
+        app.traffic_selected_unit = None
+        app.save_traffic_layout()
+        traffic_layout_path = Path(app.traffic_output_path.get())
+        assert traffic_layout_path.exists()
+        assert app.layouts.load(traffic_layout_path)["traffic_configuration"]
+        traffic_export = temp / "workflow-traffic.traffic.json"
+        gui.filedialog.asksaveasfilename = lambda **_kwargs: str(traffic_export)
+        app.export_traffic_report()
+        assert traffic_export.exists()
+        assert traffic_export.with_name("workflow-traffic_traffic_resources.csv").exists()
+
         app.slot_location_attributes = {}
-        app.load_slotting_configuration(layout_path)
+        original_open_dialog = gui.filedialog.askopenfilename
+        gui.filedialog.askopenfilename = lambda **_kwargs: str(layout_path)
+        try:
+            app.load_interactive_slotting_layout()
+        finally:
+            gui.filedialog.askopenfilename = original_open_dialog
+        assert "Viewing saved layout:" in app.slot_viewer_status.get()
         assert app.slot_location_attributes[special_slot]["chilled"] is True
         app.draw_slotting_layout()
         first_assignment = assigned_rows(app.slot_rows)[0]
+        selected_bay_path = first_assignment["storage_location_address"].rsplit("/L", 1)[0]
+        app.slot_location_attributes[selected_bay_path] = {"max_item_weight": 123}
         rack_item = next(
             item
             for item in app.slot_canvas.find_withtag("rack")
@@ -324,6 +467,33 @@ def main() -> None:
         )
         app.slot_canvas.addtag_withtag("current", rack_item)
         app.slot_rack_click(SimpleNamespace())
+        zone_detail = app.slot_zone_detail.get()
+        rack_detail = app.slot_rack_detail.get()
+        expected_zone = (
+            first_assignment["planned_zone_id"]
+            if "_chill_" in first_assignment["planned_zone_id"]
+            else first_assignment["zone_id"]
+        )
+        assert f"Zone: {expected_zone}" in zone_detail
+        if expected_zone != first_assignment["zone_id"]:
+            assert f"Parent zone: {first_assignment['zone_id']}" in zone_detail
+        else:
+            assert "Parent zone:" not in zone_detail
+        assert (
+            f"Generated storage type: {first_assignment['planned_storage_type']}"
+            in zone_detail
+        )
+        assert "Attributes:" in zone_detail
+        assert "Static grid rack" not in zone_detail
+        assert "Static grid rack" in rack_detail
+        assert "Overrides:" in rack_detail
+        assert "Effective bay attributes" not in rack_detail
+        override_line = next(
+            line for line in rack_detail.splitlines()
+            if line.startswith("Overrides:")
+        )
+        assert "max_item_weight=123" in override_line
+        assert "chilled=False" not in override_line
         assert app.slot_tree.get_children()
         slot_item = app.slot_tree.get_children()[0]
         slot_row = next(
@@ -343,6 +513,18 @@ def main() -> None:
         assert app.sku_storage_flags(
             {"physical_storage_class": "UNVERIFIED_OVERSIZE"}
         ) == "UNVERIFIED OVERSIZE"
+        assert app.sku_storage_flags({
+            "physical_missing_data_type": "UNKNOWN_WEIGHT",
+            "physical_storage_class": "OVERWEIGHT",
+        }) == "UNKNOWN WEIGHT"
+        assert app.sku_storage_flags({
+            "physical_missing_data_type": "UNKNOWN_SIZE",
+            "physical_storage_class": "OVERSIZE",
+        }) == "UNKNOWN SIZE"
+        assert app.sku_storage_flags({
+            "physical_missing_data_type": "NON_VOLUMETRIC_DATA",
+            "physical_storage_class": "OVERSIZE_AND_OVERWEIGHT",
+        }) == "NO SIZE/WEIGHT DATA"
 
         # Operations tab: load/search, select and execute both swap modes, save.
         app.ops_layout_path.set(str(layout_path))
@@ -351,13 +533,14 @@ def main() -> None:
         operation_rows = assigned_rows(app.ops_rows)
         assert operation_rows
         special_row = next(
-            row for row in operation_rows if row["static_address"] == special_slot
+            row for row in operation_rows
+            if row["storage_location_address"] == special_slot
         )
         ambient_row = next(
             row for row in operation_rows
-            if row["static_address"] != special_slot
+            if row["storage_location_address"] != special_slot
             and app.attributes.effective_attributes(
-                row["static_address"], app.ops_payload["location_attributes"]
+                row["storage_location_address"], app.ops_payload["location_attributes"]
             )[0].get("chilled") is False
         )
         special_requirements = dict(special_row["sku_requirements"])
@@ -399,8 +582,31 @@ def main() -> None:
             if row["rack_id"] != special_row["rack_id"]
             and row["sku_requirements"].get("chilled") is False
         ]
-        source = normal_rows[0]
-        target = next(row for row in normal_rows if row["rack_id"] != source["rack_id"])
+        source = target = None
+        for candidate_source in normal_rows:
+            for candidate_target in normal_rows:
+                if candidate_source["rack_id"] == candidate_target["rack_id"]:
+                    continue
+                try:
+                    app.inventory._validate_target(
+                        candidate_source,
+                        candidate_target["storage_location_address"],
+                        app.ops_payload["attribute_catalog"],
+                        app.ops_payload["location_attributes"],
+                    )
+                    app.inventory._validate_target(
+                        candidate_target,
+                        candidate_source["storage_location_address"],
+                        app.ops_payload["attribute_catalog"],
+                        app.ops_payload["location_attributes"],
+                    )
+                except ValueError:
+                    continue
+                source, target = candidate_source, candidate_target
+                break
+            if source is not None:
+                break
+        assert source is not None and target is not None
         app.show_ops_rack_inventory(source["rack_id"])
         source_item = next(
             item for item, row in app.ops_inventory_rows.items() if row["sku"] == source["sku"]
@@ -422,14 +628,33 @@ def main() -> None:
         app.ops_swap_mode.set("Whole shelf")
         app.ops_swap_mode_changed()
         operation_rows = assigned_rows(app.ops_rows)
-        first = next(
-            row for row in operation_rows if row["rack_id"] != special_row["rack_id"]
-        )
-        second = next(
-            row for row in operation_rows
-            if row["handling_unit_id"] != first["handling_unit_id"]
-            and row["rack_id"] != special_row["rack_id"]
-        )
+        rows_by_unit = {}
+        for row in operation_rows:
+            rows_by_unit.setdefault(row["handling_unit_id"], []).append(row)
+        eligible_units = [
+            unit_rows for unit_rows in rows_by_unit.values()
+            if all(row["rack_id"] != special_row["rack_id"] for row in unit_rows)
+        ]
+        first = second = None
+        for first_rows in eligible_units:
+            for second_rows in eligible_units:
+                if first_rows is second_rows:
+                    continue
+                try:
+                    app.inventory.swap_whole_shelf_units(
+                        copy.deepcopy(operation_rows),
+                        first_rows[0]["handling_unit_id"],
+                        second_rows[0]["handling_unit_id"],
+                        app.ops_payload["attribute_catalog"],
+                        copy.deepcopy(app.ops_payload["location_attributes"]),
+                    )
+                except ValueError:
+                    continue
+                first, second = first_rows[0], second_rows[0]
+                break
+            if first is not None:
+                break
+        assert first is not None and second is not None
         first_rack_rows = [row for row in operation_rows if row["rack_id"] == first["rack_id"]]
         second_rack_rows = [row for row in operation_rows if row["rack_id"] == second["rack_id"]]
         app.select_ops_shelf_for_swap(first["rack_id"], first_rack_rows)

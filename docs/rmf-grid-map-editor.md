@@ -4,6 +4,11 @@ This Python application creates an image-free Open-RMF `.building.yaml` map.
 It uses `cartesian_meters`, so the bottom-left grid point is `G0_0` at `(0, 0)`
 and positive Y points upward.
 
+All map and layout views support consistent navigation. Hold the right mouse
+button and drag to pan; scroll the mouse wheel to zoom in or out around the
+pointer. Left-button editing, rack inspection, and rectangle selection remain
+available at any zoom level.
+
 ## Start the editor
 
 ```bash
@@ -15,12 +20,14 @@ Enter:
 
 - Total warehouse width in metres
 - Total warehouse length in metres
-- Distance between grid points in metres
+- X and Y distance between grid points in metres
 - Map and RMF level names
 
-Width and length must be exact multiples of grid spacing. Click **Generate / reset
-grid** to create all vertices and edges. Every point is initially connected to
-its horizontal and vertical neighbours, and every lane is bidirectional.
+X and Y use independent positive grid distances, so cells may be rectangular.
+Click **Generate / reset grid** to create all vertices and edges. Complete
+intervals use the configured distance for their axis; a shorter final interval
+is added when needed to meet the exact width or length. Every point is connected
+to its horizontal and vertical neighbours, and every lane is bidirectional.
 
 ## Mark operational points
 
@@ -44,13 +51,20 @@ undoable action, as does filling a complete rack rectangle.
 Save an editable `.grid.json` project while working. Export the completed map as
 `resources/map/v6.building.yaml` when ready.
 
+Before saving the project for Inventory Slotting, select `AMR`, `Mini-load
+ASRS`, or `Pallet ASRS`, enter its levels and slots per level, and click
+**Assign empty storage buffers**. AMR produces one grid buffer per rack pickup;
+ASRS produces level/slot buffers. The YAML export is unchanged and continues to
+contain only RMF rack `pickup_dispenser` and workstation `dropoff_ingestor`
+metadata.
+
 ## Command-line generation
 
 An empty 20 m × 15 m map with 1 m grid spacing:
 
 ```bash
 python3 rmf_grid_map_editor.py --generate \
-  --width 20 --length 15 --spacing 1 \
+  --width 20 --length 15 --x-spacing 1 --y-spacing 1 \
   --name warehouse_grid \
   --output resources/map/v6.building.yaml
 ```
@@ -59,7 +73,7 @@ Markers may be supplied as `ROLE,COLUMN,ROW,ENDPOINT_ID`:
 
 ```bash
 python3 rmf_grid_map_editor.py --generate \
-  --width 20 --length 15 --spacing 1 \
+  --width 20 --length 15 --x-spacing 2 --y-spacing 1 \
   --marker rack,3,4,RACK_001 \
   --marker workstation,0,2,WS_OUTBOUND \
   --output resources/map/v6.building.yaml
@@ -102,38 +116,42 @@ interchange artifacts.
 
 The **Inventory Slotting** tab accepts:
 
-- An RMF `.building.yaml` containing rack `pickup_dispenser` points and
-  workstation `dropoff_ingestor` points
+- An editable `.grid.json` containing the RMF grid, rack/workstation markers,
+  storage-system profile, and empty buffers
 - The ABC SKU velocity summary CSV
 - An optional selected-SKU chilled requirements CSV
 - A strategy selected from the dropdown
-- The handling-unit model: AMR shelf, tote, or pallet
-- Levels and slots per rack
+- The handling-unit model and levels/slots generated in Grid Map Editor
 - Optional typed hierarchy attributes and matching `req_<attribute_key>` CSV
   columns
 
 Use this workflow:
 
-1. Browse for the building YAML and click **Load map**.
+1. Browse for the grid project JSON and click **Load project**.
 2. The first zone ID defaults to `Z01`.
-3. Keep **Rectangle zone selection** enabled and drag over a group of racks.
+3. In the **Slotting zone editor**, drag over a group of racks.
 4. Repeat until every rack belongs to a zone. After each successful rectangle,
    the ID advances automatically to `Z02`, `Z03`, and so on. IDs such as
    `ZONE_001` advance to `ZONE_002` while preserving their numeric width.
-5. Set levels and slots, then click **Zone storage settings…**. Limits default
-   to 15 × 16 × 13 and weight 250 in unconfirmed source units. No zone is
-   pre-labelled or automatically enlarged for oversize storage.
-6. Mark actual chilled zones. Chilled defaults to false and is never inferred
-   from the map.
+5. Confirm the read-only levels and slots, then click **Zone storage settings…**.
+   Limits default to 25.0 × 19.3 × 19.2 and weight 465.0 in unconfirmed source units.
+   Any maximum may be cleared; blank means no configured maximum, not zero.
+6. Mark actual chilled zones. Chilled is the only storage role predefined by
+   the user; oversize segments are planned automatically during slotting.
 7. Use **Advanced attributes…** for extra inherited values or lower-level
-   overrides. A child slot can use larger limits such as the sample maximums
-   150 × 50 × 95 and weight 640 while its parent zone remains normal.
+   overrides. Generated oversize segment attributes also appear at child slots.
 8. Browse for the ABC SKU velocity CSV and optional chilled CSV. Physical
    requirement columns are `req_max_item_length`, `req_max_item_width`,
-   `req_max_item_height`, and `req_max_item_weight`.
-9. Select the strategy and handling-unit type, then generate the layout.
+   `req_max_item_height`, and `req_max_item_weight`. A positive SKU weight
+   enables a soft preference for middle rack levels; weight `0` disables this
+   ergonomic preference for that SKU.
+9. Select the strategy, then generate the layout.
 
 For `abc_affinity`, select the order-history workbook and an affinity weight.
+The weight directly balances same-bay affinity consolidation against ABC bay
+purity: 0% behaves like ABC grouping, while 100% lets strongly related SKUs from
+different ABC classes share a bay when storage constraints permit. For an AMR
+shelf, this can reduce separate shelf pickups for related order lines.
 The first generation automatically suggests minimum shared store-days, minimum
 affinity score, and maximum service-distance increase from that workbook and
 warehouse map. The values appear after generation and become editable. Use
@@ -150,16 +168,22 @@ The demo **basic** strategy calculates the shortest directed graph route from
 each rack to every workstation, then uses the average of those route distances
 as the rack score. It sorts SKUs by ABC class and pick frequency, checks chilled
 exclusivity first, then uses rotation-aware dimensions, weight, and custom
-attributes as best-fit preferences. Chilled versus ambient is the only hard
-storage boundary. If a matching-temperature slot needs different soft values,
-the generator writes local overrides on that child slot and assigns the SKU.
+attributes. Zone capacity for exceptions is planned in advance, but standard
+SKUs are physically placed first and oversize/overweight SKUs last. Compatible
+racks are filled before another rack is opened, so ABC classes may mix. Standard
+SKUs cannot consume reserved oversize segments. Chilled exceptions use available slots inside a chilled zone, which
+splits that zone into standard and oversize segments without changing its
+temperature role.
+For weighted SKUs, otherwise suitable slots are ranked from the rack center
+outward; this is a heuristic and does not reject an available location.
 Missing physical data is assigned with an `UNVERIFIED` warning. A general
 not-enough-space result occurs only when every slot is occupied.
 
-The **abc_affinity** strategy retains that ABC-first allocation and all storage
-constraints. It uses store-day cosine affinity only to rank locations that are
-otherwise eligible at the same ABC/physical priority, balancing service distance
-against proximity to already placed related SKUs. Automatic thresholds come
+The **abc_affinity** strategy retains all storage constraints but makes ABC bay
+purity a soft objective that competes directly with affinity. Placement follows
+strong affinity connections, and the location score charges a primary cost for
+using another bay plus a secondary cost for distance between bays. High weights
+therefore permit cross-class same-bay consolidation. Automatic thresholds come
 from empirical distributions in the selected workbook and map; they are not
 fixed to the bundled sample data.
 
@@ -167,43 +191,49 @@ Chilled and ambient capacity is counted separately because neither category may
 use slots from the other. The result distinguishes this temperature-zone
 shortage from global not-enough-space.
 
-An automatic override is recommendation metadata, not a physical modification
-to a rack. Validate generated limits against real equipment before production.
+Unknown weight is treated as overweight, unknown size as oversize, and missing
+both usable size and weight as oversize plus overweight. Unknown properties are
+stored as unbounded assumptions on the generated segment. Validate every
+generated segment and capacity recommendation against real equipment.
 Racks without a complete route to every workstation rank last but remain usable
 and receive `UNREACHABLE_LAST_RESORT` when selected.
 
-Zone storage type is generated after allocation from actual contents:
-`STANDARD`, `OVERSIZE`, `MIXED`, or `UNUSED`. It is output metadata and is not a
-pre-generation zone role. Compatibility always uses the effective slot values,
-including child overrides inherited from or replacing parent values.
+Every generated storage zone is exactly `STANDARD` or `OVERSIZE`; `MIXED` is
+not produced. Ambient user zones remain whole and the planner selects the
+smallest nearby set for outliers. Chilled user zones may be partitioned into
+separate standard and oversize generated subzones when capacity allows.
+`planned_zone_id` records this generated identity while the original `zone_id`
+continues to control chilled inheritance and static addressing.
 
 Local attributes are stored against full static hierarchy paths, so `Z01/A01`
 and `Z02/A01` are independent. Children inherit ancestor values and can override
-them; clearing a local value restores inheritance. **Load previous layout…**
-restores this configuration from a v2 slotting JSON.
+them; clearing a local value restores inheritance. **Load saved layout…** in
+the **Interactive Slotting Layout** tab restores this configuration from a v2
+slotting JSON. That tab is a read-only assignment viewer; zone dragging remains
+in the **Inventory Slotting** tab.
 
-The generated slotting JSON contains both address levels:
+The generated slotting JSON separates the static buffer from the movable unit:
 
-- `static_address`: zone, aisle, fixed grid bay, level and slot
-- `dynamic_address`: the current full address with the movable-unit ID applied
-  at its correct hierarchy layer
+- `static_address`: the fixed buffer address
+- `dynamic_address`: the shelf slot, tote, or pallet address
+- `storage_location_address`: the full level/slot path used by compatibility rules
 
 Dynamic handling-unit IDs are independent of RMF waypoint and static rack IDs.
 They are assigned sequentially from `001`. Complete addresses look like:
 
 ```text
-AMR static:   Z01/A05/BAY-G611/L01/S01
-AMR dynamic:  Z01/A05/BAY-SHELF_001/L01/S01
+AMR static:   Z03/A08/B-G11_11
+AMR dynamic:  SHELF_001/L01/S01
 
-ASRS static:  Z01/A05/BAY-G611/L01/S01
-Tote dynamic: Z01/A05/BAY-G611/L01/SLOT-TOTE_001
+ASRS static:  Z03/A08/B-G11_11/L01/S01
+Tote dynamic: TOTE_001
 ```
 
-An AMR shelf is movable at the bay layer, so all SKU slots on one shelf share
-the same `SHELF_001` ID. An ASRS tote or pallet is movable at the slot layer,
-so each slot receives an independent ID such as `TOTE_001` or `PALLET_001`.
-Each assignment records this explicitly as `dynamic_address_level` (`bay` or
-`slot`). The RMF-only address remains available separately as
+An AMR grid buffer can contain one movable shelf, and all SKU positions on that
+shelf share `SHELF_001`. Each ASRS slot buffer accepts one tote or pallet. The
+summary reports `buffer_count`, `occupied_buffer_count`, `empty_buffer_count`,
+and `buffer_occupancy_rate`; each buffer is counted once regardless of how many
+SKUs are stored in its handling unit. The RMF-only address remains available as
 `rmf_grid_address`.
 
 After generation, the tab displays the RMF lane graph as an interactive map.
@@ -217,7 +247,7 @@ it shows the complete current static address, current dynamic address, handling
 unit type and handling-unit ID. Routing and frequency values remain available
 in the JSON assignment records but are omitted from the rack-detail view.
 
-The default inputs are the existing `demo.building.yaml` and
+The default inputs are `demo.grid.json` and
 `sku_velocity_summary.csv`. The result defaults to
 `resources/data/basic_slotting_layout.slotting.json`.
 

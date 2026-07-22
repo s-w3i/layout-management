@@ -70,6 +70,66 @@ class StorageAttributeTests(unittest.TestCase):
             self.attributes.parse_value(self.catalog["max_item_weight"], "12.5"), 12.5
         )
 
+    def test_blank_physical_zone_limits_are_unbounded(self):
+        local = self.attributes.validate_location_attributes(
+            {
+                "Z01": {
+                    "chilled": False,
+                    "max_item_length": None,
+                    "max_item_width": "",
+                    "max_item_height": None,
+                    "max_item_weight": "",
+                }
+            },
+            self.catalog,
+        )
+        effective, _sources = self.attributes.effective_attributes("Z01", local)
+        requirements = {
+            "chilled": False,
+            "max_item_length": 10000,
+            "max_item_width": 9000,
+            "max_item_height": 8000,
+            "max_item_weight": 7000,
+        }
+        compatible, issues, status = self.attributes.evaluate_location(
+            requirements, effective, self.catalog
+        )
+        self.assertTrue(compatible)
+        self.assertEqual(issues, [])
+        self.assertEqual(status, "COMPATIBLE")
+        self.assertEqual(
+            self.attributes.required_local_overrides(
+                requirements, effective, self.catalog
+            ),
+            {},
+        )
+        self.assertEqual(
+            SlottingService.required_slot_footprint(requirements, effective),
+            (1, 1),
+        )
+
+    def test_missing_physical_data_types_are_classified_conservatively(self):
+        complete_size = {
+            "max_item_length": 5,
+            "max_item_width": 6,
+            "max_item_height": 7,
+        }
+        unknown_weight = self.attributes.physical_profile(complete_size)
+        self.assertEqual(unknown_weight["missing_data_type"], "UNKNOWN_WEIGHT")
+        self.assertEqual(unknown_weight["storage_class"], "UNKNOWN_WEIGHT")
+
+        unknown_size = self.attributes.physical_profile({"max_item_weight": 10})
+        self.assertEqual(unknown_size["missing_data_type"], "UNKNOWN_SIZE")
+        self.assertEqual(unknown_size["storage_class"], "OVERSIZE")
+
+        no_physical_data = self.attributes.physical_profile({})
+        self.assertEqual(
+            no_physical_data["missing_data_type"], "NON_VOLUMETRIC_DATA"
+        )
+        self.assertEqual(
+            no_physical_data["storage_class"], "NON_VOLUMETRIC_DATA"
+        )
+
     def test_full_paths_keep_same_aisle_id_separate_by_zone(self):
         racks = [
             {"zone_id": "Z01", "aisle_id": "A01", "static_bay_id": "BAY-G0_0"},
@@ -109,8 +169,203 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
             if path.endswith("/S01")
         ]
         self.base_local = {
-            "Z01": {"chilled": False, **STANDARD_STORAGE_DEFAULTS}
+            "Z01": {
+                "chilled": False,
+                "oversize_capable": False,
+                **STANDARD_STORAGE_DEFAULTS,
+            }
         }
+
+    def test_weight_heuristic_prefers_center_level_and_zero_disables_it(self):
+        project = GridProject(
+            GridSpec(2, 1, 1, "ergonomic-weight", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (2, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        building = project.to_building_dict()
+        capacity = {"Z01": {"chilled": False, **OVERSIZE_STORAGE_DEFAULTS}}
+        base_requirements = {
+            "chilled": False,
+            "max_item_length": 5,
+            "max_item_width": 5,
+            "max_item_height": 5,
+        }
+        weighted_rows, weighted_summary = self.slotting.generate_basic(
+            building,
+            [{
+                "sku": "HEAVY", "pick_frequency": 1, "velocity_class": "A",
+                "sku_requirements": {**base_requirements, "max_item_weight": 500},
+            }],
+            5, 1, "AMR shelf", attribute_catalog=self.catalog,
+            location_attributes=copy.deepcopy(capacity),
+        )
+        self.assertEqual(weighted_rows[0]["storage_level"], 2)
+        self.assertTrue(weighted_rows[0]["ergonomic_weight_heuristic"])
+        self.assertEqual(weighted_rows[0]["ergonomic_preferred_level"], 2)
+        self.assertTrue(weighted_summary["ergonomic_weight_heuristic"])
+
+        disabled_rows, _summary = self.slotting.generate_basic(
+            building,
+            [{
+                "sku": "DISABLED", "pick_frequency": 1, "velocity_class": "A",
+                "sku_requirements": {**base_requirements, "max_item_weight": 0},
+            }],
+            5, 1, "AMR shelf", attribute_catalog=self.catalog,
+            location_attributes=copy.deepcopy(capacity),
+        )
+        self.assertEqual(disabled_rows[0]["storage_level"], 1)
+        self.assertFalse(disabled_rows[0]["ergonomic_weight_heuristic"])
+        self.assertEqual(disabled_rows[0]["physical_data_status"], "MISSING")
+
+        unknown_weight_rows, _summary = self.slotting.generate_basic(
+            building,
+            [{
+                "sku": "UNKNOWN_WEIGHT",
+                "pick_frequency": 1,
+                "velocity_class": "A",
+                "sku_requirements": base_requirements,
+            }],
+            5, 1, "AMR shelf", attribute_catalog=self.catalog,
+            location_attributes=copy.deepcopy(capacity),
+        )
+        self.assertEqual(unknown_weight_rows[0]["storage_level"], 1)
+        self.assertFalse(
+            unknown_weight_rows[0]["ergonomic_weight_heuristic"]
+        )
+
+    def test_exception_categories_can_mix_in_the_same_rack(self):
+        project = GridProject(
+            GridSpec(6, 1, 1, "unknown-category-racks", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_A"),
+                (2, 0): Marker("rack", "RACK_B"),
+                (4, 0): Marker("rack", "RACK_C"),
+                (6, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        building = project.to_building_dict()
+        capacity = {"Z01": {"chilled": False, **OVERSIZE_STORAGE_DEFAULTS}}
+        rows, _summary = self.slotting.generate_basic(
+            building,
+            [
+                {
+                    "sku": "UNKNOWN_SIZE",
+                    "pick_frequency": 3,
+                    "velocity_class": "A",
+                    "sku_requirements": {"chilled": False, "max_item_weight": 1},
+                },
+                {
+                    "sku": "UNKNOWN_WEIGHT",
+                    "pick_frequency": 2,
+                    "velocity_class": "A",
+                    "sku_requirements": {
+                        "chilled": False,
+                        "max_item_length": 5,
+                        "max_item_width": 5,
+                        "max_item_height": 5,
+                    },
+                },
+                {
+                    "sku": "NON_VOLUMETRIC",
+                    "pick_frequency": 1,
+                    "velocity_class": "A",
+                    "sku_requirements": {"chilled": False},
+                },
+            ],
+            2,
+            2,
+            "AMR shelf",
+            attribute_catalog=self.catalog,
+            location_attributes=copy.deepcopy(capacity),
+        )
+        by_sku = {row["sku"]: row for row in rows}
+        self.assertEqual(
+            by_sku["UNKNOWN_SIZE"]["physical_missing_data_type"], "UNKNOWN_SIZE"
+        )
+        self.assertEqual(
+            by_sku["UNKNOWN_WEIGHT"]["physical_missing_data_type"], "UNKNOWN_WEIGHT"
+        )
+        self.assertEqual(
+            by_sku["NON_VOLUMETRIC"]["physical_missing_data_type"],
+            "NON_VOLUMETRIC_DATA",
+        )
+        self.assertGreaterEqual(
+            len([
+                row for row in by_sku.values()
+                if row["rack_id"] == by_sku["UNKNOWN_SIZE"]["rack_id"]
+            ]),
+            2,
+        )
+
+    def test_overweight_requires_level_two_in_basic_slotting(self):
+        project = GridProject(
+            GridSpec(2, 1, 1, "overweight-hard-level", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (2, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        rows, summary = self.slotting.generate_basic(
+            project.to_building_dict(),
+            [
+                {
+                    "sku": "HEAVY_1",
+                    "pick_frequency": 2,
+                    "velocity_class": "A",
+                    "sku_requirements": {
+                        "chilled": False,
+                        "max_item_length": 5,
+                        "max_item_width": 5,
+                        "max_item_height": 5,
+                        "max_item_weight": 500,
+                    },
+                },
+                {
+                    "sku": "HEAVY_2",
+                    "pick_frequency": 1,
+                    "velocity_class": "C",
+                    "sku_requirements": {
+                        "chilled": False,
+                        "max_item_length": 5,
+                        "max_item_width": 5,
+                        "max_item_height": 5,
+                        "max_item_weight": 500,
+                    },
+                },
+            ],
+            3,
+            1,
+            "AMR shelf",
+            attribute_catalog=self.catalog,
+            location_attributes={"Z01": {"chilled": False, **OVERSIZE_STORAGE_DEFAULTS}},
+        )
+        by_sku = {row["sku"]: row for row in rows}
+        self.assertEqual(by_sku["HEAVY_1"]["assignment_status"], "ASSIGNED")
+        self.assertEqual(by_sku["HEAVY_1"]["storage_level"], 2)
+        self.assertEqual(
+            by_sku["HEAVY_2"]["assignment_status"],
+            "UNASSIGNED_NO_COMPATIBLE_LOCATION",
+        )
+        self.assertIn(
+            "overweight inventory requires level 2",
+            "; ".join(by_sku["HEAVY_2"]["compatibility_issues"]),
+        )
+        self.assertEqual(summary["assigned_count"], 1)
+
+    def test_velocity_csv_accepts_zero_weight_as_heuristic_opt_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "velocity.csv"
+            path.write_text(
+                "sku,pick_frequency,velocity_class,req_max_item_length,"
+                "req_max_item_width,req_max_item_height,req_max_item_weight\n"
+                "SKU_ZERO,1,A,1,1,1,0\n",
+                encoding="utf-8",
+            )
+            rows = self.slotting.load_velocity(path, self.catalog)
+        self.assertEqual(rows[0]["sku_requirements"]["max_item_weight"], 0)
+        self.assertEqual(rows[0]["physical_data_status"], "MISSING")
 
     @staticmethod
     def sku(name, frequency, requirements=None):
@@ -177,10 +432,9 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         self.assertEqual(capacity_rows[-1]["assignment_status"], "UNASSIGNED_NO_CAPACITY")
         self.assertEqual(capacity_summary["unassigned_no_capacity_count"], 1)
 
-    def test_abc_class_fills_matching_rack_before_mixing(self):
+    def test_compatible_rack_is_filled_before_opening_next_rack(self):
         skus = [
             {**self.sku("A_1", 100), "velocity_class": "A"},
-            {**self.sku("A_2", 90), "velocity_class": "A"},
             {**self.sku("B_1", 80), "velocity_class": "B"},
             {**self.sku("B_2", 70), "velocity_class": "B"},
         ]
@@ -193,10 +447,14 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
             rack_classes.setdefault(row["rack_id"], set()).add(
                 row["velocity_class"]
             )
-        self.assertEqual(len(rack_classes), 2)
-        self.assertTrue(all(len(classes) == 1 for classes in rack_classes.values()))
+        rack_counts = {
+            rack_id: sum(row["rack_id"] == rack_id for row in rows)
+            for rack_id in rack_classes
+        }
+        filled_rack = next(rack_id for rack_id, count in rack_counts.items() if count == 2)
+        self.assertEqual(rack_classes[filled_rack], {"A", "B"})
 
-    def test_oversize_uses_level_three_when_mixed_with_standard(self):
+    def test_predefined_ambient_oversize_does_not_block_standard_first(self):
         project = GridProject(
             GridSpec(2, 1, 1, "mixed_physical", "L1"),
             {
@@ -209,10 +467,15 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
             building
         )
         zones = {racks[0]["waypoint"]: "Z01"}
+        local = copy.deepcopy(self.base_local)
+        local["Z01/A01/BAY-G0_0/L03"] = {
+            "oversize_capable": True,
+            **OVERSIZE_STORAGE_DEFAULTS,
+        }
         rows, _summary = self.slotting.generate_basic(
             building,
             [
-                self.sku("OVERSIZE", 100, {"max_item_length": 17}),
+                self.sku("OVERSIZE", 100, {"max_item_length": 26}),
                 self.sku("STANDARD", 90),
             ],
             3,
@@ -221,15 +484,21 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
             "Z01",
             zones,
             self.catalog,
-            copy.deepcopy(self.base_local),
+            local,
         )
         by_sku = {row["sku"]: row for row in rows}
-        self.assertEqual(by_sku["STANDARD"]["storage_level"], 1)
+        self.assertEqual(by_sku["STANDARD"]["assignment_status"], "ASSIGNED")
+        self.assertEqual(by_sku["STANDARD"]["storage_area_type"], "STANDARD")
         self.assertEqual(by_sku["OVERSIZE"]["physical_storage_class"], "OVERSIZE")
         self.assertEqual(by_sku["OVERSIZE"]["storage_level"], 3)
+        self.assertEqual(by_sku["OVERSIZE"]["planned_zone_id"], "Z01_OVERSIZE")
+        self.assertNotEqual(
+            by_sku["STANDARD"]["planned_zone_id"],
+            by_sku["OVERSIZE"]["planned_zone_id"],
+        )
         self.assertEqual(
             by_sku["OVERSIZE"]["compatibility_status"],
-            "COMPATIBLE_AUTO_OVERRIDE",
+            "COMPATIBLE",
         )
 
     def test_csv_requirement_columns_and_validation(self):
@@ -276,7 +545,7 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(compatible, issues)
         self.assertEqual(status, "COMPATIBLE")
-        too_large = {**rotated, "max_item_length": 17}
+        too_large = {**rotated, "max_item_length": 26}
         compatible, issues, _status = self.attributes.evaluate_location(
             too_large, {"chilled": False, **STANDARD_STORAGE_DEFAULTS}, self.catalog
         )
@@ -284,7 +553,7 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         self.assertIn("any allowed rotation", "; ".join(issues))
         self.assertEqual(
             self.attributes.physical_profile(
-                {**rotated, "max_item_weight": 251}
+                {**rotated, "max_item_weight": 466}
             )["storage_class"],
             "OVERWEIGHT",
         )
@@ -300,12 +569,18 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
         self.assertEqual(rows[0]["compatibility_status"], "UNVERIFIED")
-        self.assertEqual(rows[0]["storage_area_type"], "STANDARD")
+        self.assertEqual(rows[0]["storage_area_type"], "OVERSIZE")
+        self.assertEqual(
+            rows[0]["physical_missing_data_type"], "NON_VOLUMETRIC_DATA"
+        )
         self.assertEqual(summary["assigned_unverified_count"], 1)
 
-    def test_standard_prefers_normal_slot_then_can_use_larger_child_slot(self):
+    def test_user_oversize_flags_are_replanned_when_no_outlier_exists(self):
         local = copy.deepcopy(self.base_local)
-        local[self.slot_paths[1]] = dict(OVERSIZE_STORAGE_DEFAULTS)
+        local[self.slot_paths[1]] = {
+            "oversize_capable": True,
+            **OVERSIZE_STORAGE_DEFAULTS,
+        }
         rows, _summary = self.slotting.generate_basic(
             copy.deepcopy(self.building),
             [self.sku("FIRST", 2), self.sku("SECOND", 1)],
@@ -314,30 +589,36 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
         self.assertEqual(rows[0]["storage_area_type"], "STANDARD")
         self.assertEqual(rows[1]["assignment_status"], "ASSIGNED")
-        self.assertEqual(rows[1]["storage_area_type"], "OVERSIZE")
-        self.assertEqual(rows[0]["zone_storage_type"], "STANDARD")
-        self.assertEqual(rows[1]["zone_storage_type"], "STANDARD")
+        self.assertTrue(all(row["planned_storage_type"] == "STANDARD" for row in rows))
 
-    def test_known_oversize_uses_child_override_in_standard_parent_zone(self):
+    def test_known_oversize_uses_predefined_oversize_slot(self):
         local = copy.deepcopy(self.base_local)
-        local[self.slot_paths[1]] = dict(OVERSIZE_STORAGE_DEFAULTS)
+        local[self.slot_paths[1]] = {
+            "oversize_capable": True,
+            **OVERSIZE_STORAGE_DEFAULTS,
+        }
         rows, summary = self.slotting.generate_basic(
             copy.deepcopy(self.building),
             [
                 self.sku("NORMAL", 2),
-                self.sku("LARGE", 1, {"max_item_length": 17}),
+                self.sku("LARGE", 1, {"max_item_length": 26}),
             ],
             1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
         )
         large = next(row for row in rows if row["sku"] == "LARGE")
         self.assertEqual(large["assignment_status"], "ASSIGNED")
+        self.assertEqual(large["storage_location_address"], self.slot_paths[1])
         self.assertEqual(large["static_address"], self.slot_paths[1])
-        self.assertEqual(summary["zone_storage_types"], {"Z01": "MIXED"})
+        self.assertEqual(summary["zone_storage_types"], {
+            "Z01_OVERSIZE": "OVERSIZE",
+            "Z01_STANDARD": "STANDARD",
+        })
 
-    def test_chilled_standard_can_use_oversize_when_no_standard_chilled_slot_exists(self):
+    def test_chilled_standard_uses_replanned_standard_segment(self):
         local = copy.deepcopy(self.base_local)
         local[self.slot_paths[1]] = {
             "chilled": True,
+            "oversize_capable": True,
             **OVERSIZE_STORAGE_DEFAULTS,
         }
         rows, _summary = self.slotting.generate_basic(
@@ -346,39 +627,56 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
             1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
         )
         self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
-        self.assertEqual(rows[0]["storage_area_type"], "OVERSIZE")
+        self.assertEqual(rows[0]["planned_storage_type"], "STANDARD")
+        self.assertEqual(rows[0]["planned_zone_id"], "Z01_STANDARD")
 
-    def test_physical_requirements_create_child_overrides_not_unassigned_rows(self):
-        cases = (
-            (
-                self.sku("TOO_LONG", 1, {"max_item_length": 17}),
-                "max_item_length", 17,
-            ),
-            (
-                self.sku("TOO_HEAVY", 1, {"max_item_weight": 251}),
-                "max_item_weight", 251,
-            ),
+    def test_oversize_automatically_plans_a_dedicated_segment(self):
+        local = copy.deepcopy(self.base_local)
+        rows, summary = self.slotting.generate_basic(
+            copy.deepcopy(self.building),
+            [self.sku("TOO_LONG", 1, {"max_item_length": 26})],
+            1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
         )
-        for sku, key, expected_value in cases:
-            with self.subTest(key=key):
-                local = copy.deepcopy(self.base_local)
-                rows, _summary = self.slotting.generate_basic(
-                    copy.deepcopy(self.building), [sku], 1, 1, "AMR shelf",
-                    "Z01", self.zones, self.catalog, local,
-                )
-                self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
-                self.assertEqual(
-                    rows[0]["compatibility_status"], "COMPATIBLE_AUTO_OVERRIDE"
-                )
-                self.assertEqual(
-                    local[rows[0]["static_address"]][key], expected_value
-                )
+        self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
+        self.assertEqual(rows[0]["planned_storage_type"], "OVERSIZE")
+        self.assertEqual(rows[0]["planned_zone_id"], "Z01_OVERSIZE")
+        self.assertEqual(rows[0]["auto_attribute_overrides"]["max_item_length"], 26)
+        self.assertEqual(summary["auto_planned_oversize_segment_count"], 1)
+
+        heavy_rows, _summary = self.slotting.generate_basic(
+            copy.deepcopy(self.building),
+            [self.sku("TOO_HEAVY", 1, {"max_item_weight": 466})],
+            1, 1, "AMR shelf", "Z01", self.zones, self.catalog,
+            copy.deepcopy(self.base_local),
+        )
+        self.assertEqual(heavy_rows[0]["assignment_status"], "ASSIGNED")
+        self.assertEqual(
+            heavy_rows[0]["compatibility_status"], "COMPATIBLE_AUTO_OVERRIDE"
+        )
+
+        zero_weight_rows, _summary = self.slotting.generate_basic(
+            copy.deepcopy(self.building),
+            [self.sku("OVERSIZE_WEIGHT_OPT_OUT", 1, {
+                "max_item_length": 26,
+                "max_item_weight": 0,
+            })],
+            1, 1, "AMR shelf", "Z01", self.zones, self.catalog,
+            copy.deepcopy(self.base_local),
+        )
+        self.assertEqual(zero_weight_rows[0]["assignment_status"], "ASSIGNED")
+        self.assertEqual(
+            zero_weight_rows[0]["physical_missing_data_type"], "UNKNOWN_WEIGHT"
+        )
+        self.assertEqual(
+            zero_weight_rows[0]["physical_storage_class"],
+            "OVERSIZE",
+        )
 
         chilled_rows, _summary = self.slotting.generate_basic(
             copy.deepcopy(self.building),
             [self.sku(
                 "CHILLED_LARGE", 1,
-                {"max_item_length": 17, "chilled": True},
+                {"max_item_length": 26, "chilled": True},
             )],
             1, 1, "AMR shelf", "Z01", self.zones, self.catalog,
             copy.deepcopy(self.base_local),
@@ -386,6 +684,184 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         self.assertEqual(
             chilled_rows[0]["assignment_status"],
             "UNASSIGNED_NO_CHILLED_LOCATION",
+        )
+
+    def test_oversize_zone_can_leave_all_maximums_unbounded(self):
+        project = GridProject(
+            GridSpec(2, 1, 1, "oversize-zone", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (2, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        building = project.to_building_dict()
+        _level, racks, _workstations, _unreachable = self.slotting.rack_distances(
+            building
+        )
+        zones = {racks[0]["waypoint"]: "Z99"}
+        local = {"Z99": {
+            "chilled": False,
+            "oversize_capable": True,
+            **{key: None for key in STANDARD_STORAGE_DEFAULTS},
+        }}
+        rows, summary = self.slotting.generate_basic(
+            building,
+            [self.sku("OUTLIER", 1, {
+                "max_item_length": 1000,
+                "max_item_width": 900,
+                "max_item_height": 800,
+                "max_item_weight": 700,
+            })],
+            1, 1, "AMR shelf", "Z99", zones, self.catalog, local,
+        )
+        self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
+        self.assertEqual(rows[0]["storage_area_type"], "OVERSIZE")
+        self.assertEqual(rows[0]["auto_attribute_overrides"], {})
+        self.assertEqual(summary["unassigned_no_oversize_location_count"], 0)
+
+    def test_chilled_zone_is_automatically_split_for_oversize_inventory(self):
+        local = copy.deepcopy(self.base_local)
+        local["Z01"]["chilled"] = True
+        rows, summary = self.slotting.generate_basic(
+            copy.deepcopy(self.building),
+            [
+                self.sku("CHILLED_STANDARD", 100, {"chilled": True}),
+                {
+                    "sku": "CHILLED_UNKNOWN_SIZE",
+                    "pick_frequency": 1,
+                    "velocity_class": "A",
+                    "sku_requirements": {
+                        "chilled": True,
+                        "max_item_width": 6,
+                        "max_item_height": 7,
+                        "max_item_weight": 10,
+                    },
+                },
+            ],
+            1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
+        )
+        by_sku = {row["sku"]: row for row in rows}
+        self.assertEqual(
+            by_sku["CHILLED_UNKNOWN_SIZE"]["physical_missing_data_type"],
+            "UNKNOWN_SIZE",
+        )
+        self.assertLess(
+            by_sku["CHILLED_STANDARD"]["placement_rank"],
+            by_sku["CHILLED_UNKNOWN_SIZE"]["placement_rank"],
+        )
+        self.assertEqual(
+            by_sku["CHILLED_UNKNOWN_SIZE"]["storage_area_type"], "OVERSIZE"
+        )
+        self.assertEqual(
+            by_sku["CHILLED_STANDARD"]["storage_area_type"], "STANDARD"
+        )
+        self.assertNotEqual(
+            by_sku["CHILLED_UNKNOWN_SIZE"]["storage_location_address"],
+            by_sku["CHILLED_STANDARD"]["storage_location_address"],
+        )
+        self.assertNotEqual(
+            by_sku["CHILLED_UNKNOWN_SIZE"]["rack_id"],
+            by_sku["CHILLED_STANDARD"]["rack_id"],
+        )
+        self.assertEqual(
+            by_sku["CHILLED_STANDARD"]["planned_zone_id"],
+            "Z01_chill_normal",
+        )
+        self.assertEqual(
+            by_sku["CHILLED_UNKNOWN_SIZE"]["planned_zone_id"],
+            "Z01_chill_oversize",
+        )
+        self.assertTrue(
+            by_sku["CHILLED_STANDARD"]["static_address"].startswith(
+                "Z01_chill_normal/"
+            )
+        )
+        self.assertTrue(
+            by_sku["CHILLED_UNKNOWN_SIZE"]["static_address"].startswith(
+                "Z01_chill_oversize/"
+            )
+        )
+        self.assertLessEqual(
+            by_sku["CHILLED_STANDARD"]["average_workstation_distance_m"],
+            by_sku["CHILLED_UNKNOWN_SIZE"]["average_workstation_distance_m"],
+        )
+        self.assertEqual(summary["zone_storage_types"], {
+            "Z01_chill_normal": "STANDARD",
+            "Z01_chill_oversize": "OVERSIZE",
+        })
+
+    def test_ambient_planner_selects_nearby_whole_zone_without_mixing(self):
+        zones = {
+            self.racks[0]["waypoint"]: "Z01",
+            self.racks[1]["waypoint"]: "Z02",
+        }
+        local = {
+            "Z01": {"chilled": False, **STANDARD_STORAGE_DEFAULTS},
+            "Z02": {"chilled": False, **STANDARD_STORAGE_DEFAULTS},
+        }
+        rows, summary = self.slotting.generate_basic(
+            copy.deepcopy(self.building),
+            [
+                self.sku("AMBIENT_STANDARD", 100),
+                self.sku("AMBIENT_OUTLIER", 1, {"max_item_length": 26}),
+            ],
+            1, 1, "AMR shelf", "Z01", zones, self.catalog, local,
+        )
+        by_sku = {row["sku"]: row for row in rows}
+        self.assertEqual(by_sku["AMBIENT_OUTLIER"]["planned_storage_type"], "OVERSIZE")
+        self.assertEqual(by_sku["AMBIENT_STANDARD"]["planned_storage_type"], "STANDARD")
+        self.assertNotEqual(
+            by_sku["AMBIENT_OUTLIER"]["zone_id"],
+            by_sku["AMBIENT_STANDARD"]["zone_id"],
+        )
+        self.assertLessEqual(
+            by_sku["AMBIENT_STANDARD"]["average_workstation_distance_m"],
+            by_sku["AMBIENT_OUTLIER"]["average_workstation_distance_m"],
+        )
+        self.assertNotIn("MIXED", summary["zone_storage_types"].values())
+
+    def test_auto_planning_overwrites_segment_capacity_for_outlier(self):
+        local = copy.deepcopy(self.base_local)
+        local[self.slot_paths[0]] = {
+            "oversize_capable": True,
+            **OVERSIZE_STORAGE_DEFAULTS,
+            "max_item_length": 16,
+        }
+        rows, _summary = self.slotting.generate_basic(
+            copy.deepcopy(self.building),
+            [self.sku("TOO_LONG_FOR_OUTLIER_SLOT", 1, {
+                "max_item_length": 151,
+                "max_item_width": 51,
+                "max_item_height": 96,
+            })],
+            1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
+        )
+        self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
+        self.assertEqual(
+            rows[0]["auto_attribute_overrides"]["max_item_length"], 151
+        )
+
+    def test_swap_cannot_move_oversize_sku_into_standard_slot(self):
+        local = copy.deepcopy(self.base_local)
+        local[self.slot_paths[1]] = {
+            "oversize_capable": True,
+            **OVERSIZE_STORAGE_DEFAULTS,
+        }
+        rows, _summary = self.slotting.generate_basic(
+            copy.deepcopy(self.building),
+            [
+                self.sku("STANDARD", 2),
+                self.sku("OVERSIZE", 1, {"max_item_length": 26}),
+            ],
+            1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
+        )
+        before = [row["storage_location_address"] for row in rows]
+        with self.assertRaisesRegex(ValueError, "reserved|not predefined"):
+            self.inventory.swap_sku_slots(
+                rows, "STANDARD", "OVERSIZE", self.catalog, local
+            )
+        self.assertEqual(
+            [row["storage_location_address"] for row in rows], before
         )
 
     def test_chilled_csv_merge_validation_and_exclusivity(self):
@@ -474,12 +950,12 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
             )
         self.assertEqual([row["static_address"] for row in rows], before)
 
-    def test_sku_swap_applies_soft_target_override(self):
+    def test_sku_swap_cannot_move_overweight_item_to_standard_segment(self):
         local = copy.deepcopy(self.base_local)
         rows, _summary = self.slotting.generate_basic(
             copy.deepcopy(self.building),
             [
-                self.sku("HEAVY", 2, {"max_item_weight": 300}),
+                self.sku("HEAVY", 2, {"max_item_weight": 500}),
                 self.sku("NORMAL", 1),
             ],
             1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
@@ -487,13 +963,11 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         heavy = self.inventory.find_sku(rows, "HEAVY")
         normal = self.inventory.find_sku(rows, "NORMAL")
         target = normal["static_address"]
-        self.inventory.swap_sku_slots(
-            rows, "HEAVY", "NORMAL", self.catalog, local
-        )
-        self.assertEqual(local[target]["max_item_weight"], 300)
-        self.assertEqual(
-            heavy["compatibility_status"], "COMPATIBLE_AUTO_OVERRIDE"
-        )
+        with self.assertRaisesRegex(ValueError, "not predefined|reserved"):
+            self.inventory.swap_sku_slots(
+                rows, "HEAVY", "NORMAL", self.catalog, local
+            )
+        self.assertNotIn("max_item_weight", local.get(target, {}))
 
     def test_invalid_whole_shelf_swap_is_atomic(self):
         rows, local = self._compatible_swap_layout()

@@ -2,10 +2,11 @@
   "schema": "rmf_grid_map_editor/v2",
   "grid": {
     "width_m": 20.0,
-    "length_m": 15.0,
-    "spacing_m": 1.0,
+    "length_m": 14.0,
+    "spacing_m": 1,
     "map_name": "warehouse_grid",
-    "level_name": "L1"
+    "level_name": "L1",
+    "spacing_y_m": 1.0
   },
   "markers": [
     {
@@ -873,126 +874,42 @@
       "endpoint_id": "RACK_20_11"
     },
     {
-      "column": 0,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_0_12"
-    },
-    {
       "column": 2,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_2_12"
-    },
-    {
-      "column": 3,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_3_12"
-    },
-    {
-      "column": 5,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_5_12"
+      "row": 14,
+      "role": "workstation",
+      "endpoint_id": "WS_2_14"
     },
     {
       "column": 6,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_6_12"
-    },
-    {
-      "column": 8,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_8_12"
-    },
-    {
-      "column": 9,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_9_12"
-    },
-    {
-      "column": 11,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_11_12"
-    },
-    {
-      "column": 12,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_12_12"
-    },
-    {
-      "column": 14,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_14_12"
-    },
-    {
-      "column": 15,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_15_12"
-    },
-    {
-      "column": 17,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_17_12"
-    },
-    {
-      "column": 18,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_18_12"
-    },
-    {
-      "column": 20,
-      "row": 12,
-      "role": "rack",
-      "endpoint_id": "RACK_20_12"
-    },
-    {
-      "column": 2,
-      "row": 15,
+      "row": 14,
       "role": "workstation",
-      "endpoint_id": "WS_2_15"
-    },
-    {
-      "column": 6,
-      "row": 15,
-      "role": "workstation",
-      "endpoint_id": "WS_6_15"
+      "endpoint_id": "WS_6_14"
     },
     {
       "column": 10,
-      "row": 15,
+      "row": 14,
       "role": "workstation",
-      "endpoint_id": "WS_10_15"
+      "endpoint_id": "WS_10_14"
     },
     {
       "column": 14,
-      "row": 15,
+      "row": 14,
       "role": "workstation",
-      "endpoint_id": "WS_14_15"
+      "endpoint_id": "WS_14_14"
     },
     {
       "column": 18,
-      "row": 15,
+      "row": 14,
       "role": "workstation",
-      "endpoint_id": "WS_18_15"
+      "endpoint_id": "WS_18_14"
     }
   ],
   "storage_layout": {
     "system_type": "AMR",
     "buffer_level": "grid",
     "handling_unit_type": "AMR shelf",
-    "levels_per_rack": 3,
-    "slots_per_level": 4,
+    "levels_per_rack": 1,
+    "slots_per_level": 6,
     "buffers": [
       {
         "buffer_id": "B-G0_0",
@@ -2287,132 +2204,6 @@
         "row": 11,
         "grid_waypoint": "G20_11",
         "rack_endpoint_id": "RACK_20_11",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G0_12",
-        "column": 0,
-        "row": 12,
-        "grid_waypoint": "G0_12",
-        "rack_endpoint_id": "RACK_0_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G2_12",
-        "column": 2,
-        "row": 12,
-        "grid_waypoint": "G2_12",
-        "rack_endpoint_id": "RACK_2_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G3_12",
-        "column": 3,
-        "row": 12,
-        "grid_waypoint": "G3_12",
-        "rack_endpoint_id": "RACK_3_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G5_12",
-        "column": 5,
-        "row": 12,
-        "grid_waypoint": "G5_12",
-        "rack_endpoint_id": "RACK_5_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G6_12",
-        "column": 6,
-        "row": 12,
-        "grid_waypoint": "G6_12",
-        "rack_endpoint_id": "RACK_6_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G8_12",
-        "column": 8,
-        "row": 12,
-        "grid_waypoint": "G8_12",
-        "rack_endpoint_id": "RACK_8_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G9_12",
-        "column": 9,
-        "row": 12,
-        "grid_waypoint": "G9_12",
-        "rack_endpoint_id": "RACK_9_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G11_12",
-        "column": 11,
-        "row": 12,
-        "grid_waypoint": "G11_12",
-        "rack_endpoint_id": "RACK_11_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G12_12",
-        "column": 12,
-        "row": 12,
-        "grid_waypoint": "G12_12",
-        "rack_endpoint_id": "RACK_12_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G14_12",
-        "column": 14,
-        "row": 12,
-        "grid_waypoint": "G14_12",
-        "rack_endpoint_id": "RACK_14_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G15_12",
-        "column": 15,
-        "row": 12,
-        "grid_waypoint": "G15_12",
-        "rack_endpoint_id": "RACK_15_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G17_12",
-        "column": 17,
-        "row": 12,
-        "grid_waypoint": "G17_12",
-        "rack_endpoint_id": "RACK_17_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G18_12",
-        "column": 18,
-        "row": 12,
-        "grid_waypoint": "G18_12",
-        "rack_endpoint_id": "RACK_18_12",
-        "buffer_level": "grid",
-        "status": "EMPTY"
-      },
-      {
-        "buffer_id": "B-G20_12",
-        "column": 20,
-        "row": 12,
-        "grid_waypoint": "G20_12",
-        "rack_endpoint_id": "RACK_20_12",
         "buffer_level": "grid",
         "status": "EMPTY"
       }

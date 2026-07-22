@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from .attributes import StorageAttributeService
+from .attributes import (
+    OVERSIZE_CAPABLE_KEY,
+    PHYSICAL_DIMENSION_KEYS,
+    PHYSICAL_WEIGHT_KEY,
+    StorageAttributeService,
+)
 from .slotting import SlottingService
 
 
@@ -10,7 +15,8 @@ class InventoryService:
     """Search assignments and apply SKU-slot or AMR-shelf swaps."""
 
     LOCATION_FIELDS = (
-        "static_address", "rmf_grid_address", "zone_id", "aisle_id",
+        "static_address", "storage_location_address", "buffer_id", "buffer_level",
+        "rmf_grid_address", "zone_id", "aisle_id",
         "static_bay_id", "rack_id", "rack_waypoint", "pickup_dispenser_id",
         "rack_vertex_index", "rack_rank", "handling_unit_type",
         "handling_unit_id", "dynamic_address_level", "dynamic_address",
@@ -18,7 +24,8 @@ class InventoryService:
         "average_workstation_distance_m", "routing_status",
     )
     STATIC_PROFILE_FIELDS = (
-        "rmf_grid_address", "zone_id", "aisle_id", "static_bay_id", "rack_id",
+        "rmf_grid_address", "zone_id", "aisle_id", "static_bay_id", "buffer_id",
+        "buffer_level", "rack_id",
         "rack_waypoint", "pickup_dispenser_id", "rack_vertex_index", "rack_rank",
         "workstations_evaluated", "average_workstation_distance_m",
         "routing_status",
@@ -61,12 +68,20 @@ class InventoryService:
         second = self.find_sku(rows, second_sku)
         if first is second:
             raise ValueError("select two different SKUs")
+        if any(
+            int(row.get("occupied_slot_count") or 1) > 1
+            for row in (first, second)
+        ):
+            raise ValueError(
+                "manual SKU swaps do not support multi-slot inventory; "
+                "regenerate the layout with the slotting pipeline"
+            )
         first_validation = self._validate_target(
-            first, str(second.get("static_address", "")),
+            first, str(second.get("storage_location_address") or second.get("static_address", "")),
             attribute_catalog, location_attributes,
         )
         second_validation = self._validate_target(
-            second, str(first.get("static_address", "")),
+            second, str(first.get("storage_location_address") or first.get("static_address", "")),
             attribute_catalog, location_attributes,
         )
         self._apply_location_overrides(
@@ -127,6 +142,14 @@ class InventoryService:
             for row in first_rows + second_rows
         ):
             raise ValueError("whole-shelf swap is only available for AMR shelf layouts")
+        if any(
+            int(row.get("occupied_slot_count") or 1) > 1
+            for row in first_rows + second_rows
+        ):
+            raise ValueError(
+                "manual shelf swaps do not support multi-slot inventory; "
+                "regenerate the layout with the traffic-aware pipeline"
+            )
 
         first_profile = self._static_profile(first_rows[0])
         second_profile = self._static_profile(second_rows[0])
@@ -188,6 +211,44 @@ class InventoryService:
                 f"SKU {row.get('sku', '')} is incompatible with {target_address}: "
                 + "; ".join(hard_issues)
             )
+        if self.attributes.has_physical_catalog(attribute_catalog):
+            profile = self.attributes.physical_profile(requirements)
+            exception_inventory = str(
+                profile.get("storage_class", "STANDARD")
+            ).upper() != "STANDARD"
+            oversize_location = effective.get(OVERSIZE_CAPABLE_KEY) is True
+            if exception_inventory and not oversize_location:
+                raise ValueError(
+                    f"SKU {row.get('sku', '')} is incompatible with {target_address}: "
+                    "location is not predefined for oversized inventory"
+                )
+            if not exception_inventory and oversize_location:
+                raise ValueError(
+                    f"SKU {row.get('sku', '')} is incompatible with {target_address}: "
+                    "oversize-capable storage is reserved for oversized inventory"
+                )
+            if exception_inventory:
+                dimensions_known = all(
+                    key in profile.get("values", {})
+                    for key in PHYSICAL_DIMENSION_KEYS
+                )
+                if dimensions_known and self.slotting.required_slot_footprint(
+                    requirements, effective, 1, 1
+                ) is None:
+                    raise ValueError(
+                        f"SKU {row.get('sku', '')} is incompatible with "
+                        f"{target_address}: item dimensions exceed the configured "
+                        "oversize location"
+                    )
+                required_weight = float(requirements.get(PHYSICAL_WEIGHT_KEY, 0) or 0)
+                if required_weight > self.attributes.physical_capacity(
+                    effective, PHYSICAL_WEIGHT_KEY
+                ):
+                    raise ValueError(
+                        f"SKU {row.get('sku', '')} is incompatible with "
+                        f"{target_address}: item weight exceeds the configured "
+                        "oversize location"
+                    )
         overrides = self.attributes.required_local_overrides(
             requirements, effective, attribute_catalog
         )
@@ -235,10 +296,20 @@ class InventoryService:
         row.update(profile)
         level = int(row.get("storage_level") or 1)
         slot = int(row.get("storage_slot") or 1)
-        row["static_address"] = (
+        row["storage_location_address"] = (
             f"{row['zone_id']}/{row['aisle_id']}/{row['static_bay_id']}"
             f"/L{level:02d}/S{slot:02d}"
         )
+        buffer_model = bool(row.get("buffer_id"))
+        if buffer_model:
+            row["buffer_id"] = row["static_bay_id"]
+            row["static_address"] = (
+                f"{row['zone_id']}/{row['aisle_id']}/{row['buffer_id']}"
+            )
+            row["occupied_buffer_ids"] = [row["buffer_id"]]
+            row["occupied_static_addresses"] = [row["static_address"]]
+        else:
+            row["static_address"] = row["storage_location_address"]
         row["dynamic_address"], row["dynamic_address_level"] = (
             self.slotting.build_dynamic_address(
                 row["zone_id"],
@@ -248,5 +319,6 @@ class InventoryService:
                 slot,
                 row.get("handling_unit_type", "AMR shelf"),
                 row["handling_unit_id"],
+                buffer_model=buffer_model,
             )
         )
