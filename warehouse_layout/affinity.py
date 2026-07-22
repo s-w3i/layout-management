@@ -297,12 +297,15 @@ class AffinityAnalysis:
                 coverage_fraction = float(
                     coverage_grid[support_position, score_position]
                 ) / max(1, related_sku_count)
-                # Distance to the ideal sparse graph that preserves all useful
-                # affinity mass and SKU coverage. The user-selected affinity
-                # weight controls preservation versus sparsity.
+                # Distance to a sparse graph that still preserves useful
+                # affinity mass and SKU coverage. Sparsity always retains a
+                # minimum influence; otherwise 100% affinity selects nearly
+                # every positive edge and destroys meaningful clusters.
+                sparsity_weight = max(0.25, 1.0 - affinity_weight)
+                preservation_weight = 1.0 - sparsity_weight
                 loss = math.sqrt(
-                    (1.0 - affinity_weight) * edge_fraction**2
-                    + affinity_weight
+                    sparsity_weight * edge_fraction**2
+                    + preservation_weight
                     * (
                         (1.0 - mass_fraction) ** 2
                         + (1.0 - coverage_fraction) ** 2
@@ -329,6 +332,7 @@ class AffinityAnalysis:
             ),
         )
         recommendation["method"] = "empirical_relationship_pareto_knee"
+        recommendation["minimum_sparsity_weight"] = 0.25
         recommendation["candidate_support_count"] = len(support_candidates)
         recommendation["candidate_score_count"] = len(score_candidates)
         recommendation["active_affinity_sku_count"] = len(indices)

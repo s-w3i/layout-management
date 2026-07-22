@@ -83,17 +83,23 @@ own data.
 
 The `abc_affinity` strategy keeps physical compatibility, temperature
 compatibility, and capacity as eligibility rules. Affinity and ABC grouping are
-competing soft objectives: 0% preserves ABC bay purity, while 100% prioritizes
-placing strongly related SKUs in the same bay and uses ABC only as a tie-breaker.
-For AMR shelves, same-bay placement can reduce the number of shelf pickups needed
-to satisfy related order lines. The user chooses only the strategy and affinity
-weight for the initial run. The service then derives the
+competing soft objectives: 0% is pure ABC placement, while 100% is pure affinity
+placement with ABC excluded from ordering, scoring, and tie-breaking.
+For AMR shelves, each `(Store ID, Date)` is treated as one fulfillment group.
+Candidate racks are scored by how many of that SKU's groups already require the
+rack, directly reducing incremental distinct-rack touches. The user chooses only
+the strategy and affinity weight for the initial run. The service then derives the
 minimum shared store-days and affinity score from empirical quantiles of the
 current workbook's relationships. It derives service-distance allowance
 candidates from the current warehouse map and selects a candidate from the
 relationship confidence and chosen affinity weight. The result is compared
 against the basic baseline. These recommendations are displayed after
 generation and can be edited for a subsequent regeneration.
+
+The relationship selector always retains a sparsity penalty, including at 100%
+affinity, so a near-complete graph of weak relationships cannot erase meaningful
+clusters. Output rows expose both `abc_frequency_rank` and
+`affinity_placement_rank`.
 
 ## Common errors
 

@@ -31,6 +31,7 @@ from .affinity_support import (
     affinity_physical_signature,
     affinity_placement_order,
     build_affinity_neighbors,
+    build_order_membership_masks,
 )
 
 
@@ -248,6 +249,9 @@ def allocate(
             str(row.get("sku", "")),
         ),
     )
+    abc_rank_by_id = {
+        id(row): rank for rank, row in enumerate(base_sorted_skus, start=1)
+    }
     affinity_neighbors: dict[str, list[tuple[str, float, float, int]]] = {}
     if affinity_enabled and affinity_analysis is not None:
         affinity_neighbors = precomputed_affinity_neighbors or (
@@ -258,14 +262,24 @@ def allocate(
                 minimum_affinity_score,
             )
         )
+    order_membership_masks = {}
+    if affinity_enabled and affinity_analysis is not None:
+        order_membership_masks, _order_group_count = build_order_membership_masks(
+            affinity_analysis,
+            {str(row.get("sku", "")) for row in sku_rows},
+        )
     logical_sorted_skus = (
         affinity_placement_order(
-            base_sorted_skus, affinity_neighbors, affinity_weight
+            base_sorted_skus,
+            affinity_neighbors,
+            affinity_weight,
+            order_membership_masks,
+            levels_per_rack * slots_per_level,
         )
         if affinity_enabled
         else base_sorted_skus
     )
-    sku_rank_by_id = {
+    affinity_rank_by_id = {
         id(row): rank for rank, row in enumerate(logical_sorted_skus, start=1)
     }
 
@@ -300,7 +314,7 @@ def allocate(
                     if isinstance(row.get("sku_requirements"), dict)
                     else service.attributes.requirements_from_row(row, catalog)
                 )["storage_class"] != "STANDARD",
-                sku_rank_by_id[id(row)],
+                affinity_rank_by_id[id(row)],
             ),
         )
     else:
@@ -342,7 +356,13 @@ def allocate(
     rack_state: dict[str, dict] = {}
     assigned_affinity_positions: dict[str, dict] = {}
     for placement_rank, sku in enumerate(sorted_skus, start=1):
-        sku_rank = sku_rank_by_id.get(id(sku), placement_rank)
+        abc_frequency_rank = abc_rank_by_id.get(id(sku), placement_rank)
+        affinity_placement_rank = affinity_rank_by_id.get(
+            id(sku), placement_rank
+        )
+        sku_rank = abc_frequency_rank
+        current_sku = str(sku.get("sku", ""))
+        current_order_mask = order_membership_masks.get(current_sku, 0)
         requirements = sku.get("sku_requirements")
         if not isinstance(requirements, dict):
             requirements = service.attributes.requirements_from_row(sku, catalog)
@@ -550,19 +570,26 @@ def allocate(
                             # Unknown physical properties become unbounded
                             # planning assumptions on this generated segment.
                             overrides[key] = None
+                candidate_key = allocation_candidate_key(
+                    candidate,
+                    profile,
+                    physical_grouping_enabled,
+                    str(sku.get("velocity_class", "")).upper(),
+                    overrides,
+                    rack_state,
+                    levels_per_rack,
+                    occupied_positions,
+                    ergonomic_weight_heuristic,
+                    auto_plan_oversize,
+                )
+                if affinity_enabled and affinity_weight >= 1.0:
+                    # At the pure-affinity endpoint ABC class must not affect
+                    # placement, even for isolated SKUs or affinity ties.
+                    candidate_key = (
+                        *candidate_key[:4], 0, *candidate_key[5:]
+                    )
                 hard_candidates.append((
-                    allocation_candidate_key(
-                        candidate,
-                        profile,
-                        physical_grouping_enabled,
-                        str(sku.get("velocity_class", "")).upper(),
-                        overrides,
-                        rack_state,
-                        levels_per_rack,
-                        occupied_positions,
-                        ergonomic_weight_heuristic,
-                        auto_plan_oversize,
-                    ),
+                    candidate_key,
                     index,
                     candidate,
                     overrides,
@@ -573,14 +600,17 @@ def allocate(
                     hard_candidates, key=lambda item: item[0]
                 )
                 selected_candidate = baseline_candidate
-                current_sku = str(sku.get("sku", ""))
                 related_assigned = [
                     (related_sku, weight, assigned_affinity_positions[related_sku])
                     for related_sku, weight, _score, _shared
                     in affinity_neighbors.get(current_sku, [])
                     if related_sku in assigned_affinity_positions
                 ]
-                if affinity_enabled and affinity_weight > 0 and related_assigned:
+                if (
+                    affinity_enabled
+                    and affinity_weight > 0
+                    and current_order_mask
+                ):
                     baseline_key = baseline_candidate[0]
                     physical_signature = affinity_physical_signature(
                         baseline_key
@@ -595,7 +625,9 @@ def allocate(
                         minimum_service_reference,
                     )
                     service_limit = (
-                        baseline_service
+                        math.inf
+                        if affinity_weight >= 1.0
+                        else baseline_service
                         + maximum_service_distance_increase * service_reference
                         if math.isfinite(baseline_service)
                         else math.inf
@@ -637,14 +669,20 @@ def allocate(
                             [float(item[1]) for item in related_assigned],
                             dtype=np.float64,
                         )
-                        pair_distances = np.linalg.norm(
-                            candidate_coordinates[:, None, :]
-                            - related_coordinates[None, :, :],
-                            axis=2,
-                        ) * coordinate_scale
+                        pair_distances = (
+                            np.linalg.norm(
+                                candidate_coordinates[:, None, :]
+                                - related_coordinates[None, :, :],
+                                axis=2,
+                            ) * coordinate_scale
+                            if related_assigned
+                            else np.zeros((len(eligible), 0), dtype=np.float64)
+                        )
                         affinity_distances = (
-                            pair_distances @ relationship_weights
-                        ) / float(relationship_weights.sum())
+                            (pair_distances @ relationship_weights)
+                            / float(relationship_weights.sum())
+                            if related_assigned else np.zeros(len(eligible))
+                        )
                         candidate_rack_ids = np.array(
                             [str(item[2]["rack_id"]) for item in eligible]
                         )
@@ -654,29 +692,40 @@ def allocate(
                         different_bay = (
                             candidate_rack_ids[:, None]
                             != related_rack_ids[None, :]
+                            if related_assigned
+                            else np.zeros((len(eligible), 0), dtype=bool)
                         )
                         normalized_affinity_distances = (
                             affinity_distances / maximum_rack_distance
                         )
                         different_bay_fractions = (
-                            different_bay.astype(np.float64)
-                            @ relationship_weights
-                        ) / float(relationship_weights.sum())
+                            (different_bay.astype(np.float64) @ relationship_weights)
+                            / float(relationship_weights.sum())
+                            if related_assigned else np.ones(len(eligible))
+                        )
                         same_bay_fractions = 1.0 - different_bay_fractions
                         scores = []
                         for candidate_number, candidate_record in enumerate(eligible):
                             service_distance = float(
                                 candidate_record[2]["distance_m"]
                             )
-                            candidate_abc_cost = float(
-                                candidate_record[0][3]
-                            )
-                            candidate_affinity_cost = float(
-                                different_bay_fractions[candidate_number]
+                            candidate_abc_cost = float(candidate_record[0][3])
+                            rack_order_mask = rack_state.get(
+                                str(candidate_record[2]["rack_id"]), {}
+                            ).get("order_mask", 0)
+                            covered_orders = (
+                                current_order_mask & rack_order_mask
+                            ).bit_count()
+                            candidate_affinity_cost = 1.0 - (
+                                covered_orders / current_order_mask.bit_count()
                             )
                             combined = (
                                 (1.0 - affinity_weight) * candidate_abc_cost
                                 + affinity_weight * candidate_affinity_cost
+                            )
+                            abc_tiebreak_cost = (
+                                candidate_abc_cost
+                                if affinity_weight < 1.0 else 0.0
                             )
                             scores.append((
                                 combined,
@@ -686,7 +735,7 @@ def allocate(
                                         candidate_number
                                     ]
                                 ),
-                                candidate_abc_cost,
+                                abc_tiebreak_cost,
                                 service_distance,
                                 candidate_record[0],
                                 candidate_number,
@@ -745,8 +794,10 @@ def allocate(
                         "velocity_classes": set(),
                         "physical_buckets": set(),
                         "has_oversize": False,
+                        "order_mask": 0,
                     },
                 )
+                selected_state["order_mask"] |= current_order_mask
                 selected_state["velocity_classes"].add(
                     str(sku.get("velocity_class", "")).upper()
                 )
@@ -818,6 +869,8 @@ def allocate(
             compatibility_status = "NOT_EVALUATED"
         row = {
             "sku_rank": sku_rank,
+            "abc_frequency_rank": abc_frequency_rank,
+            "affinity_placement_rank": affinity_placement_rank,
             "placement_rank": placement_rank,
             "placement_priority_group": (
                 "STANDARD_FIRST" if not exception_inventory else "OVERSIZE_LAST"
@@ -877,6 +930,18 @@ def allocate(
             ),
             "occupied_storage_location_addresses": (
                 [item["storage_location_address"] for item in occupied_positions]
+                if position else []
+            ),
+            "occupied_handling_units": (
+                [
+                    {
+                        "handling_unit_id": item["handling_unit_id"],
+                        "rack_id": item["rack_id"],
+                        "storage_level": item["level"],
+                        "storage_slot": item["slot"],
+                    }
+                    for item in occupied_positions
+                ]
                 if position else []
             ),
         }

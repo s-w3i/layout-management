@@ -46,6 +46,15 @@ def main() -> None:
         "● Chilled rack",
         "● Workstation",
     ]
+    assert [label.cget("text") for label in app.slot_dot_legend_labels] == [
+        "● A movement unit", "● B movement unit", "● C movement unit",
+        "● Unranked unit",
+        "◆ Workstation",
+    ]
+    assert [label.cget("text") for label in app.ops_dot_legend_labels] == [
+        "● A movement unit", "● B movement unit", "● C movement unit",
+        "● Unranked unit", "◆ Workstation",
+    ]
     assert set(app.grid_sidebar_sections) == {
         "grid", "tools", "point", "buffers", "settings", "files"
     }
@@ -335,8 +344,15 @@ def main() -> None:
         app.run_slotting()
         root.update_idletasks()
         assert layout_path.exists()
+        assert app.slot_progress_value.get() == 100
+        assert app.slot_progress_text.get() == "Complete"
         assert "Viewing generated layout:" in app.slot_viewer_status.get()
         assert app.slot_canvas.find_withtag("rack")
+        assert len(app.slot_canvas.find_withtag("slot_zone_boundary")) == 1
+        assert [
+            app.slot_canvas.itemcget(item, "text")
+            for item in app.slot_canvas.find_withtag("slot_zone_label")
+        ] == ["Z01"]
         assert all(
             row["dynamic_address_level"] == "shelf_slot"
             for row in assigned_rows(app.slot_rows)
@@ -348,6 +364,26 @@ def main() -> None:
         saved_payload = app.layouts.load(layout_path)
         assert saved_payload["schema"] == "inventory_slotting_layout/v2"
         assert saved_payload["location_attributes"][special_slot]["chilled"] is True
+        app.show_unassigned_slotting_rows([{
+            "sku": "REJECTED_CHILLED",
+            "assignment_status": "UNASSIGNED_NO_CHILLED_LOCATION",
+            "sku_requirements": {
+                "chilled": True,
+                "max_item_length": 40,
+                "max_item_width": 30,
+                "max_item_height": 20,
+                "max_item_weight": 50,
+            },
+            "physical_data_status": "VERIFIED",
+            "compatibility_issues": [],
+        }])
+        rejected_values = app.slot_unassigned_tree.item(
+            app.slot_unassigned_tree.get_children()[0], "values"
+        )
+        assert rejected_values == (
+            "REJECTED_CHILLED", "Yes", "40 × 30 × 20", "50",
+            "VERIFIED", "No chilled storage location",
+        )
 
         # ABC + affinity: calculate workbook/map-specific values, expose them,
         # then accept an edited regeneration and persist both input and tuning.
@@ -514,6 +550,13 @@ def main() -> None:
             gui.filedialog.askopenfilename = original_open_dialog
         assert "Viewing saved layout:" in app.slot_viewer_status.get()
         assert app.slot_location_attributes[special_slot]["chilled"] is True
+        app.slot_history_path.set(str(slot_affinity_path))
+        app.calculate_slot_movement_ranks()
+        root.update_idletasks()
+        assert app.slot_movement_summary["grouping"] == "Store ID + Date"
+        assert app.slot_movement_summary["ranking_level"] == "shelf"
+        assert app.slot_movement_by_unit
+        assert "ranked at shelf level" in app.slot_movement_status.get()
         app.draw_slotting_layout()
         first_assignment = assigned_rows(app.slot_rows)[0]
         selected_bay_path = first_assignment["storage_location_address"].rsplit("/L", 1)[0]
@@ -544,6 +587,9 @@ def main() -> None:
         assert "Attributes:" in zone_detail
         assert "Static grid rack" not in zone_detail
         assert "Static grid rack" in rack_detail
+        assert "Shelf movement: class" in rack_detail
+        assert "Store ID + Date visits" in rack_detail
+        assert "Rack pick-frequency ABC:" in rack_detail
         assert "Overrides:" in rack_detail
         assert "Effective bay attributes" not in rack_detail
         override_line = next(
@@ -557,7 +603,7 @@ def main() -> None:
         slot_row = next(
             row
             for row in assigned_rows(app.slot_rows)
-            if row["sku"] == app.slot_tree.item(slot_item, "values")[1]
+            if row["sku"] == app.slot_tree.item(slot_item, "values")[2]
         )
         assert app.sku_storage_flags(slot_row) in app.slot_tree.item(
             slot_item, "values"
@@ -588,6 +634,18 @@ def main() -> None:
         app.ops_layout_path.set(str(layout_path))
         app.load_ops_layout()
         root.update_idletasks()
+        app.ops_history_path.set(str(slot_affinity_path))
+        app.calculate_ops_movement_ranks()
+        root.update_idletasks()
+        assert app.ops_movement_summary["grouping"] == "Store ID + Date"
+        assert app.ops_movement_summary["ranking_level"] == "shelf"
+        assert app.ops_movement_by_unit
+        assert "ranked at shelf level" in app.ops_movement_status.get()
+        assert len(app.ops_canvas.find_withtag("ops_zone_boundary")) == 1
+        assert [
+            app.ops_canvas.itemcget(item, "text")
+            for item in app.ops_canvas.find_withtag("ops_zone_label")
+        ] == ["Z01"]
         operation_rows = assigned_rows(app.ops_rows)
         assert operation_rows
         special_row = next(
@@ -623,7 +681,9 @@ def main() -> None:
             if f"opsrack:{operation_rows[0]['rack_id']}" in app.ops_canvas.gettags(item)
         )
         app.ops_canvas.addtag_withtag("current", ops_rack_item)
+        details_before_rack_click = app.ops_details.get()
         app.ops_rack_click(SimpleNamespace())
+        assert app.ops_details.get() == details_before_rack_click
         assert app.ops_inventory_tree.get_children()
         for item, row in app.ops_inventory_rows.items():
             assert app.sku_storage_flags(row) in app.ops_inventory_tree.item(
@@ -682,6 +742,8 @@ def main() -> None:
         app.execute_ops_swap()
         assert source["static_address"] == target_address
         assert target["static_address"] == source_address
+        assert app.ops_movement_by_unit
+        assert "ranked at shelf level" in app.ops_movement_status.get()
 
         app.ops_swap_mode.set("Whole shelf")
         app.ops_swap_mode_changed()
@@ -723,7 +785,11 @@ def main() -> None:
         saved_path = temp / "saved-operations.slotting.json"
         gui.filedialog.asksaveasfilename = lambda **_kwargs: str(saved_path)
         app.save_ops_layout()
-        assert app.layouts.load(saved_path)["operation_log"]
+        saved_operations = app.layouts.load(saved_path)
+        assert saved_operations["operation_log"]
+        assert saved_operations["sources"]["movement_order_workbook"] == str(
+            slot_affinity_path.resolve()
+        )
 
     root.destroy()
     if errors:

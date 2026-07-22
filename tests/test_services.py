@@ -95,6 +95,60 @@ class WarehouseServiceTests(unittest.TestCase):
             "C_SKU", "B_SKU",
         ])
 
+    def test_handling_unit_visits_rank_shelves_and_asrs_slots_by_store_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _path, analysis = self.affinity_analysis(directory)
+
+        amr_rows = [
+            {
+                "sku": "SKU_00", "assignment_status": "ASSIGNED",
+                "rack_id": "R1", "handling_unit_id": "SHELF_1",
+                "storage_level": 1, "storage_slot": 1,
+            },
+            {
+                "sku": "SKU_01", "assignment_status": "ASSIGNED",
+                "rack_id": "R1", "handling_unit_id": "SHELF_1",
+                "storage_level": 1, "storage_slot": 2,
+            },
+            {
+                "sku": "SKU_02", "assignment_status": "ASSIGNED",
+                "rack_id": "R2", "handling_unit_id": "SHELF_2",
+                "storage_level": 1, "storage_slot": 1,
+            },
+        ]
+        shelf_metrics = self.slotting.handling_unit_visit_metrics(
+            analysis, amr_rows, "AMR shelf"
+        )
+        shelf_visits = {
+            row["handling_unit_id"]: row["visit_count"]
+            for row in shelf_metrics["units"]
+        }
+        self.assertEqual(shelf_metrics["grouping"], "Store ID + Date")
+        self.assertEqual(shelf_metrics["ranking_level"], "shelf")
+        self.assertEqual(shelf_metrics["fulfillment_group_count"], 8)
+        self.assertEqual(shelf_visits, {"SHELF_1": 8, "SHELF_2": 3})
+
+        asrs_rows = copy.deepcopy(amr_rows)
+        for index, row in enumerate(asrs_rows, start=1):
+            row["handling_unit_id"] = f"TOTE_{index}"
+            row["occupied_handling_units"] = [{
+                "handling_unit_id": f"TOTE_{index}",
+                "rack_id": row["rack_id"],
+                "storage_level": 1,
+                "storage_slot": index,
+            }]
+        slot_metrics = self.slotting.handling_unit_visit_metrics(
+            analysis, asrs_rows, "Tote"
+        )
+        self.assertEqual(slot_metrics["ranking_level"], "slot")
+        self.assertEqual(
+            [row["visit_count"] for row in slot_metrics["units"]], [7, 6, 3]
+        )
+        self.assertEqual(
+            [row["movement_class"] for row in slot_metrics["units"]],
+            ["A", "A", "B"],
+        )
+
     def test_project_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "warehouse.grid.json"
@@ -323,6 +377,10 @@ class WarehouseServiceTests(unittest.TestCase):
         self.inventory.swap_sku_slots(rows, rows[0]["sku"], rows[4]["sku"])
         self.assertEqual(rows[0]["static_address"], second_address)
         self.assertEqual(rows[4]["static_address"], first_address)
+        for row in (rows[0], rows[4]):
+            occupied = row["occupied_handling_units"][0]
+            self.assertEqual(occupied["handling_unit_id"], row["handling_unit_id"])
+            self.assertEqual(occupied["rack_id"], row["rack_id"])
 
     def test_whole_shelf_swap_preserves_shelf_ids(self):
         rows, _summary = self.slotting.generate_basic(
@@ -341,6 +399,10 @@ class WarehouseServiceTests(unittest.TestCase):
             {row["rack_id"] for row in rows if row["handling_unit_id"] == second_unit},
             {first_rack},
         )
+        for row in rows:
+            occupied = row["occupied_handling_units"][0]
+            self.assertEqual(occupied["handling_unit_id"], row["handling_unit_id"])
+            self.assertEqual(occupied["rack_id"], row["rack_id"])
 
     def test_whole_shelf_swap_rejects_slot_level_units(self):
         rows, _summary = self.slotting.generate_basic(
@@ -496,6 +558,73 @@ class WarehouseServiceTests(unittest.TestCase):
         self.assertGreater(
             affinity_summary["affinity_metrics"]["mixed_abc_rack_count"], 0
         )
+        self.assertLessEqual(
+            affinity_summary["baseline_comparison"]["total_rack_touch_change"],
+            0,
+        )
+        self.assertIn("order_rack_touch_metrics", affinity_summary)
+
+    def test_affinity_weight_endpoints_are_pure_abc_and_pure_affinity(self):
+        tuning = {
+            "maximum_service_distance_increase": 10.0,
+            "minimum_shared_store_days": 1,
+            "minimum_affinity_score": 0.0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            _path, analysis = self.affinity_analysis(directory)
+            basic_rows, _basic_summary = self.slotting.generate_basic(
+                copy.deepcopy(self.building), copy.deepcopy(self.skus), 1, 2
+            )
+            zero_rows, zero_summary = self.slotting.generate_abc_affinity(
+                copy.deepcopy(self.building), copy.deepcopy(self.skus),
+                analysis, 0.0, 1, 2, tuning_parameters=tuning,
+            )
+            first_classes = ("A", "B", "C")
+            second_classes = ("C", "A", "B")
+            first = [
+                {
+                    **copy.deepcopy(row),
+                    "velocity_class": first_classes[index % 3],
+                }
+                for index, row in enumerate(self.skus)
+            ]
+            second = [
+                {
+                    **copy.deepcopy(row),
+                    "velocity_class": second_classes[index % 3],
+                }
+                for index, row in enumerate(self.skus)
+            ]
+            pure_first, first_summary = self.slotting.generate_abc_affinity(
+                copy.deepcopy(self.building), first, analysis, 1.0, 1, 2,
+                tuning_parameters=tuning,
+            )
+            pure_second, second_summary = self.slotting.generate_abc_affinity(
+                copy.deepcopy(self.building), second, analysis, 1.0, 1, 2,
+                tuning_parameters=tuning,
+            )
+
+        def positions(rows):
+            return {
+                row["sku"]: (
+                    row.get("rack_id"), row.get("storage_level"),
+                    row.get("storage_slot")
+                )
+                for row in rows
+            }
+
+        self.assertEqual(positions(zero_rows), positions(basic_rows))
+        self.assertEqual(positions(pure_first), positions(pure_second))
+        self.assertEqual(
+            {row["sku"]: row["affinity_placement_rank"] for row in pure_first},
+            {row["sku"]: row["affinity_placement_rank"] for row in pure_second},
+        )
+        self.assertTrue(
+            all(row["sku_rank"] == row["abc_frequency_rank"] for row in pure_first)
+        )
+        self.assertTrue(zero_summary["affinity_tuning"]["abc_influences_placement"])
+        self.assertFalse(first_summary["affinity_tuning"]["abc_influences_placement"])
+        self.assertFalse(second_summary["affinity_tuning"]["abc_influences_placement"])
 
     def test_zone_id_auto_increment(self):
         self.assertEqual(self.slotting.next_zone_id("Z01"), "Z02")

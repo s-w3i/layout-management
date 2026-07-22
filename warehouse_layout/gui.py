@@ -1255,6 +1255,8 @@ class GridMapEditorApp:
         self.slot_levels = tk.StringVar(value="1")
         self.slot_slots = tk.StringVar(value="6")
         self.slot_summary = tk.StringVar(value="Choose the inputs and generate a slotting layout.")
+        self.slot_progress_value = tk.DoubleVar(value=0)
+        self.slot_progress_text = tk.StringVar(value="Ready")
         self.slot_zone_detail = tk.StringVar(value="Generate a layout, then click a rack to inspect its zone.")
         self.slot_rack_detail = tk.StringVar(value="Generate a layout, then click a rack to inspect it.")
         self.slot_building = None
@@ -1274,7 +1276,7 @@ class GridMapEditorApp:
         )
 
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
         form = ttk.LabelFrame(parent, text="Slotting inputs", padding=12)
         form.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
         form.columnconfigure(1, weight=1)
@@ -1336,7 +1338,7 @@ class GridMapEditorApp:
         affinity_weight_entry.grid(row=1, column=1, sticky="w", pady=2)
         ttk.Label(
             affinity_panel,
-            text="0 = ABC bay purity · 100 = same-bay affinity consolidation",
+            text="0 = pure ABC · 100 = pure affinity · between = weighted blend",
             foreground="#4d646d",
         ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(75, 0), pady=2)
 
@@ -1401,25 +1403,124 @@ class GridMapEditorApp:
         ttk.Button(form, text="Browse…", command=self.browse_slot_output).grid(row=6, column=2, padx=(8, 0), pady=4)
         slot_actions = ttk.Frame(form)
         slot_actions.grid(row=7, column=1, columnspan=3, sticky="w", pady=(10, 4))
-        ttk.Button(slot_actions, text="Generate slotting layout", command=self.run_slotting, style="Accent.TButton").pack(side="left")
+        self.slot_generate_button = ttk.Button(
+            slot_actions,
+            text="Generate slotting layout",
+            command=self.run_slotting,
+            style="Accent.TButton",
+        )
+        self.slot_generate_button.pack(side="left")
+        self.slot_progress = ttk.Progressbar(
+            slot_actions,
+            variable=self.slot_progress_value,
+            maximum=100,
+            length=260,
+            mode="determinate",
+        )
+        self.slot_progress.pack(side="left", padx=(12, 6))
+        ttk.Label(slot_actions, textvariable=self.slot_progress_text).pack(side="left")
         ttk.Label(form, textvariable=self.slot_summary, foreground="#315b66").grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        unassigned_frame = ttk.LabelFrame(
+            parent, text="SKUs not slotted", padding=8
+        )
+        unassigned_frame.grid(
+            row=1, column=0, sticky="nsew", padx=12, pady=(0, 12)
+        )
+        unassigned_frame.columnconfigure(0, weight=1)
+        unassigned_frame.rowconfigure(1, weight=1)
+        self.slot_unassigned_summary = tk.StringVar(
+            value="No slotting result has been generated."
+        )
+        ttk.Label(
+            unassigned_frame,
+            textvariable=self.slot_unassigned_summary,
+            foreground="#4d646d",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 5))
+        unassigned_columns = (
+            "sku", "chilled", "size", "weight", "data_status", "reason"
+        )
+        self.slot_unassigned_tree = ttk.Treeview(
+            unassigned_frame,
+            columns=unassigned_columns,
+            show="headings",
+            height=8,
+        )
+        headings = {
+            "sku": "SKU ID",
+            "chilled": "Chilled",
+            "size": "Size (L × W × H)",
+            "weight": "Weight",
+            "data_status": "Physical data",
+            "reason": "Why not slotted",
+        }
+        widths = {
+            "sku": 130, "chilled": 75, "size": 180, "weight": 100,
+            "data_status": 150, "reason": 280,
+        }
+        for column in unassigned_columns:
+            self.slot_unassigned_tree.heading(column, text=headings[column])
+            self.slot_unassigned_tree.column(
+                column,
+                width=widths[column],
+                anchor="w" if column in {"sku", "reason"} else "center",
+            )
+        self.slot_unassigned_tree.grid(row=1, column=0, sticky="nsew")
+        unassigned_scroll = ttk.Scrollbar(
+            unassigned_frame,
+            orient="vertical",
+            command=self.slot_unassigned_tree.yview,
+        )
+        unassigned_scroll.grid(row=1, column=1, sticky="ns")
+        self.slot_unassigned_tree.configure(yscrollcommand=unassigned_scroll.set)
         self.slot_strategy_changed()
 
     def _build_interactive_slotting_tab(self, parent):
+        self.slot_history_path = tk.StringVar(value=self.slot_affinity_path.get())
+        self.slot_movement_status = tk.StringVar(
+            value="Load a layout and import order history to rank unit movements."
+        )
+        self.slot_movement_by_unit = {}
+        self.slot_movement_summary = {}
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
         controls = ttk.LabelFrame(parent, text="Generated layout viewer", padding=12)
         controls.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        controls.columnconfigure(1, weight=1)
         ttk.Button(
             controls,
             text="Load saved layout…",
             command=self.load_interactive_slotting_layout,
-        ).pack(side="left")
+        ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             controls,
             textvariable=self.slot_viewer_status,
             foreground="#315b66",
-        ).pack(side="left", padx=(12, 0))
+        ).grid(row=0, column=1, columnspan=3, sticky="w", padx=(12, 0))
+        ttk.Label(controls, text="Order-history Excel").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Entry(controls, textvariable=self.slot_history_path).grid(
+            row=1, column=1, sticky="ew", padx=(12, 6), pady=(8, 0)
+        )
+        ttk.Button(
+            controls,
+            text="Browse…",
+            command=lambda: self.browse_slot_input(
+                self.slot_history_path,
+                [("Excel workbook", "*.xlsx"), ("All files", "*")],
+            ),
+        ).grid(row=1, column=2, pady=(8, 0))
+        ttk.Button(
+            controls,
+            text="Calculate movement ranks",
+            command=self.calculate_slot_movement_ranks,
+        ).grid(row=1, column=3, padx=(6, 0), pady=(8, 0))
+        ttk.Label(
+            controls,
+            textvariable=self.slot_movement_status,
+            foreground="#315b66",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
         result = ttk.LabelFrame(parent, text="Interactive slotting layout", padding=8)
         result.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
         result.columnconfigure(0, weight=1); result.rowconfigure(0, weight=1)
@@ -1442,6 +1543,34 @@ class GridMapEditorApp:
             text="Read-only generated assignment view · click a rack to inspect it",
             foreground="#4d646d",
         ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.slot_dot_legend = ttk.Frame(layout_view)
+        self.slot_dot_legend.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.slot_dot_legend_labels = []
+        for column, (colour, label) in enumerate((
+            ("#d1495b", "A movement unit"),
+            ("#f3a712", "B movement unit"),
+            ("#4c9f70", "C movement unit"),
+            ("#7b8b92", "Unranked unit"),
+        )):
+            legend_label = ttk.Label(
+                self.slot_dot_legend,
+                text=f"● {label}",
+                foreground=colour,
+            )
+            legend_label.grid(row=0, column=column, padx=(0, 12), sticky="w")
+            self.slot_dot_legend_labels.append(legend_label)
+        workstation_legend = ttk.Label(
+            self.slot_dot_legend,
+            text="◆ Workstation",
+            foreground="#277da1",
+        )
+        workstation_legend.grid(row=0, column=4, padx=(0, 12), sticky="w")
+        self.slot_dot_legend_labels.append(workstation_legend)
+        ttk.Label(
+            self.slot_dot_legend,
+            text="AMR: shelf dot · ASRS: slot dots · outline + badge = zone",
+            foreground="#4d646d",
+        ).grid(row=0, column=5, sticky="w")
 
         zone_detail_frame = ttk.LabelFrame(rack_view, text="Zone details", padding=8)
         zone_detail_frame.grid(row=0, column=0, sticky="nsew", padx=(8, 4))
@@ -1461,13 +1590,13 @@ class GridMapEditorApp:
             justify="left",
             wraplength=210,
         ).grid(row=0, column=0, sticky="ew")
-        columns = ("rank", "sku", "class", "flags", "static", "dynamic", "unit_type", "unit_id", "status")
+        columns = ("abc_rank", "affinity_rank", "sku", "class", "flags", "static", "dynamic", "unit_type", "unit_id", "status")
         tree_frame = ttk.Frame(rack_view)
         tree_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=8, pady=(8, 0))
         tree_frame.columnconfigure(0, weight=1); tree_frame.rowconfigure(0, weight=1)
         self.slot_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-        headings = {"rank":"Rank", "sku":"SKU", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Current dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
-        widths = {"rank":55, "sku":95, "class":50, "flags":180, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
+        headings = {"abc_rank":"ABC rank", "affinity_rank":"Affinity order", "sku":"SKU", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Current dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
+        widths = {"abc_rank":65, "affinity_rank":85, "sku":95, "class":50, "flags":180, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
         for column in columns:
             self.slot_tree.heading(column, text=headings[column]); self.slot_tree.column(column, width=widths[column], anchor="center" if column not in {"flags","static","dynamic"} else "w")
         yscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.slot_tree.yview)
@@ -2513,13 +2642,16 @@ class GridMapEditorApp:
 
     def _build_operations_tab(self,parent):
         self.ops_layout_path=tk.StringVar(value=str(DEFAULT_SLOTTING_OUTPUT))
+        self.ops_history_path=tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
         self.ops_search=tk.StringVar(); self.ops_source_sku=tk.StringVar(); self.ops_target_sku=tk.StringVar()
         self.ops_source_label=tk.StringVar(value="Source SKU");self.ops_target_label=tk.StringVar(value="Target SKU")
         self.ops_swap_mode=tk.StringVar(value="SKU slot")
         self.ops_status=tk.StringVar(value="Load a generated slotting layout to begin.")
+        self.ops_movement_status=tk.StringVar(value="Load a layout and import order history to rank unit movements.")
         self.ops_details=tk.StringVar(value="Search for a SKU to show its current addresses and map position.")
         self.ops_payload=None; self.ops_building=None; self.ops_rows=[]; self.ops_racks=[]; self.ops_highlight_rack=None
         self.ops_shelf_selection=[];self.ops_sku_selection=[];self.ops_inventory_rows={}
+        self.ops_movement_by_unit={};self.ops_movement_summary={};self.ops_movement_analysis=None
         parent.columnconfigure(0,weight=1); parent.rowconfigure(1,weight=1)
         top=ttk.LabelFrame(parent,text="Slotting layout",padding=10); top.grid(row=0,column=0,sticky="ew",padx=12,pady=12); top.columnconfigure(1,weight=1)
         ttk.Label(top,text="Layout JSON").grid(row=0,column=0,sticky="w",padx=(0,8))
@@ -2527,7 +2659,18 @@ class GridMapEditorApp:
         ttk.Button(top,text="Browse…",command=self.browse_ops_layout).grid(row=0,column=2,padx=(8,0))
         ttk.Button(top,text="Load layout",command=self.load_ops_layout).grid(row=0,column=3,padx=(6,0))
         ttk.Button(top,text="Save changes as…",command=self.save_ops_layout).grid(row=0,column=4,padx=(6,0))
-        ttk.Label(top,textvariable=self.ops_status,foreground="#315b66").grid(row=1,column=0,columnspan=5,sticky="w",pady=(7,0))
+        ttk.Label(top,text="Order-history Excel").grid(row=1,column=0,sticky="w",padx=(0,8),pady=(7,0))
+        ttk.Entry(top,textvariable=self.ops_history_path).grid(row=1,column=1,sticky="ew",pady=(7,0))
+        ttk.Button(
+            top,text="Browse…",
+            command=lambda:self.browse_slot_input(
+                self.ops_history_path,
+                [("Excel workbook","*.xlsx"),("All files","*")],
+            ),
+        ).grid(row=1,column=2,padx=(8,0),pady=(7,0))
+        ttk.Button(top,text="Calculate movement ranks",command=self.calculate_ops_movement_ranks).grid(row=1,column=3,columnspan=2,sticky="w",padx=(6,0),pady=(7,0))
+        ttk.Label(top,textvariable=self.ops_status,foreground="#315b66").grid(row=2,column=0,columnspan=5,sticky="w",pady=(7,0))
+        ttk.Label(top,textvariable=self.ops_movement_status,foreground="#315b66").grid(row=3,column=0,columnspan=5,sticky="w",pady=(4,0))
 
         paned=ttk.Panedwindow(parent,orient="horizontal"); paned.grid(row=1,column=0,sticky="nsew",padx=12,pady=(0,12))
         map_frame=ttk.LabelFrame(paned,text="Current inventory layout",padding=8)
@@ -2538,7 +2681,15 @@ class GridMapEditorApp:
         self.ops_canvas.grid(row=0,column=0,sticky="nsew"); self.ops_canvas.bind("<Configure>",lambda _event:self.draw_ops_layout())
         self.enable_canvas_viewport(self.ops_canvas)
         self.ops_canvas.tag_bind("ops_rack","<Button-1>",self.ops_rack_click)
-        ttk.Label(map_frame,text="Rack colour = traffic-aware handling-unit visits (blue low → red high) · highlighted ring = searched SKU position · click a rack to inspect",foreground="#4d646d").grid(row=1,column=0,sticky="w",pady=(5,0))
+        ttk.Label(map_frame,text="Read-only assignment view · highlighted ring = searched SKU or selected swap position · click a rack to list inventory",foreground="#4d646d").grid(row=1,column=0,sticky="w",pady=(5,0))
+        self.ops_dot_legend=ttk.Frame(map_frame);self.ops_dot_legend.grid(row=2,column=0,sticky="w",pady=(4,0))
+        self.ops_dot_legend_labels=[]
+        for column,(colour,label) in enumerate((("#d1495b","A movement unit"),("#f3a712","B movement unit"),("#4c9f70","C movement unit"),("#7b8b92","Unranked unit"))):
+            widget=ttk.Label(self.ops_dot_legend,text=f"● {label}",foreground=colour)
+            widget.grid(row=0,column=column,padx=(0,12),sticky="w");self.ops_dot_legend_labels.append(widget)
+        workstation_legend=ttk.Label(self.ops_dot_legend,text="◆ Workstation",foreground="#277da1")
+        workstation_legend.grid(row=0,column=4,padx=(0,12),sticky="w");self.ops_dot_legend_labels.append(workstation_legend)
+        ttk.Label(self.ops_dot_legend,text="AMR: shelf dot · ASRS: slot dots · outline + badge = zone",foreground="#4d646d").grid(row=0,column=5,sticky="w")
 
         search=ttk.LabelFrame(control,text="1. Find SKU",padding=10); search.grid(row=0,column=0,sticky="ew",pady=(0,8)); search.columnconfigure(0,weight=1)
         ttk.Entry(search,textvariable=self.ops_search).grid(row=0,column=0,sticky="ew")
@@ -2578,38 +2729,51 @@ class GridMapEditorApp:
         try:
             payload=self.layouts.load(Path(self.ops_layout_path.get()).expanduser())
             _,racks,workstations,unreachable=self.slotting.rack_distances(payload["building"])
-            visits_rebuilt=self.ensure_ops_traffic_demand(payload)
+            zones=dict(payload.get("zone_assignments",{}))
+            self.slotting.apply_zone_local_aisles(
+                payload["building"],racks,zones,next(iter(zones.values()),"Z01")
+            )
         except (OSError,ValueError,TypeError,json.JSONDecodeError,yaml.YAMLError) as exc:
             messagebox.showerror("Layout load failed",str(exc));return
         self.ops_payload=payload;self.ops_building=payload["building"];self.ops_rows=payload["assignments"];self.ops_racks=racks;self.ops_highlight_rack=None;self.ops_shelf_selection=[];self.ops_sku_selection=[]
         self.ops_source_sku.set("");self.ops_target_sku.set("")
+        source_history=(payload.get("sources",{}).get("movement_order_workbook") or payload.get("sources",{}).get("traffic_order_workbook") or payload.get("sources",{}).get("affinity_order_workbook") or "")
+        if source_history:self.ops_history_path.set(source_history)
+        self.ops_movement_by_unit={};self.ops_movement_summary={};self.ops_movement_analysis=None
+        self.ops_movement_status.set("Order history selected. Calculate movement ranks for this layout." if self.ops_history_path.get().strip() else "Import order-history Excel to calculate movement ranks.")
         self.show_ops_rack_inventory(None)
         self.ops_log.delete(0,"end")
         for event in payload.get("operation_log",[]):self.ops_log.insert("end",event.get("message",str(event)))
-        demand_status=" · traffic demand rebuilt from orders" if visits_rebuilt else ""
-        self.ops_status.set(f"Loaded {len(self.ops_rows):,} SKU assignments · {len(racks)} racks · {workstations} workstations · {unreachable} unreachable racks{demand_status}")
-        self.ops_details.set("Search for a SKU or click a rack to inspect current inventory addresses.");self.draw_ops_layout()
+        self.ops_status.set(f"Loaded {len(self.ops_rows):,} SKU assignments · {len(racks)} racks · {workstations} workstations · {unreachable} unreachable racks")
+        self.ops_details.set("Search for a SKU to show its current addresses and map position.");self.draw_ops_layout()
 
-    def ensure_ops_traffic_demand(self,payload):
-        """Backfill per-unit visits in older traffic layouts from their orders."""
-        traffic_analysis=payload.setdefault("traffic_analysis",{})
-        if isinstance(traffic_analysis.get("unit_visits"),dict):return False
-        if not payload.get("traffic_configuration"):return False
-        sources=payload.get("sources",{})
-        order_source=sources.get("traffic_order_workbook") or sources.get("affinity_order_workbook")
-        if not order_source:return False
-        order_path=Path(order_source).expanduser()
-        if not order_path.is_file():return False
-        configuration=payload.get("traffic_configuration",{})
+    def calculate_ops_movement_ranks(self):
+        if not self.ops_rows:
+            messagebox.showerror("Movement ranking","Load a slotting layout first.");return
         try:
-            start=date.fromisoformat(configuration["start_date"]) if configuration.get("start_date") else None
-            end=date.fromisoformat(configuration["end_date"]) if configuration.get("end_date") else None
-            dataset=self.affinity.load_orders(order_path)
-            demand=self.traffic.build_demand(dataset,payload.get("assignments",[]),start,end)
-        except (OSError,ValueError,TypeError,KeyError):
-            return False
-        traffic_analysis["unit_visits"]=dict(sorted(demand.unit_visits.items()))
-        return True
+            history_path=Path(self.ops_history_path.get().strip()).expanduser().resolve()
+            self.ops_movement_status.set("Loading historical store orders…");self.root.update_idletasks()
+            analysis=self.affinity.analyze(self.affinity.load_orders(history_path))
+            movement=self.slotting.handling_unit_visit_metrics(
+                analysis,self.ops_rows,self.ops_payload.get("handling_unit_type","AMR shelf")
+            )
+            if not movement["units"]:raise ValueError("no assigned layout SKUs match the order-history workbook")
+        except (OSError,ValueError,TypeError,KeyError) as exc:
+            self.ops_movement_status.set("Movement ranking failed.");messagebox.showerror("Movement ranking",str(exc));return
+        self.ops_movement_analysis=analysis
+        self.ops_payload.setdefault("sources",{})["movement_order_workbook"]=str(history_path)
+        self.set_ops_movement_metrics(movement)
+
+    def set_ops_movement_metrics(self,movement):
+        self.ops_movement_summary=movement
+        self.ops_movement_by_unit={row["handling_unit_id"]:row for row in movement["units"]}
+        counts={label:sum(row["movement_class"]==label for row in movement["units"]) for label in ("A","B","C")}
+        self.ops_movement_status.set(
+            f"{movement['fulfillment_group_count']:,} Store ID + Date tasks · "
+            f"{movement['total_handling_unit_visits']:,} {movement['handling_unit_type']} visits · "
+            f"ranked at {movement['ranking_level']} level · A {counts['A']} / B {counts['B']} / C {counts['C']}"
+        )
+        self.draw_ops_layout()
 
     def save_ops_layout(self):
         if not self.ops_payload:
@@ -2621,36 +2785,13 @@ class GridMapEditorApp:
 
     def ops_geometry(self,vertices):
         xs=[float(v[0]) for v in vertices];ys=[float(v[1]) for v in vertices];min_x,max_x,min_y,max_y=min(xs),max(xs),min(ys),max(ys)
-        width=max(300,self.ops_canvas.winfo_width());height=max(300,self.ops_canvas.winfo_height());padding=28
+        width=max(300,self.ops_canvas.winfo_width());height=max(300,self.ops_canvas.winfo_height());padding=55
         scale=min((width-2*padding)/max(1e-9,max_x-min_x),(height-2*padding)/max(1e-9,max_y-min_y));return min_x,max_x,min_y,max_y,width,height,padding,scale
 
     def ops_screen_point(self,x,y,geometry):
         min_x,max_x,min_y,max_y,width,height,padding,scale=geometry;sx=padding+(float(x)-min_x)*scale
         sy=padding+(float(y)-min_y)*scale if self.ops_building.get("coordinate_system")=="reference_image" else height-padding-(float(y)-min_y)*scale
         return sx,sy
-
-    @staticmethod
-    def ops_rack_handling_unit_visits(rows, unit_visits):
-        """Return traffic demand once per distinct handling unit in a rack."""
-        units={str(row.get("handling_unit_id") or "") for row in rows}
-        return sum(max(0,int(unit_visits.get(unit,0) or 0)) for unit in units if unit)
-
-    def draw_ops_frequency_legend(self, maximum_frequency, available=True):
-        """Draw the traffic-aware handling-unit visit scale."""
-        x,y,swatch_width,swatch_height=12,12,34,10
-        self.ops_canvas.create_rectangle(x-5,y-5,x+5*swatch_width+5,y+44,fill="white",outline="#9aa8ae",tags=("ops_legend",))
-        self.ops_canvas.create_text(x,y,text="Handling-unit visits",anchor="nw",fill="#314d59",font=("TkDefaultFont",8,"bold"),tags=("ops_legend",))
-        y+=17
-        if not available:
-            self.ops_canvas.create_text(x,y,text="Unavailable in this layout",anchor="nw",fill="#6d7f87",font=("TkDefaultFont",8),tags=("ops_legend",))
-            return
-        steps=5
-        for index in range(steps):
-            ratio=index/(steps-1)
-            left=x+index*swatch_width
-            self.ops_canvas.create_rectangle(left,y,left+swatch_width,y+swatch_height,fill=self._traffic_heat_colour(ratio),outline="",tags=("ops_legend",))
-        self.ops_canvas.create_text(x,y+14,text="0",anchor="nw",fill="#314d59",font=("TkDefaultFont",7),tags=("ops_legend",))
-        self.ops_canvas.create_text(x+steps*swatch_width,y+14,text=f"{maximum_frequency:g} visits",anchor="ne",fill="#314d59",font=("TkDefaultFont",7),tags=("ops_legend",))
 
     def draw_ops_layout(self):
         if not hasattr(self,"ops_canvas"):return
@@ -2662,28 +2803,61 @@ class GridMapEditorApp:
         for lane in level.get("lanes",[]):
             if len(lane)<2:continue
             a,b=vertices[lane[0]],vertices[lane[1]];x1,y1=self.ops_screen_point(a[0],a[1],geometry);x2,y2=self.ops_screen_point(b[0],b[1],geometry);self.ops_canvas.create_line(x1,y1,x2,y2,fill="#d9e0e3")
+        zone_palette=("#6c8cd5","#31a6a0","#d47b4c","#8ca63c","#c75d8b","#81756e","#3d8fbe","#9b70c7")
+        zone_ids=sorted({str(rack.get("zone_id","")).strip() for rack in self.ops_racks if str(rack.get("zone_id","")).strip()})
+        zone_colours={zone:zone_palette[index%len(zone_palette)] for index,zone in enumerate(zone_ids)}
+        for zone in zone_ids:
+            positions=[self.ops_screen_point(rack["x"],rack["y"],geometry) for rack in self.ops_racks if str(rack.get("zone_id","")).strip()==zone]
+            if not positions:continue
+            left=min(x for x,_y in positions)-10;top=min(y for _x,y in positions)-10
+            right=max(x for x,_y in positions)+10;bottom=max(y for _x,y in positions)+10
+            self.ops_canvas.create_rectangle(left,top,right,bottom,outline=zone_colours[zone],width=3,tags=("ops_zone_boundary",))
+            badge_width=max(42,len(zone)*8+14);badge_top=top-26
+            self.ops_canvas.create_rectangle(left,badge_top,left+badge_width,badge_top+22,fill=zone_colours[zone],outline=zone_colours[zone],tags=("ops_zone_label_badge",))
+            self.ops_canvas.create_text(left+badge_width/2,badge_top+11,text=zone,fill="white",font=("TkDefaultFont",9,"bold"),tags=("ops_zone_label",))
         grouped={}
         for row in self.ops_rows:
             if row.get("assignment_status")=="ASSIGNED":grouped.setdefault(row.get("rack_id",""),[]).append(row)
-        unit_visits=(self.ops_payload or {}).get("traffic_analysis",{}).get("unit_visits")
-        demand_available=isinstance(unit_visits,dict)
-        unit_visits=unit_visits if demand_available else {}
-        rack_frequencies={
-            rack_id:self.ops_rack_handling_unit_visits(rows,unit_visits)
-            for rack_id,rows in grouped.items()
-        }
-        maximum_frequency=max(rack_frequencies.values(),default=0.0)
+        handling_unit_type=(self.ops_payload or {}).get("handling_unit_type","AMR shelf")
+        capacity=(self.ops_payload or {}).get("rack_capacity",{})
+        level_count=max(1,int(capacity.get("levels",1)));slot_count=max(1,int(capacity.get("slots_per_level",1)))
+        class_colours={"A":"#d1495b","B":"#f3a712","C":"#4c9f70"}
         shelf_racks={selection["rack_id"] for selection in self.ops_shelf_selection}
         for rack in self.ops_racks:
-            x,y=self.ops_screen_point(rack["x"],rack["y"],geometry);rows=grouped.get(rack["rack_id"],[])
-            frequency=rack_frequencies.get(rack["rack_id"],0.0)
-            fill=self._traffic_heat_colour(frequency/maximum_frequency) if demand_available and frequency and maximum_frequency else "#aeb8bc"
-            shelf_selected=rack["rack_id"] in shelf_racks;selected=rack["rack_id"]==self.ops_highlight_rack;radius=11 if shelf_selected else (9 if selected else 4)
+            rack_id=rack["rack_id"];x,y=self.ops_screen_point(rack["x"],rack["y"],geometry);rows=grouped.get(rack_id,[])
+            shelf_selected=rack_id in shelf_racks;selected=rack_id==self.ops_highlight_rack
             outline="#e07a1f" if shelf_selected else ("#087f8c" if selected else "white")
-            self.ops_canvas.create_oval(x-radius,y-radius,x+radius,y+radius,fill=fill,outline=outline,width=4 if shelf_selected else (3 if selected else 1),tags=("ops_rack",f"opsrack:{rack['rack_id']}"))
+            if handling_unit_type=="AMR shelf":
+                unit_id=str(rows[0].get("handling_unit_id","")) if rows else ""
+                movement=self.ops_movement_by_unit.get(unit_id,{})
+                fill=class_colours.get(movement.get("movement_class",""),"#7b8b92")
+                radius=11 if shelf_selected else (9 if selected else 4)
+                self.ops_canvas.create_oval(x-radius,y-radius,x+radius,y+radius,fill=fill,outline=outline,width=4 if shelf_selected else (3 if selected else 1),tags=("ops_rack",f"opsrack:{rack_id}",f"opsunit:{unit_id}"))
+            else:
+                outer_radius=11 if selected else 7
+                self.ops_canvas.create_oval(x-outer_radius,y-outer_radius,x+outer_radius,y+outer_radius,fill="",outline="#087f8c" if selected else "#aab4b8",width=3 if selected else 1,tags=("ops_rack",f"opsrack:{rack_id}"))
+                locations={}
+                for row in rows:
+                    occupied=row.get("occupied_handling_units") or [{"handling_unit_id":row.get("handling_unit_id",""),"storage_level":row.get("storage_level",1),"storage_slot":row.get("storage_slot",1)}]
+                    for location in occupied:
+                        unit_id=str(location.get("handling_unit_id","")).strip()
+                        if unit_id:locations.setdefault(unit_id,location)
+                dx=min(6.0,30.0/max(1,slot_count-1));dy=min(6.0,30.0/max(1,level_count-1))
+                for unit_id,location in locations.items():
+                    slot=int(location.get("storage_slot") or 1);storage_level=int(location.get("storage_level") or 1)
+                    unit_x=x+(slot-(slot_count+1)/2)*dx;unit_y=y+(storage_level-(level_count+1)/2)*dy
+                    movement=self.ops_movement_by_unit.get(unit_id,{})
+                    fill=class_colours.get(movement.get("movement_class",""),"#7b8b92")
+                    self.ops_canvas.create_oval(unit_x-3,unit_y-3,unit_x+3,unit_y+3,fill=fill,outline="white",width=1,tags=("ops_rack",f"opsrack:{rack_id}",f"opsunit:{unit_id}"))
             if selected:
-                self.ops_canvas.create_text(x,y-16,text=rack["rack_id"],fill="#065f69",font=("TkDefaultFont",9,"bold"))
-        self.draw_ops_frequency_legend(maximum_frequency,demand_available)
+                self.ops_canvas.create_text(x,y-18,text=rack_id,fill="#065f69",font=("TkDefaultFont",9,"bold"))
+        for vertex in vertices:
+            params=vertex[4] if len(vertex)>4 and isinstance(vertex[4],dict) else {}
+            if "dropoff_ingestor" not in params:continue
+            endpoint=str(self.slotting.typed_value(params["dropoff_ingestor"],vertex[3]));x,y=self.ops_screen_point(vertex[0],vertex[1],geometry);radius=6
+            self.ops_canvas.create_polygon(x,y-radius,x+radius,y,x,y+radius,x-radius,y,fill="#277da1",outline="white",tags=("ops_workstation",))
+            self.ops_canvas.create_text(x,y-11,text=endpoint,fill="#1d5d78",font=("TkDefaultFont",8,"bold"),tags=("ops_workstation",))
+        self.ops_canvas.tag_raise("ops_zone_label_badge");self.ops_canvas.tag_raise("ops_zone_label")
         self.apply_canvas_viewport(self.ops_canvas)
 
     def show_ops_rack_inventory(self,rack_id):
@@ -2752,20 +2926,6 @@ class GridMapEditorApp:
         rack_id=found[0];rows=[row for row in self.ops_rows if row.get("assignment_status")=="ASSIGNED" and row.get("rack_id")==rack_id]
         self.ops_highlight_rack=rack_id
         self.show_ops_rack_inventory(rack_id)
-        units=sorted({str(row.get("handling_unit_id","")) for row in rows if row.get("handling_unit_id")})
-        rack_attributes = {}
-        if rows and self.ops_payload:
-            bay_path = "/".join(str(rows[0].get("static_address", "")).split("/")[:3])
-            rack_attributes, _sources = self.attributes.effective_attributes(
-                bay_path, self.ops_payload.get("location_attributes", {})
-            )
-        chilled_count, exception_count = self.rack_storage_flag_counts(rows)
-        self.ops_details.set(
-            f"Rack {rack_id} · {len(rows)} assigned SKU(s)\nShelf / handling unit: "
-            + (", ".join(units) if units else "empty")
-            + f"\nStorage flags: CHILLED={chilled_count} · OVERSIZE / WEIGHT EXCEPTION={exception_count}"
-            + f"\nEffective bay attributes: {self.attributes.format_values(rack_attributes)}"
-        )
         if self.ops_swap_mode.get()=="Whole shelf":
             self.select_ops_shelf_for_swap(rack_id,rows)
         else:self.draw_ops_layout()
@@ -2814,6 +2974,12 @@ class GridMapEditorApp:
         )
         event={"timestamp":timestamp,"type":mode,"source":source,"target":target,"message":message};self.ops_payload.setdefault("operation_log",[]).append(event);self.ops_log.insert("end",f"{timestamp[:19]}  {message}");self.ops_log.see("end")
         self.ops_shelf_selection=[];self.ops_sku_selection=[];self.show_ops_assignment(row);self.ops_status.set(message+" · save changes to persist the demo result")
+        if self.ops_movement_analysis is not None:
+            movement=self.slotting.handling_unit_visit_metrics(
+                self.ops_movement_analysis,self.ops_rows,
+                self.ops_payload.get("handling_unit_type","AMR shelf"),
+            )
+            self.set_ops_movement_metrics(movement)
         return True
 
     def execute_ops_swap(self):
@@ -2912,6 +3078,7 @@ class GridMapEditorApp:
         self.slot_chilled_path.set(source_chilled)
         if source_affinity:
             self.slot_affinity_path.set(source_affinity)
+            self.slot_history_path.set(source_affinity)
         self.slot_building = building
         self.slot_grid_project = None
         if source_grid_project:
@@ -2950,12 +3117,22 @@ class GridMapEditorApp:
             for path, values in local.items()
         )
         self.slot_rows = payload.get("assignments", [])
+        self.slot_movement_by_unit = {}
+        self.slot_movement_summary = {}
+        self.slot_movement_status.set(
+            "Order history selected. Calculate movement ranks for this layout."
+            if self.slot_history_path.get().strip()
+            else "Import order-history Excel to calculate movement ranks."
+        )
         self.slot_zone_storage_types = payload.get("summary", {}).get(
             "zone_storage_types", {}
         )
         self.slot_output_path.set(str(layout_path))
         self.slot_selected_rack = None
-        self.show_slotting_rows(self.slot_rows); self.draw_slotting_layout()
+        self.show_slotting_rows(self.slot_rows)
+        self.show_unassigned_slotting_rows(self.slot_rows)
+        self.draw_slotting_layout()
+        self.update_slot_progress(100, "Loaded saved layout")
         self.slot_summary.set(
             f"Restored {len(racks)} racks, {len(set(zones.values()))} zones, "
             f"{len(local)} attributed nodes and {len(self.slot_rows):,} assignments · "
@@ -2973,6 +3150,50 @@ class GridMapEditorApp:
     def load_interactive_slotting_layout(self):
         """Load a saved layout into the read-only interactive result viewer."""
         self.load_slotting_configuration()
+
+    def calculate_slot_movement_ranks(self):
+        if not self.slot_rows:
+            messagebox.showerror(
+                "Movement ranking", "Load or generate a slotting layout first."
+            )
+            return
+        try:
+            history_path = Path(
+                self.slot_history_path.get().strip()
+            ).expanduser().resolve()
+            self.slot_movement_status.set("Loading historical store orders…")
+            self.root.update_idletasks()
+            dataset = self.affinity.load_orders(history_path)
+            analysis = self.affinity.analyze(dataset)
+            movement = self.slotting.handling_unit_visit_metrics(
+                analysis, self.slot_rows, self.slot_handling_unit.get()
+            )
+            if not movement["units"]:
+                raise ValueError(
+                    "no assigned layout SKUs match the order-history workbook"
+                )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.slot_movement_status.set("Movement ranking failed.")
+            messagebox.showerror("Movement ranking", str(exc))
+            return
+        self.slot_movement_summary = movement
+        self.slot_movement_by_unit = {
+            row["handling_unit_id"]: row for row in movement["units"]
+        }
+        class_counts = {
+            label: sum(
+                row["movement_class"] == label for row in movement["units"]
+            )
+            for label in ("A", "B", "C")
+        }
+        self.slot_movement_status.set(
+            f"{movement['fulfillment_group_count']:,} Store ID + Date tasks · "
+            f"{movement['total_handling_unit_visits']:,} "
+            f"{movement['handling_unit_type']} visits · ranked at "
+            f"{movement['ranking_level']} level · "
+            f"A {class_counts['A']} / B {class_counts['B']} / C {class_counts['C']}"
+        )
+        self.draw_slotting_layout()
 
     def load_slot_building(self):
         try:
@@ -3023,11 +3244,22 @@ class GridMapEditorApp:
         self.slot_levels.set(str(project.storage_layout.levels_per_rack))
         self.slot_slots.set(str(project.storage_layout.slots_per_level))
         self.slot_zone_assignments=zones; self.slot_rows=[]; self.slot_selected_rack=None
+        self.slot_movement_by_unit = {}
+        self.slot_movement_summary = {}
+        self.slot_movement_status.set(
+            "Project loaded. Generate a layout before calculating movement ranks."
+        )
         self.slot_attribute_catalog=self.attributes.normalize_catalog(catalog); self.slot_location_attributes=copy.deepcopy(local); self.slot_hierarchy_paths=paths
         self.slot_storage_initialized=True
         self.slot_zone_storage_types={}
         self.slot_zone.set(default_zone)
-        self.show_slotting_rows([]); self.draw_slotting_layout()
+        self.show_slotting_rows([])
+        self.show_unassigned_slotting_rows([])
+        self.slot_unassigned_summary.set(
+            "Project loaded. Generate slotting to review rejected SKUs."
+        )
+        self.update_slot_progress(0, "Ready")
+        self.draw_slotting_layout()
         self.slot_summary.set(
             f"Loaded {len(racks)} racks, {len(project.storage_layout.buffers)} empty "
             f"{project.storage_layout.buffer_level} buffers and {workstations} "
@@ -3076,7 +3308,75 @@ class GridMapEditorApp:
         )
         self.slot_strategy_changed()
 
+    def update_slot_progress(self, value, message):
+        self.slot_progress_value.set(max(0, min(100, float(value))))
+        self.slot_progress_text.set(message)
+        self.root.update_idletasks()
+
+    @staticmethod
+    def slot_requirement_value(requirements, key, unknown="Unknown"):
+        value = (requirements or {}).get(key)
+        if value is None or str(value).strip() == "":
+            return unknown
+        return str(value)
+
+    def show_unassigned_slotting_rows(self, rows):
+        self.slot_unassigned_tree.delete(
+            *self.slot_unassigned_tree.get_children()
+        )
+        unassigned = [
+            row for row in rows
+            if row.get("assignment_status") != "ASSIGNED"
+        ]
+        reason_labels = {
+            "UNASSIGNED_NO_CAPACITY": "All compatible slots are occupied",
+            "UNASSIGNED_NO_CHILLED_LOCATION": "No chilled storage location",
+            "UNASSIGNED_NO_AMBIENT_LOCATION": "No ambient storage location",
+            "UNASSIGNED_NO_COMPATIBLE_LOCATION": "No compatible location attributes",
+            "UNASSIGNED_NO_OVERSIZE_LOCATION": "No oversize-capable location",
+        }
+        for row in unassigned:
+            requirements = row.get("sku_requirements") or {}
+            chilled = requirements.get("chilled")
+            chilled_label = (
+                "Yes" if chilled is True else "No" if chilled is False else "Unknown"
+            )
+            size = " × ".join(
+                self.slot_requirement_value(requirements, key)
+                for key in (
+                    "max_item_length", "max_item_width", "max_item_height"
+                )
+            )
+            issues = row.get("compatibility_issues") or []
+            if isinstance(issues, str):
+                issues = [issues]
+            reason = "; ".join(str(issue) for issue in issues if str(issue).strip())
+            if not reason:
+                reason = reason_labels.get(
+                    row.get("assignment_status"),
+                    str(row.get("assignment_status", "Unassigned")),
+                )
+            self.slot_unassigned_tree.insert(
+                "", "end",
+                values=(
+                    row.get("sku", ""),
+                    chilled_label,
+                    size,
+                    self.slot_requirement_value(
+                        requirements, "max_item_weight"
+                    ),
+                    row.get("physical_data_status", "Unknown"),
+                    reason,
+                ),
+            )
+        self.slot_unassigned_summary.set(
+            f"{len(unassigned):,} SKU(s) could not be slotted."
+            if unassigned else "All SKUs were slotted successfully."
+        )
+
     def run_slotting(self, use_adjusted=False):
+        self.slot_generate_button.configure(state="disabled")
+        self.update_slot_progress(2, "Validating inputs…")
         try:
             strategy = self.slot_strategy.get()
             if strategy not in {"basic", "abc_affinity"}:
@@ -3089,6 +3389,7 @@ class GridMapEditorApp:
             if self.slot_grid_project is None or self.slot_grid_project.storage_layout is None:
                 raise ValueError("loaded grid project has no storage buffers")
             self.prepare_slot_attribute_hierarchy()
+            self.update_slot_progress(12, "Loading SKU data…")
             building=self.slot_building
             skus=self.slotting.load_velocity(
                 Path(self.slot_velocity_path.get()).expanduser(),
@@ -3099,6 +3400,7 @@ class GridMapEditorApp:
                     else None
                 ),
             )
+            self.update_slot_progress(25, f"Loaded {len(skus):,} SKUs")
             levels=int(self.slot_levels.get()); slots=int(self.slot_slots.get())
             source_affinity = ""
             if strategy == "abc_affinity":
@@ -3111,9 +3413,10 @@ class GridMapEditorApp:
                 source_affinity = str(affinity_path)
 
                 def report_affinity_progress(current, total, message):
-                    percent = 100.0 * current / max(1, total)
-                    self.slot_summary.set(f"{message} · {percent:.0f}%")
-                    self.root.update_idletasks()
+                    fraction = current / max(1, total)
+                    self.update_slot_progress(
+                        25 + 30 * fraction, message
+                    )
 
                 affinity_dataset = self.affinity.load_orders(
                     affinity_path, progress=report_affinity_progress
@@ -3135,7 +3438,7 @@ class GridMapEditorApp:
                 self.slot_summary.set(
                     "Evaluating ABC-preserving affinity layouts and map-derived parameters…"
                 )
-                self.root.update_idletasks()
+                self.update_slot_progress(60, "Generating affinity layout…")
                 rows, summary = self.slotting.generate_abc_affinity(
                     building,
                     skus,
@@ -3152,12 +3455,14 @@ class GridMapEditorApp:
                     storage_layout=self.slot_grid_project.storage_layout,
                 )
             else:
+                self.update_slot_progress(45, "Generating basic ABC layout…")
                 rows, summary = self.slotting.generate_basic(
                     building, skus, levels, slots, self.slot_handling_unit.get(),
                     self.slot_zone.get(), self.slot_zone_assignments,
                     self.slot_attribute_catalog, self.slot_location_attributes,
                     storage_layout=self.slot_grid_project.storage_layout,
                 )
+            self.update_slot_progress(85, "Saving slotting layout…")
             self.layouts.save(
                 rows, building, summary, Path(self.slot_output_path.get()).expanduser(),
                 strategy=self.slot_strategy.get(),
@@ -3178,12 +3483,24 @@ class GridMapEditorApp:
                 storage_layout=self.slot_grid_project.storage_layout,
             )
         except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+            self.slot_generate_button.configure(state="normal")
+            self.update_slot_progress(0, "Generation failed")
             messagebox.showerror("Slotting generation failed", str(exc)); return
         self.slot_rows = rows
+        self.slot_movement_by_unit = {}
+        self.slot_movement_summary = {}
+        if source_affinity:
+            self.slot_history_path.set(source_affinity)
+        self.slot_movement_status.set(
+            "Layout generated. Calculate movement ranks from the selected history."
+            if self.slot_history_path.get().strip()
+            else "Import order-history Excel to calculate movement ranks."
+        )
         self.slot_zone_storage_types = summary["zone_storage_types"]
         self.slotting.apply_zone_local_aisles(building,self.slot_racks,self.slot_zone_assignments,self.slot_zone.get())
         self.slot_selected_rack = None
         self.show_slotting_rows(rows)
+        self.show_unassigned_slotting_rows(rows)
         self.draw_slotting_layout()
         self.slot_viewer_status.set(
             f"Viewing generated layout: {self.slot_output_path.get()}"
@@ -3209,6 +3526,20 @@ class GridMapEditorApp:
                 f" · mixed ABC bays "
                 f"{summary['affinity_metrics']['mixed_abc_rack_count']}"
             )
+            rack_touches = summary.get("order_rack_touch_metrics", {})
+            baseline_touches = comparison.get(
+                "basic_order_rack_touch_metrics", {}
+            )
+            if rack_touches and baseline_touches:
+                affinity_summary += (
+                    f" · racks/store-day "
+                    f"{baseline_touches['average_racks_per_group']:.2f}→"
+                    f"{rack_touches['average_racks_per_group']:.2f}"
+                    f" · total rack touches "
+                    f"{baseline_touches['total_rack_touches']:,}→"
+                    f"{rack_touches['total_rack_touches']:,} "
+                    f"({comparison['total_rack_touch_change_fraction'] * 100:+.2f}%)"
+                )
         self.slot_summary.set(
             f"Assigned {summary['assigned_count']:,}/{summary['sku_count']:,} SKUs · "
             f"unassigned {summary['unassigned_count']:,} · "
@@ -3232,17 +3563,26 @@ class GridMapEditorApp:
             + " · "
             f"saved to {self.slot_output_path.get()}"
         )
+        self.slot_generate_button.configure(state="normal")
+        self.update_slot_progress(100, "Complete")
 
     def show_slotting_rows(self, rows):
         self.slot_tree.delete(*self.slot_tree.get_children())
         for row in rows[:1000]:
-            self.slot_tree.insert("", "end", values=(row["sku_rank"], row["sku"], row["velocity_class"], self.sku_storage_flags(row), row["static_address"], row["dynamic_address"], row["handling_unit_type"], row["handling_unit_id"], row["assignment_status"]))
+            self.slot_tree.insert("", "end", values=(
+                row.get("abc_frequency_rank", row.get("sku_rank", "")),
+                row.get("affinity_placement_rank", ""),
+                row["sku"], row["velocity_class"], self.sku_storage_flags(row),
+                row["static_address"], row["dynamic_address"],
+                row["handling_unit_type"], row["handling_unit_id"],
+                row["assignment_status"],
+            ))
 
     def slotting_geometry(self, vertices, canvas=None):
         canvas = canvas or self.slot_canvas
         xs=[float(v[0]) for v in vertices]; ys=[float(v[1]) for v in vertices]
         min_x,max_x,min_y,max_y=min(xs),max(xs),min(ys),max(ys)
-        width=max(300,canvas.winfo_width()); height=max(300,canvas.winfo_height()); padding=28
+        width=max(300,canvas.winfo_width()); height=max(300,canvas.winfo_height()); padding=55
         scale=min((width-2*padding)/max(1e-9,max_x-min_x),(height-2*padding)/max(1e-9,max_y-min_y))
         return min_x,max_x,min_y,max_y,width,height,padding,scale
 
@@ -3269,22 +3609,131 @@ class GridMapEditorApp:
             if len(lane)<2 or lane[0]>=len(vertices) or lane[1]>=len(vertices): continue
             a,b=vertices[lane[0]],vertices[lane[1]]; x1,y1=self.slotting_screen_point(a[0],a[1],geometry); x2,y2=self.slotting_screen_point(b[0],b[1],geometry)
             canvas.create_line(x1,y1,x2,y2,fill="#d9e0e3",width=1)
+        zone_palette = (
+            "#6c8cd5", "#31a6a0", "#d47b4c", "#8ca63c",
+            "#c75d8b", "#81756e", "#3d8fbe", "#9b70c7",
+        )
+        zone_ids = sorted({
+            str(rack.get("zone_id", "")).strip()
+            for rack in self.slot_racks
+            if str(rack.get("zone_id", "")).strip()
+        })
+        zone_colors = {
+            zone: zone_palette[index % len(zone_palette)]
+            for index, zone in enumerate(zone_ids)
+        }
+        for zone in zone_ids:
+            positions = [
+                self.slotting_screen_point(rack["x"], rack["y"], geometry)
+                for rack in self.slot_racks
+                if str(rack.get("zone_id", "")).strip() == zone
+            ]
+            if not positions:
+                continue
+            boundary_padding = 10
+            left = min(x for x, _y in positions) - boundary_padding
+            top = min(y for _x, y in positions) - boundary_padding
+            right = max(x for x, _y in positions) + boundary_padding
+            bottom = max(y for _x, y in positions) + boundary_padding
+            canvas.create_rectangle(
+                left, top, right, bottom,
+                outline=zone_colors[zone],
+                width=3,
+                tags=("slot_zone_boundary",),
+            )
+            badge_width = max(42, len(zone) * 8 + 14)
+            badge_height = 22
+            badge_top = top - badge_height - 4
+            canvas.create_rectangle(
+                left, badge_top, left + badge_width, badge_top + badge_height,
+                fill=zone_colors[zone],
+                outline=zone_colors[zone],
+                tags=("slot_zone_label_badge",),
+            )
+            canvas.create_text(
+                left + badge_width / 2,
+                badge_top + badge_height / 2,
+                text=zone,
+                anchor="center",
+                fill="white",
+                font=("TkDefaultFont", 9, "bold"),
+                tags=("slot_zone_label",),
+            )
         assignments={}
         for row in self.slot_rows:
             if row["assignment_status"]=="ASSIGNED": assignments.setdefault(row["rack_id"],[]).append(row)
         class_colors={"A":"#d1495b","B":"#f3a712","C":"#4c9f70"}
         for rack in self.slot_racks:
-            x,y=self.slotting_screen_point(rack["x"],rack["y"],geometry); rack_rows=assignments.get(rack["rack_id"],[])
-            rack_class = rack_rows[0].get("rack_velocity_class", "") if rack_rows else ""
-            fill=class_colors.get(rack_class,"#7b8b92")
-            radius=7 if rack["rack_id"]==self.slot_selected_rack else 4
-            canvas.create_oval(x-radius,y-radius,x+radius,y+radius,fill=fill,outline="#087f8c" if radius==7 else "white",width=3 if radius==7 else 1,tags=("rack",f"rack:{rack['rack_id']}"))
+            rack_id = rack["rack_id"]
+            x, y = self.slotting_screen_point(rack["x"], rack["y"], geometry)
+            rack_rows = assignments.get(rack_id, [])
+            selected = rack_id == self.slot_selected_rack
+            if self.slot_handling_unit.get() == "AMR shelf":
+                unit_id = (
+                    str(rack_rows[0].get("handling_unit_id", ""))
+                    if rack_rows else ""
+                )
+                movement = self.slot_movement_by_unit.get(unit_id, {})
+                fill = class_colors.get(
+                    movement.get("movement_class", ""), "#7b8b92"
+                )
+                radius = 7 if selected else 4
+                canvas.create_oval(
+                    x-radius, y-radius, x+radius, y+radius,
+                    fill=fill,
+                    outline="#087f8c" if selected else "white",
+                    width=3 if selected else 1,
+                    tags=("rack", f"rack:{rack_id}", f"unit:{unit_id}"),
+                )
+                continue
+
+            # ASRS retrieves individual totes/pallets, so display movement rank
+            # at storage-slot level instead of assigning one colour to the rack.
+            locations = {}
+            for row in rack_rows:
+                occupied = row.get("occupied_handling_units") or [{
+                    "handling_unit_id": row.get("handling_unit_id", ""),
+                    "storage_level": row.get("storage_level", 1),
+                    "storage_slot": row.get("storage_slot", 1),
+                }]
+                for location in occupied:
+                    unit_id = str(location.get("handling_unit_id", "")).strip()
+                    if unit_id:
+                        locations.setdefault(unit_id, location)
+            outline_radius = 8 if selected else 6
+            canvas.create_oval(
+                x-outline_radius, y-outline_radius,
+                x+outline_radius, y+outline_radius,
+                fill="", outline="#087f8c" if selected else "#aab4b8",
+                width=3 if selected else 1,
+                tags=("rack", f"rack:{rack_id}"),
+            )
+            level_count = max(1, int(self.slot_levels.get()))
+            slot_count = max(1, int(self.slot_slots.get()))
+            dx = min(6.0, 30.0 / max(1, slot_count - 1))
+            dy = min(6.0, 30.0 / max(1, level_count - 1))
+            for unit_id, location in locations.items():
+                slot = int(location.get("storage_slot") or 1)
+                level_number = int(location.get("storage_level") or 1)
+                unit_x = x + (slot - (slot_count + 1) / 2) * dx
+                unit_y = y + (level_number - (level_count + 1) / 2) * dy
+                movement = self.slot_movement_by_unit.get(unit_id, {})
+                fill = class_colors.get(
+                    movement.get("movement_class", ""), "#7b8b92"
+                )
+                canvas.create_oval(
+                    unit_x-3, unit_y-3, unit_x+3, unit_y+3,
+                    fill=fill, outline="white", width=1,
+                    tags=("rack", f"rack:{rack_id}", f"unit:{unit_id}"),
+                )
         for index,vertex in enumerate(vertices):
             params=vertex[4] if len(vertex)>4 and isinstance(vertex[4],dict) else {}
             if "dropoff_ingestor" not in params: continue
             endpoint=str(self.slotting.typed_value(params["dropoff_ingestor"],vertex[3])); x,y=self.slotting_screen_point(vertex[0],vertex[1],geometry); r=6
             canvas.create_polygon(x,y-r,x+r,y,x,y+r,x-r,y,fill="#277da1",outline="white")
             canvas.create_text(x,y-11,text=endpoint,fill="#1d5d78",font=("TkDefaultFont",8,"bold"))
+        canvas.tag_raise("slot_zone_label_badge")
+        canvas.tag_raise("slot_zone_label")
         self.apply_canvas_viewport(canvas)
 
     def rack_attribute_detail_text(self, zone_path, bay_path):
@@ -3359,11 +3808,55 @@ class GridMapEditorApp:
         rack_class = rows[0].get("rack_velocity_class", "") if rows else ""
         rack_frequency_rank = rows[0].get("rack_frequency_rank", "") if rows else ""
         rack_pick_frequency = rows[0].get("rack_pick_frequency", "") if rows else ""
+        movement_rows = [
+            self.slot_movement_by_unit[unit_id]
+            for unit_id in unit_ids
+            if unit_id in self.slot_movement_by_unit
+        ]
+        if self.slot_handling_unit.get() != "AMR shelf":
+            all_unit_ids = {
+                str(unit.get("handling_unit_id", ""))
+                for row in rows
+                for unit in (
+                    row.get("occupied_handling_units") or [{
+                        "handling_unit_id": row.get("handling_unit_id", "")
+                    }]
+                )
+            }
+            unit_ids = sorted(unit_id for unit_id in all_unit_ids if unit_id)
+            movement_rows = [
+                self.slot_movement_by_unit[unit_id]
+                for unit_id in unit_ids
+                if unit_id in self.slot_movement_by_unit
+            ]
+        movement_classes = {
+            label: sum(row.get("movement_class") == label for row in movement_rows)
+            for label in ("A", "B", "C")
+        }
+        if self.slot_handling_unit.get() == "AMR shelf":
+            movement_detail = (
+                f"Shelf movement: class {movement_rows[0]['movement_class']} · "
+                f"rank {movement_rows[0]['visit_rank']} · "
+                f"{movement_rows[0]['visit_count']:,} Store ID + Date visits · "
+                f"visit rate {movement_rows[0]['visit_rate'] * 100:.1f}%\n"
+                if movement_rows else
+                "Shelf movement: unranked; import history and calculate ranks\n"
+            )
+        else:
+            movement_detail = (
+                f"Slot movement: {len(movement_rows)}/{len(unit_ids)} ranked · "
+                f"A {movement_classes['A']} / B {movement_classes['B']} / "
+                f"C {movement_classes['C']} · "
+                f"{sum(row['visit_count'] for row in movement_rows):,} total visits\n"
+                if movement_rows else
+                "Slot movement: unranked; import history and calculate ranks\n"
+            )
         self.slot_zone_detail.set(self.planned_zone_detail_text(zone_path, rows))
         self.slot_rack_detail.set(
             f"Static grid rack: {rack_id}\nPickup dispenser: {rack['pickup_dispenser_id']} · vertex {rack['vertex_index']}\n"
             f"Current static buffer address: {rows[0]['static_address'] if rows else rack.get('zone_id','UNASSIGNED')+'/'+rack['aisle_id']+'/'+rack['static_bay_id']}\n"
-            f"Rack ABC: {rack_class or 'unassigned'} · frequency rank {rack_frequency_rank or 'n/a'} · picks {rack_pick_frequency or 0}\n"
+            f"{movement_detail}"
+            f"Rack pick-frequency ABC: {rack_class or 'unassigned'} · frequency rank {rack_frequency_rank or 'n/a'} · picks {rack_pick_frequency or 0}\n"
             f"Assigned SKUs: {len(rows)} · A {classes['A']} / B {classes['B']} / C {classes['C']}\n"
             f"Storage flags: CHILLED={chilled_count} · OVERSIZE / WEIGHT EXCEPTION={exception_count}\n"
             f"Physical classes: "

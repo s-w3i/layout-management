@@ -9,6 +9,168 @@ import numpy as np
 from ..affinity import AffinityAnalysis
 
 
+def build_order_membership_masks(
+    analysis: AffinityAnalysis, sku_names: set[str] | None = None
+) -> tuple[dict[str, int], int]:
+    """Encode each SKU's store-day fulfillment groups as a compact bit mask."""
+    dataset = analysis.dataset
+    selected = (
+        (dataset.dates >= analysis.start_date.toordinal())
+        & (dataset.dates <= analysis.end_date.toordinal())
+    )
+    dates = dataset.dates[selected]
+    stores = dataset.store_indices[selected]
+    sku_indices = dataset.sku_indices[selected]
+    order = np.lexsort((sku_indices, stores, dates))
+    dates = dates[order]
+    stores = stores[order]
+    sku_indices = sku_indices[order]
+    unique_presence = np.ones(len(order), dtype=bool)
+    unique_presence[1:] = (
+        (dates[1:] != dates[:-1])
+        | (stores[1:] != stores[:-1])
+        | (sku_indices[1:] != sku_indices[:-1])
+    )
+    dates = dates[unique_presence]
+    stores = stores[unique_presence]
+    sku_indices = sku_indices[unique_presence]
+    group_start = np.ones(len(sku_indices), dtype=bool)
+    group_start[1:] = (
+        (dates[1:] != dates[:-1]) | (stores[1:] != stores[:-1])
+    )
+    group_indices = np.cumsum(group_start, dtype=np.int32) - 1
+    group_count = int(group_indices[-1]) + 1 if len(group_indices) else 0
+    masks = [0] * len(dataset.skus)
+    for sku_index, group_index in zip(sku_indices, group_indices):
+        masks[int(sku_index)] |= 1 << int(group_index)
+    allowed = sku_names if sku_names is not None else set(dataset.skus)
+    return {
+        str(sku): masks[index]
+        for index, sku in enumerate(dataset.skus)
+        if str(sku) in allowed and masks[index]
+    }, group_count
+
+
+def order_rack_touch_metrics(
+    analysis: AffinityAnalysis,
+    rows: list[dict],
+    order_masks: dict[str, int] | None = None,
+) -> dict:
+    """Measure distinct handling-unit rack touches per store-day group."""
+    if order_masks is None:
+        order_masks, group_count = build_order_membership_masks(analysis)
+    else:
+        group_count = analysis.store_day_count
+    rack_masks: dict[str, int] = {}
+    for row in rows:
+        if row.get("assignment_status") != "ASSIGNED":
+            continue
+        rack_id = str(row.get("rack_id", ""))
+        sku = str(row.get("sku", ""))
+        if rack_id and sku in order_masks:
+            rack_masks[rack_id] = rack_masks.get(rack_id, 0) | order_masks[sku]
+    touches = np.zeros(group_count, dtype=np.int32)
+    for mask in rack_masks.values():
+        remaining = mask
+        while remaining:
+            least_bit = remaining & -remaining
+            touches[least_bit.bit_length() - 1] += 1
+            remaining ^= least_bit
+    observed = touches[touches > 0]
+    total = int(observed.sum()) if len(observed) else 0
+    return {
+        "fulfillment_group_count": int(len(observed)),
+        "total_rack_touches": total,
+        "average_racks_per_group": (
+            float(observed.mean()) if len(observed) else 0.0
+        ),
+        "median_racks_per_group": (
+            float(np.median(observed)) if len(observed) else 0.0
+        ),
+        "p95_racks_per_group": (
+            float(np.percentile(observed, 95)) if len(observed) else 0.0
+        ),
+        "one_rack_group_fraction": (
+            float(np.mean(observed == 1)) if len(observed) else 0.0
+        ),
+    }
+
+
+def handling_unit_visit_metrics(
+    analysis: AffinityAnalysis,
+    rows: list[dict],
+    handling_unit_type: str,
+) -> dict:
+    """Rank deliverable units by distinct Store ID + Date task visits."""
+    sku_names = {
+        str(row.get("sku", "")) for row in rows
+        if row.get("assignment_status") == "ASSIGNED"
+    }
+    order_masks, _group_count = build_order_membership_masks(
+        analysis, sku_names
+    )
+    unit_masks: dict[str, int] = {}
+    unit_locations: dict[str, dict] = {}
+    for row in rows:
+        if row.get("assignment_status") != "ASSIGNED":
+            continue
+        sku_mask = order_masks.get(str(row.get("sku", "")), 0)
+        if not sku_mask:
+            continue
+        occupied_units = row.get("occupied_handling_units") or []
+        if handling_unit_type == "AMR shelf" or not occupied_units:
+            occupied_units = [{
+                "handling_unit_id": row.get("handling_unit_id", ""),
+                "rack_id": row.get("rack_id", ""),
+                "storage_level": row.get("storage_level", ""),
+                "storage_slot": row.get("storage_slot", ""),
+            }]
+        for location in occupied_units:
+            unit_id = str(location.get("handling_unit_id", "")).strip()
+            if not unit_id:
+                continue
+            unit_masks[unit_id] = unit_masks.get(unit_id, 0) | sku_mask
+            unit_locations.setdefault(unit_id, dict(location))
+    ranked = sorted(
+        unit_masks,
+        key=lambda unit_id: (-unit_masks[unit_id].bit_count(), unit_id),
+    )
+    total_visits = sum(unit_masks[unit_id].bit_count() for unit_id in ranked)
+    cumulative = 0
+    units = []
+    for rank, unit_id in enumerate(ranked, start=1):
+        visits = unit_masks[unit_id].bit_count()
+        previous_share = cumulative / total_visits if total_visits else 0.0
+        cumulative += visits
+        cumulative_share = cumulative / total_visits if total_visits else 0.0
+        movement_class = (
+            "A" if previous_share < 0.80
+            else "B" if previous_share < 0.95
+            else "C"
+        )
+        units.append({
+            **unit_locations[unit_id],
+            "handling_unit_id": unit_id,
+            "visit_rank": rank,
+            "visit_count": visits,
+            "visit_rate": visits / analysis.store_day_count,
+            "visit_share": visits / total_visits if total_visits else 0.0,
+            "cumulative_visit_share": cumulative_share,
+            "movement_class": movement_class,
+        })
+    return {
+        "grouping": "Store ID + Date",
+        "fulfillment_group_count": analysis.store_day_count,
+        "handling_unit_type": handling_unit_type,
+        "ranking_level": (
+            "shelf" if handling_unit_type == "AMR shelf" else "slot"
+        ),
+        "total_handling_unit_visits": total_visits,
+        "unit_count": len(units),
+        "units": units,
+    }
+
+
 def build_affinity_neighbors(
     analysis: AffinityAnalysis,
     sku_names: set[str],
@@ -48,6 +210,8 @@ def affinity_placement_order(
     base_order: list[dict],
     affinity_neighbors: dict[str, list[tuple[str, float, float, int]]],
     affinity_weight: float,
+    order_masks: dict[str, int] | None = None,
+    rack_capacity: int | None = None,
 ) -> list[dict]:
     """Blend affinity-cluster traversal with the existing ABC order.
 
@@ -67,6 +231,55 @@ def affinity_placement_order(
     }
     class_rank = {"A": 0.0, "B": 0.5, "C": 1.0}
     abc_weight = 1.0 - affinity_weight
+    if order_masks:
+        remaining = set(rows_by_sku)
+        ordered = []
+        cluster_mask = 0
+        cluster_size = 0
+        capacity = max(1, int(rack_capacity or len(base_order)))
+        while remaining:
+            if cluster_size == 0:
+                maximum_signal = max(
+                    order_masks.get(sku, 0).bit_count() for sku in remaining
+                ) or 1
+                affinity_cost = {
+                    sku: 1.0
+                    - order_masks.get(sku, 0).bit_count() / maximum_signal
+                    for sku in remaining
+                }
+            else:
+                overlaps = {
+                    sku: (
+                        order_masks.get(sku, 0) & cluster_mask
+                    ).bit_count()
+                    for sku in remaining
+                }
+                maximum_signal = max(overlaps.values(), default=0) or 1
+                affinity_cost = {
+                    sku: 1.0 - overlaps[sku] / maximum_signal
+                    for sku in remaining
+                }
+            selected = min(
+                remaining,
+                key=lambda sku: (
+                    abc_weight * class_rank.get(
+                        str(rows_by_sku[sku].get("velocity_class", "")).upper(),
+                        1.0,
+                    )
+                    + affinity_weight * affinity_cost[sku],
+                    affinity_cost[sku],
+                    base_position[sku] if abc_weight > 0 else 0,
+                    sku,
+                ),
+            )
+            remaining.remove(selected)
+            ordered.append(rows_by_sku[selected])
+            cluster_mask |= order_masks.get(selected, 0)
+            cluster_size += 1
+            if cluster_size >= capacity:
+                cluster_mask = 0
+                cluster_size = 0
+        return ordered
     strongest_edge = max(
         (
             float(edge[1])
@@ -125,7 +338,6 @@ def affinity_placement_order(
 
 def affinity_physical_signature(candidate_key: tuple) -> tuple:
     """Keep physical-fit preferences fixed while ABC competes with affinity."""
-    candidate_sort_key = candidate_key[-1]
     return (
         candidate_key[0],
         candidate_key[1],
@@ -134,7 +346,6 @@ def affinity_physical_signature(candidate_key: tuple) -> tuple:
         candidate_key[6],
         candidate_key[7],
         candidate_key[8],
-        candidate_sort_key[0],
     )
 
 

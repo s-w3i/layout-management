@@ -8,8 +8,10 @@ import math
 from ..affinity import AffinityAnalysis
 from .affinity_support import (
     build_affinity_neighbors,
+    build_order_membership_masks,
     empirical_service_cap_candidates,
     normalized_metric,
+    order_rack_touch_metrics,
 )
 
 
@@ -74,6 +76,9 @@ class AbcAffinitySlottingStrategy:
             known_skus,
             minimum_shared_store_days,
             minimum_affinity_score,
+        )
+        order_masks, _order_group_count = build_order_membership_masks(
+            affinity_analysis, known_skus
         )
 
         baseline_rows, baseline_summary = service.generate_basic(
@@ -164,9 +169,16 @@ class AbcAffinitySlottingStrategy:
                 ergonomic_weight_heuristic=ergonomic_weight_heuristic,
                 auto_plan_oversize=auto_plan_oversize,
             )
-            if trial_summary["unassigned_count"] > baseline_summary["unassigned_count"]:
+            if (
+                affinity_weight < 1.0
+                and trial_summary["unassigned_count"]
+                > baseline_summary["unassigned_count"]
+            ):
                 continue
             metrics = trial_summary["affinity_metrics"]
+            rack_touch_metrics = order_rack_touch_metrics(
+                affinity_analysis, trial_rows, order_masks
+            )
             trials.append({
                 "maximum_service_distance_increase": service_cap,
                 "weighted_pair_distance_m": float(
@@ -179,6 +191,10 @@ class AbcAffinitySlottingStrategy:
                     metrics["same_rack_affinity_fraction"]
                 ),
                 "mixed_abc_rack_count": int(metrics["mixed_abc_rack_count"]),
+                "total_rack_touches": int(
+                    rack_touch_metrics["total_rack_touches"]
+                ),
+                "order_rack_touch_metrics": rack_touch_metrics,
                 "summary": trial_summary,
                 "rows": trial_rows,
                 "location_attributes": trial_location_attributes,
@@ -189,21 +205,23 @@ class AbcAffinitySlottingStrategy:
             )
         pair_values = [row["weighted_pair_distance_m"] for row in trials]
         service_values = [row["weighted_service_distance_m"] for row in trials]
+        rack_touch_values = [row["total_rack_touches"] for row in trials]
         for trial in trials:
-            pair_normalized = normalized_metric(
-                pair_values, trial["weighted_pair_distance_m"]
+            affinity_normalized = normalized_metric(
+                rack_touch_values, trial["total_rack_touches"]
             )
             service_normalized = normalized_metric(
                 service_values, trial["weighted_service_distance_m"]
             )
             trial["selection_loss"] = math.sqrt(
-                affinity_weight * pair_normalized**2
+                affinity_weight * affinity_normalized**2
                 + (1.0 - affinity_weight) * service_normalized**2
             )
         selected_trial = min(
             trials,
             key=lambda row: (
                 row["selection_loss"],
+                row["total_rack_touches"],
                 row["weighted_service_distance_m"],
                 row["weighted_pair_distance_m"],
                 row["maximum_service_distance_increase"],
@@ -219,6 +237,11 @@ class AbcAffinitySlottingStrategy:
             location_attributes.update(selected_trial["location_attributes"])
         baseline_metrics = baseline_summary["affinity_metrics"]
         final_metrics = final_summary["affinity_metrics"]
+        baseline_rack_touches = order_rack_touch_metrics(
+            affinity_analysis, baseline_rows, order_masks
+        )
+        final_rack_touches = selected_trial["order_rack_touch_metrics"]
+        final_summary["order_rack_touch_metrics"] = final_rack_touches
 
         def relative_change(current, baseline):
             return (
@@ -231,9 +254,10 @@ class AbcAffinitySlottingStrategy:
             "parameter_status": "AUTO_SUGGESTED" if automatic else "USER_ADJUSTED",
             "method": "data_driven_relationship_pareto_and_map_quantile",
             "weight_semantics": (
-                "affinity_weight balances same-bay affinity consolidation "
-                "against ABC bay purity"
+                "0 is pure ABC placement; 1 is pure affinity placement; "
+                "intermediate values weight both objectives"
             ),
+            "abc_influences_placement": affinity_weight < 1.0,
             "affinity_weight": affinity_weight,
             "minimum_shared_store_days": minimum_shared_store_days,
             "minimum_affinity_score": minimum_affinity_score,
@@ -274,6 +298,16 @@ class AbcAffinitySlottingStrategy:
             ),
             "assigned_count_change": (
                 final_summary["assigned_count"] - baseline_summary["assigned_count"]
+            ),
+            "basic_order_rack_touch_metrics": baseline_rack_touches,
+            "abc_affinity_order_rack_touch_metrics": final_rack_touches,
+            "total_rack_touch_change": (
+                final_rack_touches["total_rack_touches"]
+                - baseline_rack_touches["total_rack_touches"]
+            ),
+            "total_rack_touch_change_fraction": relative_change(
+                final_rack_touches["total_rack_touches"],
+                baseline_rack_touches["total_rack_touches"],
             ),
         }
         return final_rows, final_summary

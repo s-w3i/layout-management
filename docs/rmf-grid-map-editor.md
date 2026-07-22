@@ -136,10 +136,11 @@ Use this workflow:
 4. Select the strategy, then generate the layout.
 
 For `abc_affinity`, select the order-history workbook and an affinity weight.
-The weight directly balances same-bay affinity consolidation against ABC bay
-purity: 0% behaves like ABC grouping, while 100% lets strongly related SKUs from
-different ABC classes share a bay when storage constraints permit. For an AMR
-shelf, this can reduce separate shelf pickups for related order lines.
+The weight directly balances same-bay affinity consolidation against ABC
+placement: 0% is pure ABC, 100% is pure affinity with no ABC placement
+tie-breaker, and intermediate values use the selected ratio. For an AMR
+shelf, the affinity objective directly minimizes incremental distinct-rack
+touches across `(Store ID, Date)` fulfillment groups.
 The first generation automatically suggests minimum shared store-days, minimum
 affinity score, and maximum service-distance increase from that workbook and
 warehouse map. The values appear after generation and become editable. Use
@@ -197,7 +198,11 @@ and `Z02/A01` are independent. Children inherit ancestor values and can override
 them; clearing a local value restores inheritance. **Load saved layout…** in
 the **Interactive Slotting Layout** tab restores this configuration from a v2
 slotting JSON. That tab is a read-only assignment viewer; zone dragging remains
-in the **Inventory Slotting** tab.
+in the **Inventory Slotting** tab. The viewer accepts an order-history Excel
+workbook and ranks deliverable-unit visits after grouping its rows by
+`(Store ID, Date)`. AMR layouts are visualized and ranked at whole-shelf level;
+ASRS layouts are visualized and ranked at tote/pallet slot level. Its movement
+colour is independent of SKU and rack pick-frequency ABC classes.
 
 The generated slotting JSON separates the static buffer from the movable unit:
 

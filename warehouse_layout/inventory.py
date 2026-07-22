@@ -22,6 +22,8 @@ class InventoryService:
         "handling_unit_id", "dynamic_address_level", "dynamic_address",
         "storage_level", "storage_slot", "workstations_evaluated",
         "average_workstation_distance_m", "routing_status",
+        "occupied_static_addresses", "occupied_buffer_ids",
+        "occupied_storage_location_addresses", "occupied_handling_units",
     )
     STATIC_PROFILE_FIELDS = (
         "rmf_grid_address", "zone_id", "aisle_id", "static_bay_id", "buffer_id",
@@ -322,3 +324,12 @@ class InventoryService:
                 buffer_model=buffer_model,
             )
         )
+        row["occupied_storage_location_addresses"] = [
+            row["storage_location_address"]
+        ]
+        row["occupied_handling_units"] = [{
+            "handling_unit_id": row["handling_unit_id"],
+            "rack_id": row["rack_id"],
+            "storage_level": level,
+            "storage_slot": slot,
+        }]

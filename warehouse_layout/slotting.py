@@ -23,6 +23,7 @@ from .slotting_strategies.affinity_support import (
     affinity_placement_order,
     build_affinity_neighbors,
     empirical_service_cap_candidates,
+    handling_unit_visit_metrics,
     normalized_metric,
 )
 from .slotting_repository import SlottingLayoutRepository as SlottingLayoutRepository
@@ -335,6 +336,7 @@ class SlottingService:
     _empirical_service_cap_candidates = staticmethod(empirical_service_cap_candidates)
     _normalized_metric = staticmethod(normalized_metric)
     _affinity_layout_metrics = staticmethod(affinity_layout_metrics)
+    handling_unit_visit_metrics = staticmethod(handling_unit_visit_metrics)
 
     _plan_storage_zones = staticmethod(plan_storage_zones)
     derive_zone_storage_types = staticmethod(derive_zone_storage_types)
