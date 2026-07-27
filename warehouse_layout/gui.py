@@ -1606,11 +1606,14 @@ class GridMapEditorApp:
         ttk.Button(rack_view, text="Show all assignments", command=lambda: self.show_slotting_rows(self.slot_rows)).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(7, 0))
 
     def _build_traffic_tab(self, parent):
+        self.traffic_layout_path = tk.StringVar(value=str(DEFAULT_SLOTTING_OUTPUT))
         self.traffic_grid_project_path = tk.StringVar(value=str(DEFAULT_GRID_INPUT))
         self.traffic_velocity_path = tk.StringVar(value=str(DEFAULT_VELOCITY_INPUT))
         self.traffic_chilled_path = tk.StringVar()
         self.traffic_order_path = tk.StringVar(value=str(DEFAULT_TRAFFIC_INPUT))
         self.traffic_affinity_weight = tk.StringVar(value="50")
+        self.traffic_initial_strategy = tk.StringVar(value="ABC + Affinity")
+        self.traffic_last_workflow = None
         self.traffic_handling_unit = tk.StringVar(value="AMR shelf")
         self.traffic_levels = tk.StringVar(value="1")
         self.traffic_slots = tk.StringVar(value="6")
@@ -1622,10 +1625,13 @@ class GridMapEditorApp:
         self.traffic_max_travel = tk.StringVar()
         self.traffic_hotspot_percentile = tk.StringVar()
         self.traffic_parameter_status = tk.StringVar(
-            value="Generate once to calculate warehouse-specific parameters."
+            value="Run either workflow to calculate warehouse-specific parameters."
         )
         self.traffic_status = tk.StringVar(
-            value="Select raw inputs; this tab runs ABC, affinity, validation, visits, and traffic placement."
+            value=(
+                "Optimize a saved layout directly, or generate an ABC/affinity "
+                "layout and run the full traffic pipeline."
+            )
         )
         self.traffic_kpis = tk.StringVar(
             value="Groups —  · Unit visits —  · Mapped —  · Peak —  · P95 —  · Travel —  · Relocated —"
@@ -1655,69 +1661,99 @@ class GridMapEditorApp:
 
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
-        form = ttk.LabelFrame(parent, text="Traffic-aware slotting inputs", padding=10)
+        form = ttk.Frame(parent)
         form.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
-        form.columnconfigure(1, weight=1)
-        form.columnconfigure(4, weight=1)
+        form.columnconfigure(0, weight=1, uniform="traffic_settings")
+        form.columnconfigure(1, weight=1, uniform="traffic_settings")
 
-        ttk.Label(form, text="Grid project JSON").grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Entry(form, textvariable=self.traffic_grid_project_path).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        self.traffic_initial_settings_frame = ttk.LabelFrame(
+            form,
+            text="Initial ABC / affinity layout generation · Full pipeline only",
+            padding=10,
+        )
+        self.traffic_initial_settings_frame.grid(
+            row=0, column=0, sticky="nsew", padx=(0, 5)
+        )
+        initial = self.traffic_initial_settings_frame
+        initial.columnconfigure(1, weight=1)
+
+        ttk.Label(initial, text="Grid project JSON").grid(
+            row=0, column=0, sticky="w", pady=3
+        )
+        ttk.Entry(
+            initial, textvariable=self.traffic_grid_project_path
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(
-            form, text="Browse…",
+            initial, text="Browse…",
             command=lambda: self.browse_slot_input(
                 self.traffic_grid_project_path,
                 [("Grid project JSON", "*.grid.json"), ("JSON", "*.json")],
             ),
-        ).grid(row=0, column=2, padx=(2, 12), pady=3)
-        ttk.Label(form, text="Order-history Excel").grid(row=0, column=3, sticky="w", pady=3)
-        ttk.Entry(form, textvariable=self.traffic_order_path).grid(row=0, column=4, sticky="ew", padx=(8, 4), pady=3)
-        ttk.Button(
-            form, text="Browse…",
-            command=lambda: self.browse_slot_input(
-                self.traffic_order_path,
-                [("Excel workbook", "*.xlsx"), ("All files", "*")],
-            ),
-        ).grid(row=0, column=5, pady=3)
+        ).grid(row=0, column=2, pady=3)
 
-        ttk.Label(form, text="ABC SKU velocity CSV").grid(row=1, column=0, sticky="w", pady=3)
-        ttk.Entry(form, textvariable=self.traffic_velocity_path).grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=3)
-        ttk.Button(
-            form, text="Browse…",
-            command=lambda: self.browse_slot_input(
-                self.traffic_velocity_path, [("CSV", "*.csv"), ("All files", "*")],
-            ),
-        ).grid(row=1, column=2, padx=(2, 12), pady=3)
-        ttk.Label(form, text="Chilled SKU CSV (optional)").grid(row=1, column=3, sticky="w", pady=3)
-        ttk.Entry(form, textvariable=self.traffic_chilled_path).grid(row=1, column=4, sticky="ew", padx=(8, 4), pady=3)
-        ttk.Button(
-            form, text="Browse…",
-            command=lambda: self.browse_slot_input(
-                self.traffic_chilled_path, [("CSV", "*.csv"), ("All files", "*")],
-            ),
-        ).grid(row=1, column=5, pady=3)
-
-        ttk.Label(form, text="Movement network").grid(row=2, column=0, sticky="w", pady=3)
-        network_box = ttk.Combobox(
-            form, textvariable=self.traffic_network_mode, state="readonly",
-            values=("Use embedded RMF map", "Use generic network JSON"), width=25,
+        ttk.Label(initial, text="ABC SKU velocity CSV").grid(
+            row=1, column=0, sticky="w", pady=3
         )
-        network_box.grid(row=2, column=1, sticky="w", padx=(8, 4), pady=3)
-        network_box.bind("<<ComboboxSelected>>", self.traffic_network_mode_changed)
-        self.traffic_network_entry = ttk.Entry(form, textvariable=self.traffic_network_path)
-        self.traffic_network_entry.grid(row=2, column=3, columnspan=2, sticky="ew", padx=(0, 4), pady=3)
-        self.traffic_network_browse = ttk.Button(
-            form, text="Browse network…",
+        ttk.Entry(
+            initial, textvariable=self.traffic_velocity_path
+        ).grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(
+            initial, text="Browse…",
             command=lambda: self.browse_slot_input(
-                self.traffic_network_path,
-                [("Movement network JSON", "*.json"), ("All files", "*")],
+                self.traffic_velocity_path,
+                [("CSV", "*.csv"), ("All files", "*")],
             ),
-        )
-        self.traffic_network_browse.grid(row=2, column=5, pady=3)
+        ).grid(row=1, column=2, pady=3)
 
-        setup = ttk.Frame(form)
-        setup.grid(row=3, column=0, columnspan=3, sticky="w", pady=3)
-        ttk.Label(setup, text="Affinity weight %").pack(side="left")
-        ttk.Spinbox(setup, from_=0, to=100, textvariable=self.traffic_affinity_weight, width=6).pack(side="left", padx=(5, 10))
+        ttk.Label(initial, text="Chilled SKU CSV (optional)").grid(
+            row=2, column=0, sticky="w", pady=3
+        )
+        ttk.Entry(
+            initial, textvariable=self.traffic_chilled_path
+        ).grid(row=2, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(
+            initial, text="Browse…",
+            command=lambda: self.browse_slot_input(
+                self.traffic_chilled_path,
+                [("CSV", "*.csv"), ("All files", "*")],
+            ),
+        ).grid(row=2, column=2, pady=3)
+
+        ttk.Label(initial, text="Initial slotting strategy").grid(
+            row=3, column=0, sticky="w", pady=3
+        )
+        strategy_controls = ttk.Frame(initial)
+        strategy_controls.grid(
+            row=3, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3
+        )
+        self.traffic_strategy_box = ttk.Combobox(
+            strategy_controls,
+            textvariable=self.traffic_initial_strategy,
+            state="readonly",
+            values=("ABC", "ABC + Affinity"),
+            width=17,
+        )
+        self.traffic_strategy_box.pack(side="left")
+        self.traffic_strategy_box.bind(
+            "<<ComboboxSelected>>", self.traffic_initial_strategy_changed
+        )
+        self.traffic_affinity_label = ttk.Label(
+            strategy_controls, text="Affinity weight %"
+        )
+        self.traffic_affinity_label.pack(side="left", padx=(10, 3))
+        self.traffic_affinity_spin = ttk.Spinbox(
+            strategy_controls, from_=0, to=100,
+            textvariable=self.traffic_affinity_weight, width=6,
+        )
+        self.traffic_affinity_spin.pack(side="left")
+
+        ttk.Label(initial, text="Derived storage setup").grid(
+            row=4, column=0, sticky="w", pady=3
+        )
+        setup = ttk.Frame(initial)
+        setup.grid(
+            row=4, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3
+        )
         ttk.Label(setup, text="Unit").pack(side="left")
         ttk.Combobox(
             setup, textvariable=self.traffic_handling_unit, state="disabled",
@@ -1733,43 +1769,157 @@ class GridMapEditorApp:
             setup, from_=1, to=100, textvariable=self.traffic_slots,
             width=4, state="disabled",
         ).pack(side="left", padx=(4, 0))
-        dates = ttk.Frame(form)
-        dates.grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
+
+        ttk.Label(
+            initial,
+            text=(
+                "Ignored by Optimize Existing Layout; that workflow reuses "
+                "the saved assignments."
+            ),
+            foreground="#4d646d",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        self.traffic_optimization_settings_frame = ttk.LabelFrame(
+            form,
+            text="Traffic-aware optimization · Both workflows",
+            padding=10,
+        )
+        self.traffic_optimization_settings_frame.grid(
+            row=0, column=1, sticky="nsew", padx=(5, 0)
+        )
+        traffic_settings = self.traffic_optimization_settings_frame
+        traffic_settings.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            traffic_settings, text="Existing layout (traffic-only)"
+        ).grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(
+            traffic_settings, textvariable=self.traffic_layout_path
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(
+            traffic_settings, text="Browse…",
+            command=lambda: self.browse_slot_input(
+                self.traffic_layout_path,
+                [("Slotting layout", "*.slotting.json"), ("JSON", "*.json")],
+            ),
+        ).grid(row=0, column=2, pady=3)
+
+        ttk.Label(traffic_settings, text="Order-history Excel").grid(
+            row=1, column=0, sticky="w", pady=3
+        )
+        ttk.Entry(
+            traffic_settings, textvariable=self.traffic_order_path
+        ).grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(
+            traffic_settings, text="Browse…",
+            command=lambda: self.browse_slot_input(
+                self.traffic_order_path,
+                [("Excel workbook", "*.xlsx"), ("All files", "*")],
+            ),
+        ).grid(row=1, column=2, pady=3)
+
+        ttk.Label(traffic_settings, text="Movement network").grid(
+            row=2, column=0, sticky="w", pady=3
+        )
+        network_box = ttk.Combobox(
+            traffic_settings,
+            textvariable=self.traffic_network_mode,
+            state="readonly",
+            values=(
+                "Use embedded RMF map",
+                "Use network / grid project JSON",
+            ),
+            width=25,
+        )
+        network_box.grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3
+        )
+        network_box.bind(
+            "<<ComboboxSelected>>", self.traffic_network_mode_changed
+        )
+        ttk.Label(traffic_settings, text="Network JSON").grid(
+            row=3, column=0, sticky="w", pady=3
+        )
+        self.traffic_network_entry = ttk.Entry(
+            traffic_settings, textvariable=self.traffic_network_path
+        )
+        self.traffic_network_entry.grid(
+            row=3, column=1, sticky="ew", padx=(8, 4), pady=3
+        )
+        self.traffic_network_browse = ttk.Button(
+            traffic_settings, text="Browse…",
+            command=lambda: self.browse_slot_input(
+                self.traffic_network_path,
+                [
+                    ("Movement or grid project JSON", "*.json"),
+                    ("All files", "*"),
+                ],
+            ),
+        )
+        self.traffic_network_browse.grid(row=3, column=2, pady=3)
+
+        dates = ttk.Frame(traffic_settings)
+        dates.grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=3
+        )
         ttk.Label(dates, text="Inclusive dates").pack(side="left")
         ttk.Entry(dates, textvariable=self.traffic_start_date, width=11).pack(side="left", padx=(8, 3))
         ttk.Label(dates, text="to").pack(side="left")
         ttk.Entry(dates, textvariable=self.traffic_end_date, width=11).pack(side="left", padx=(3, 0))
-        ttk.Label(dates, text="(YYYY-MM-DD; blank = full range)", foreground="#4d646d").pack(side="left", padx=(7, 0))
-        parameters = ttk.Frame(form)
-        parameters.grid(row=4, column=3, columnspan=3, sticky="w", pady=3)
-        ttk.Label(parameters, text="Auto parameters:").pack(side="left")
-        ttk.Label(parameters, text="Max travel increase %").pack(side="left", padx=(8, 3))
+        ttk.Label(
+            dates, text="(YYYY-MM-DD; blank = full range)",
+            foreground="#4d646d",
+        ).pack(side="left", padx=(7, 0))
+
+        parameters = ttk.Frame(traffic_settings)
+        parameters.grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=3
+        )
+        ttk.Label(parameters, text="Traffic parameters").pack(side="left")
+        ttk.Label(
+            parameters, text="Max travel increase %"
+        ).pack(side="left", padx=(8, 3))
         self.traffic_max_travel_entry = ttk.Entry(parameters, textvariable=self.traffic_max_travel, width=7)
         self.traffic_max_travel_entry.pack(side="left")
         ttk.Label(parameters, text="Hotspot percentile").pack(side="left", padx=(8, 3))
         self.traffic_hotspot_entry = ttk.Entry(parameters, textvariable=self.traffic_hotspot_percentile, width=7)
         self.traffic_hotspot_entry.pack(side="left")
 
-        ttk.Label(form, text="Optimized layout output").grid(row=5, column=0, sticky="w", pady=3)
-        ttk.Entry(form, textvariable=self.traffic_output_path).grid(row=5, column=1, columnspan=4, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Label(traffic_settings, text="Optimized layout output").grid(
+            row=6, column=0, sticky="w", pady=3
+        )
+        ttk.Entry(
+            traffic_settings, textvariable=self.traffic_output_path
+        ).grid(row=6, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(
-            form, text="Browse…", command=lambda: self._browse_traffic_output()
-        ).grid(row=5, column=5, pady=3)
+            traffic_settings,
+            text="Browse…",
+            command=lambda: self._browse_traffic_output(),
+        ).grid(row=6, column=2, pady=3)
+
         actions = ttk.Frame(form)
-        actions.grid(row=6, column=0, columnspan=6, sticky="ew", pady=(7, 0))
-        self.traffic_analyze_button = ttk.Button(actions, text="Run stages 1–5", command=self.start_traffic_analysis)
-        self.traffic_generate_button = ttk.Button(actions, text="Run full pipeline", command=self.start_traffic_generation)
-        self.traffic_regenerate_button = ttk.Button(actions, text="Regenerate with edited values", command=lambda: self.start_traffic_generation(True))
+        actions.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+        )
+        self.traffic_existing_button = ttk.Button(
+            actions,
+            text="Optimize Existing Layout",
+            command=self.start_existing_layout_traffic,
+        )
+        self.traffic_full_button = ttk.Button(
+            actions,
+            text="Generate Layout + Optimize Traffic",
+            command=self.start_full_traffic_pipeline,
+        )
         self.traffic_cancel_button = ttk.Button(actions, text="Cancel", command=self.cancel_traffic_work, state="disabled")
         self.traffic_save_button = ttk.Button(actions, text="Save layout", command=self.save_traffic_layout, state="disabled")
         self.traffic_export_button = ttk.Button(actions, text="Export report…", command=self.export_traffic_report, state="disabled")
         for widget in (
-            self.traffic_analyze_button, self.traffic_generate_button,
-            self.traffic_regenerate_button, self.traffic_cancel_button,
+            self.traffic_existing_button, self.traffic_full_button,
+            self.traffic_cancel_button,
             self.traffic_save_button, self.traffic_export_button,
         ):
             widget.pack(side="left", padx=(0, 6))
-        ttk.Progressbar(actions, variable=tk.DoubleVar(value=0), maximum=100, length=180).pack_forget()
         self.traffic_progress_value = tk.DoubleVar(value=0)
         self.traffic_progress = ttk.Progressbar(
             actions, variable=self.traffic_progress_value, maximum=100, length=180
@@ -1777,6 +1927,7 @@ class GridMapEditorApp:
         self.traffic_progress.pack(side="left", padx=(8, 6))
         ttk.Label(actions, textvariable=self.traffic_parameter_status, foreground="#315b66").pack(side="left", padx=(5, 0))
         self.traffic_network_mode_changed()
+        self.traffic_initial_strategy_changed()
 
         summary = ttk.Frame(parent, padding=(12, 2))
         summary.grid(row=1, column=0, sticky="ew")
@@ -1873,10 +2024,16 @@ class GridMapEditorApp:
         return tree
 
     def traffic_network_mode_changed(self, _event=None):
-        enabled = self.traffic_network_mode.get() == "Use generic network JSON"
+        enabled = self.traffic_network_mode.get() != "Use embedded RMF map"
         state = "normal" if enabled else "disabled"
         self.traffic_network_entry.configure(state=state)
         self.traffic_network_browse.configure(state=state)
+
+    def traffic_initial_strategy_changed(self, _event=None):
+        enabled = self.traffic_initial_strategy.get() == "ABC + Affinity"
+        self.traffic_affinity_spin.configure(
+            state="normal" if enabled else "disabled"
+        )
 
     def load_traffic_area_map(self):
         try:
@@ -1968,62 +2125,114 @@ class GridMapEditorApp:
         if path:
             self.traffic_output_path.set(path)
 
-    def start_traffic_analysis(self):
-        self._start_traffic_work("analyze", False)
+    def start_existing_layout_traffic(self):
+        self._start_traffic_work("existing_layout")
 
-    def start_traffic_generation(self, use_adjusted=False):
-        self._start_traffic_work("generate", use_adjusted)
+    def start_full_traffic_pipeline(self):
+        self._start_traffic_work("full_pipeline")
 
-    def _start_traffic_work(self, mode, use_adjusted):
+    def _start_traffic_work(self, workflow_mode):
         if self.traffic_worker and self.traffic_worker.is_alive():
             return
         try:
-            grid_project_path = Path(
-                self.traffic_grid_project_path.get()
-            ).expanduser().resolve()
-            grid_project = self.rmf_maps.load_project(grid_project_path)
-            if (
-                grid_project.storage_layout is None
-                or not grid_project.storage_layout.buffers
-            ):
-                raise ValueError(
-                    "grid project has no storage buffers; assign and save buffers "
-                    "in Grid Map Editor first"
-                )
-            building = grid_project.to_building_dict()
-            storage_layout = grid_project.storage_layout
-            velocity_path = Path(self.traffic_velocity_path.get()).expanduser().resolve()
             order_path = Path(self.traffic_order_path.get()).expanduser().resolve()
-            chilled_path = (
-                Path(self.traffic_chilled_path.get()).expanduser().resolve()
-                if self.traffic_chilled_path.get().strip() else None
-            )
             network_path = (
                 Path(self.traffic_network_path.get()).expanduser().resolve()
-                if self.traffic_network_mode.get() == "Use generic network JSON"
+                if self.traffic_network_mode.get() != "Use embedded RMF map"
                 else None
             )
             start = date.fromisoformat(self.traffic_start_date.get()) if self.traffic_start_date.get().strip() else None
             end = date.fromisoformat(self.traffic_end_date.get()) if self.traffic_end_date.get().strip() else None
-            affinity_weight = float(self.traffic_affinity_weight.get()) / 100.0
-            if not 0 <= affinity_weight <= 1:
-                raise ValueError("affinity weight must be between 0% and 100%")
-            levels = int(storage_layout.levels_per_rack)
-            slots = int(storage_layout.slots_per_level)
-            handling_unit = storage_layout.handling_unit_type
+            use_adjusted = (
+                self.traffic_result is not None
+                and self.traffic_last_workflow == workflow_mode
+                and bool(self.traffic_max_travel.get().strip())
+                and bool(self.traffic_hotspot_percentile.get().strip())
+            )
+            max_travel = float(self.traffic_max_travel.get()) / 100.0 if use_adjusted else None
+            hotspot = float(self.traffic_hotspot_percentile.get()) if use_adjusted else None
+
+            layout_path = baseline_payload = None
+            grid_project_path = grid_project = building = storage_layout = None
+            velocity_path = chilled_path = None
+            levels = slots = None
+            handling_unit = ""
+            initial_strategy = "basic"
+            affinity_weight = 0.0
+            inline_zones = {}
+            inline_locations = {}
+            inline_catalog = self.attributes.starter_catalog()
+            if workflow_mode == "existing_layout":
+                layout_path = Path(
+                    self.traffic_layout_path.get()
+                ).expanduser().resolve()
+                baseline_payload = self.layouts.load(layout_path)
+                building = baseline_payload["building"]
+                capacity = baseline_payload.get("rack_capacity", {})
+                levels = int(capacity.get("levels") or 1)
+                slots = int(capacity.get("slots_per_level") or 1)
+                handling_unit = str(
+                    baseline_payload.get("handling_unit_type") or "AMR shelf"
+                )
+                initial_strategy = str(
+                    baseline_payload.get("strategy") or "basic"
+                )
+            elif workflow_mode == "full_pipeline":
+                grid_project_path = Path(
+                    self.traffic_grid_project_path.get()
+                ).expanduser().resolve()
+                grid_project = self.rmf_maps.load_project(grid_project_path)
+                if (
+                    grid_project.storage_layout is None
+                    or not grid_project.storage_layout.buffers
+                ):
+                    raise ValueError(
+                        "grid project has no storage buffers; assign and save "
+                        "buffers in Grid Map Editor first"
+                    )
+                building = grid_project.to_building_dict()
+                storage_layout = grid_project.storage_layout
+                velocity_path = Path(
+                    self.traffic_velocity_path.get()
+                ).expanduser().resolve()
+                chilled_path = (
+                    Path(self.traffic_chilled_path.get()).expanduser().resolve()
+                    if self.traffic_chilled_path.get().strip() else None
+                )
+                initial_strategy = (
+                    "basic"
+                    if self.traffic_initial_strategy.get() == "ABC"
+                    else "abc_affinity"
+                )
+                if initial_strategy == "abc_affinity":
+                    affinity_weight = float(
+                        self.traffic_affinity_weight.get()
+                    ) / 100.0
+                    if not 0 <= affinity_weight <= 1:
+                        raise ValueError(
+                            "affinity weight must be between 0% and 100%"
+                        )
+                levels = int(storage_layout.levels_per_rack)
+                slots = int(storage_layout.slots_per_level)
+                handling_unit = storage_layout.handling_unit_type
+                if self.traffic_loaded_grid_project_path != grid_project_path:
+                    if not self.load_traffic_area_map():
+                        return
+                inline_zones = copy.deepcopy(self.traffic_zone_assignments)
+                inline_locations = copy.deepcopy(
+                    self.traffic_location_attributes
+                )
+                inline_catalog = copy.deepcopy(
+                    self.traffic_attribute_catalog
+                )
+            else:
+                raise ValueError(f"unknown traffic workflow {workflow_mode}")
+
             self.traffic_levels.set(str(levels))
             self.traffic_slots.set(str(slots))
             self.traffic_handling_unit.set(handling_unit)
-            max_travel = (
-                float(self.traffic_max_travel.get()) / 100.0
-                if use_adjusted else None
-            )
-            hotspot = float(self.traffic_hotspot_percentile.get()) if use_adjusted else None
         except (ValueError, OSError) as exc:
             messagebox.showerror("Traffic-aware slotting", str(exc))
-            return
-        if use_adjusted and (not self.traffic_max_travel.get().strip() or not self.traffic_hotspot_percentile.get().strip()):
-            messagebox.showerror("Traffic-aware slotting", "Generate an automatic suggestion before editing parameters.")
             return
         # A new attempt invalidates any prior saveable recommendation. If this
         # run cannot place every SKU, the UI must not offer a stale layout as
@@ -2033,20 +2242,14 @@ class GridMapEditorApp:
         self.traffic_result = None
         self.traffic_output_payload = None
         self.traffic_pipeline_result = None
-        self._set_traffic_busy(False)
-        inline_zones = {}
-        inline_locations = {}
-        inline_catalog = self.attributes.starter_catalog()
-        if self.traffic_loaded_grid_project_path != grid_project_path:
-            if not self.load_traffic_area_map():
-                return
-        inline_zones = copy.deepcopy(self.traffic_zone_assignments)
-        inline_locations = copy.deepcopy(self.traffic_location_attributes)
-        inline_catalog = copy.deepcopy(self.traffic_attribute_catalog)
         self.traffic_area_mode.set(False)
         self.traffic_cancel_event.clear()
         self.traffic_progress_value.set(0)
-        self.traffic_status.set("Starting traffic analysis…")
+        self.traffic_status.set(
+            "Loading saved layout for traffic optimization…"
+            if workflow_mode == "existing_layout"
+            else f"Starting full pipeline from {self.traffic_initial_strategy.get()}…"
+        )
         self._set_traffic_busy(True)
 
         def report(current, total, message):
@@ -2054,48 +2257,61 @@ class GridMapEditorApp:
 
         def worker():
             try:
-                catalog = inline_catalog
-                locations = inline_locations
-                zones = inline_zones
-                sku_rows = self.slotting.load_velocity(
-                    velocity_path, catalog, chilled_path
-                )
-                report(1, 7, "Loaded warehouse project and SKU demand")
                 dataset = self.affinity.load_orders(
                     order_path,
                     progress=lambda current, total, message: report(current, total, message),
                     cancelled=self.traffic_cancel_event.is_set,
                 )
-                affinity_analysis = self.affinity.analyze(dataset, start, end)
                 network = (
                     self.traffic.load_network(network_path)
                     if network_path is not None
                     else self.traffic.network_from_rmf(building)
                 )
-                pipeline = self.traffic.run_full_pipeline(
-                    building, sku_rows, affinity_analysis, network,
-                    affinity_weight=affinity_weight,
-                    levels_per_rack=levels,
-                    slots_per_level=slots,
-                    handling_unit_type=handling_unit,
-                    zone_assignments=zones,
-                    attribute_catalog=catalog,
-                    location_attributes=locations,
-                    storage_layout=storage_layout,
-                    start_date=start,
-                    end_date=end,
-                    optimize_traffic=mode == "generate",
-                    maximum_travel_increase=max_travel,
-                    hotspot_percentile=hotspot,
-                    source_grid_project=str(grid_project_path),
-                    source_velocity=str(velocity_path),
-                    source_chilled=str(chilled_path or ""),
-                    source_orders=str(order_path),
-                    progress=report,
-                    cancelled=self.traffic_cancel_event.is_set,
-                )
+                if workflow_mode == "existing_layout":
+                    pipeline = self.traffic.run_existing_layout(
+                        baseline_payload, dataset, network,
+                        start_date=start,
+                        end_date=end,
+                        maximum_travel_increase=max_travel,
+                        hotspot_percentile=hotspot,
+                        baseline_path=str(layout_path),
+                        source_orders=str(order_path),
+                        progress=report,
+                        cancelled=self.traffic_cancel_event.is_set,
+                    )
+                else:
+                    sku_rows = self.slotting.load_velocity(
+                        velocity_path, inline_catalog, chilled_path
+                    )
+                    affinity_source = dataset
+                    if initial_strategy == "abc_affinity":
+                        affinity_source = self.affinity.analyze(
+                            dataset, start, end
+                        )
+                    pipeline = self.traffic.run_full_pipeline(
+                        building, sku_rows, affinity_source, network,
+                        initial_strategy=initial_strategy,
+                        affinity_weight=affinity_weight,
+                        levels_per_rack=levels,
+                        slots_per_level=slots,
+                        handling_unit_type=handling_unit,
+                        zone_assignments=inline_zones,
+                        attribute_catalog=inline_catalog,
+                        location_attributes=inline_locations,
+                        storage_layout=storage_layout,
+                        start_date=start,
+                        end_date=end,
+                        maximum_travel_increase=max_travel,
+                        hotspot_percentile=hotspot,
+                        source_grid_project=str(grid_project_path),
+                        source_velocity=str(velocity_path),
+                        source_chilled=str(chilled_path or ""),
+                        source_orders=str(order_path),
+                        progress=report,
+                        cancelled=self.traffic_cancel_event.is_set,
+                    )
                 payload = pipeline.pretraffic_payload
-                demand = pipeline.affinity_demand
+                demand = pipeline.baseline_demand
                 analysis = pipeline.pretraffic_analysis
                 result = pipeline.optimization
                 output_payload = pipeline.output_payload
@@ -2116,11 +2332,8 @@ class GridMapEditorApp:
 
     def _set_traffic_busy(self, busy):
         state = "disabled" if busy else "normal"
-        self.traffic_analyze_button.configure(state=state)
-        self.traffic_generate_button.configure(state=state)
-        self.traffic_regenerate_button.configure(
-            state="disabled" if busy or self.traffic_result is None else "normal"
-        )
+        self.traffic_existing_button.configure(state=state)
+        self.traffic_full_button.configure(state=state)
         self.traffic_cancel_button.configure(state="normal" if busy else "disabled")
         self.traffic_save_button.configure(
             state="disabled" if busy or self.traffic_output_payload is None else "normal"
@@ -2209,6 +2422,8 @@ class GridMapEditorApp:
         self.traffic_result = result
         self.traffic_output_payload = output_payload
         self.traffic_pipeline_result = pipeline
+        self.traffic_last_workflow = pipeline.workflow_mode
+        self.traffic_building = payload.get("building")
         self.traffic_selected_unit = None
         self.traffic_start_date.set(demand.start_date)
         self.traffic_end_date.set(demand.end_date)
@@ -2221,7 +2436,9 @@ class GridMapEditorApp:
             self.traffic_view_mode.set("After")
         else:
             self.traffic_view_mode.set("Before")
-            self.traffic_parameter_status.set("Analysis complete; generate to derive optimization parameters.")
+            self.traffic_parameter_status.set(
+                "Traffic analysis completed without an optimization result."
+            )
         self.traffic_progress_value.set(100)
         self._set_traffic_busy(False)
         self.populate_traffic_results()
@@ -2242,18 +2459,18 @@ class GridMapEditorApp:
             self.traffic_pipeline_result.grouping_metrics
             if self.traffic_pipeline_result else {}
         )
-        basic_visits = int(grouping.get(
-            "basic_handling_unit_visits", before.demand.handling_unit_visits
+        baseline_visits = int(grouping.get(
+            "baseline_handling_unit_visits",
+            before.demand.handling_unit_visits,
         ))
-        grouped_visits = int(grouping.get(
-            "affinity_handling_unit_visits", before.demand.handling_unit_visits
-        ))
-        saved_fraction = float(grouping.get(
-            "handling_unit_visit_reduction_fraction", 0.0
-        ))
+        strategy = str(grouping.get("initial_strategy", "basic"))
+        strategy_label = (
+            "ABC + Affinity" if strategy == "abc_affinity" else "ABC"
+        )
         self.traffic_kpis.set(
-            f"Groups {before.demand.fulfillment_groups:,}  · ABC visits {basic_visits:,} → grouped {grouped_visits:,} "
-            f"({saved_fraction * 100:+.2f}%)  · Mapped {len(before.mapped_units):,}  · "
+            f"Groups {before.demand.fulfillment_groups:,}  · "
+            f"{strategy_label} unit visits {baseline_visits:,}  · "
+            f"Mapped {len(before.mapped_units):,}  · "
             f"Raw peak {before.metrics['raw_peak_load']:.1f} → {after.metrics['raw_peak_load']:.1f}  · "
             f"Raw P95 {before.metrics['raw_p95_load']:.1f} → {after.metrics['raw_p95_load']:.1f}  · "
             f"Travel {before.metrics['expected_travel']:.1f} → {after.metrics['expected_travel']:.1f}  · Relocated {relocated:,}"
@@ -2310,11 +2527,10 @@ class GridMapEditorApp:
             }
             if grouping:
                 for label, value in (
-                    ("ABC handling-unit visits", basic_visits),
-                    ("Affinity-grouped visits", grouped_visits),
-                    ("Visits saved", grouping["handling_unit_visits_saved"]),
-                    ("Visit reduction", f"{saved_fraction * 100:.3f}%"),
-                    ("Affinity weight", f"{float(self.traffic_affinity_weight.get()):.3g}%"),
+                    ("Traffic workflow", self.traffic_pipeline_result.workflow_mode),
+                    ("Initial strategy", strategy_label),
+                    ("Baseline handling-unit visits", baseline_visits),
+                    ("Fulfillment groups", before.demand.fulfillment_groups),
                 ):
                     self.traffic_parameter_tree.insert("", "end", values=(label, value))
             for key, value in self.traffic_result.parameters.items():

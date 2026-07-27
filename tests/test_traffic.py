@@ -140,6 +140,44 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertEqual(demand.unit_visits, {"UNIT_H": 10, "UNIT_L": 1})
         self.assertEqual(demand.handling_unit_visits, 11)
 
+    def test_asrs_demand_counts_each_occupied_slot_retrieval(self):
+        payload = self.payload()
+        high = payload["assignments"][0]
+        high["occupied_buffer_ids"] = ["BUFFER_1", "BUFFER_2"]
+        high["occupied_handling_units"] = [
+            {
+                "handling_unit_id": "UNIT_H",
+                "buffer_id": "BUFFER_1",
+            },
+            {
+                "handling_unit_id": "UNIT_H_2",
+                "buffer_id": "BUFFER_2",
+            },
+        ]
+        payload["buffers"] = [
+            {"buffer_id": "BUFFER_1"},
+            {"buffer_id": "BUFFER_2"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            order_path = Path(directory) / "orders.xlsx"
+            self.write_orders(order_path)
+            dataset = AffinityService(Path(directory) / "cache").load_orders(
+                order_path
+            )
+            demand = self.service.build_demand(dataset, payload["assignments"])
+        self.assertEqual(
+            demand.unit_visits,
+            {"UNIT_H": 20, "UNIT_L": 1},
+        )
+        self.assertEqual(demand.handling_unit_visits, 21)
+        buffers = self.service._buffer_records(
+            payload, payload["assignments"]
+        )
+        self.assertEqual(
+            [row["handling_unit_ids"] for row in buffers],
+            [["UNIT_H"], ["UNIT_H_2"]],
+        )
+
     def test_generic_routes_capacities_and_deterministic_optimization(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -177,6 +215,27 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertEqual(network.endpoints[0].endpoint_id, "PACK_01")
         self.assertTrue(network.links)
         self.assertFalse(network.resource_capacities)
+
+    def test_grid_project_json_can_be_loaded_as_movement_network(self):
+        project = GridProject(
+            GridSpec(2, 1, 1, "traffic-grid-json", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (2, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "warehouse.grid.json"
+            path.write_text(
+                json.dumps(project.to_project_dict()),
+                encoding="utf-8",
+            )
+            network = self.service.load_network(path)
+        self.assertEqual(network.source_type, "grid_project_json")
+        self.assertEqual(network.source_path, str(path.resolve()))
+        self.assertIn("RACK_01", network.storage_nodes)
+        self.assertEqual(network.endpoints[0].endpoint_id, "PACK_01")
+        self.assertTrue(network.links)
 
     def test_hotspot_suggestion_changes_with_resource_distribution(self):
         first = self.service._suggest_hotspot_percentile([1, 1, 1, 10])
@@ -220,20 +279,20 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 optimize_traffic=True, source_orders=str(order_path),
                 source_grid_project="/input/warehouse.grid.json",
             )
-        self.assertEqual(result.basic_summary["sku_count"], 2)
+        self.assertEqual(result.basic_summary, {})
         self.assertEqual(result.affinity_summary["assigned_count"], 2)
+        self.assertEqual(result.workflow_mode, "full_pipeline")
+        self.assertEqual(result.initial_strategy, "abc_affinity")
         self.assertEqual(result.grouping_metrics["hard_validation_status"], "PASSED")
-        self.assertLessEqual(
-            result.affinity_demand.handling_unit_visits,
-            result.basic_demand.handling_unit_visits,
-        )
         self.assertIsNotNone(result.optimization)
-        self.assertEqual(
-            result.output_payload["strategy"], "abc_affinity_traffic_pipeline"
-        )
+        self.assertEqual(result.output_payload["strategy"], "abc_affinity")
         self.assertEqual(
             result.output_payload["traffic_analysis"]["unit_visits"],
-            result.affinity_demand.unit_visits,
+            result.baseline_demand.unit_visits,
+        )
+        self.assertEqual(
+            result.output_payload["traffic_configuration"]["workflow_mode"],
+            "full_pipeline",
         )
         self.assertIn("pipeline", result.output_payload)
         self.assertEqual(
@@ -243,6 +302,119 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertNotIn(
             "building_yaml", result.pretraffic_payload["sources"]
         )
+
+    def test_full_pipeline_can_start_from_pure_abc(self):
+        project = GridProject(
+            GridSpec(3, 1, 1, "abc-pipeline", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (1, 0): Marker("rack", "RACK_02"),
+                (3, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        building = project.to_building_dict()
+        skus = [
+            {
+                "sku": "SKU_H", "pick_frequency": 10,
+                "velocity_class": "A",
+                "sku_requirements": dict(self.requirements),
+            },
+            {
+                "sku": "SKU_L", "pick_frequency": 1,
+                "velocity_class": "C",
+                "sku_requirements": dict(self.requirements),
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            order_path = directory / "orders.xlsx"
+            self.write_orders(order_path)
+            dataset = AffinityService(directory / "cache").load_orders(
+                order_path
+            )
+            result = self.service.run_full_pipeline(
+                building, skus, dataset,
+                self.service.network_from_rmf(building),
+                initial_strategy="basic",
+                levels_per_rack=1,
+                slots_per_level=2,
+                attribute_catalog=self.catalog,
+                source_orders=str(order_path),
+            )
+        self.assertEqual(result.initial_strategy, "basic")
+        self.assertEqual(result.basic_summary["assigned_count"], 2)
+        self.assertEqual(result.affinity_summary, {})
+        self.assertEqual(result.output_payload["strategy"], "basic")
+        self.assertEqual(
+            result.output_payload["traffic_configuration"]["initial_strategy"],
+            "basic",
+        )
+
+    def test_existing_layout_is_optimized_without_regeneration(self):
+        payload = self.payload()
+        payload.update({
+            "strategy": "basic",
+            "handling_unit_type": "Tote",
+            "rack_capacity": {"levels": 1, "slots_per_level": 1},
+        })
+        baseline_membership = [
+            (row["sku"], row["handling_unit_id"])
+            for row in payload["assignments"]
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            order_path = directory / "orders.xlsx"
+            network_path = directory / "network.json"
+            self.write_orders(order_path)
+            self.write_network(network_path)
+            dataset = AffinityService(directory / "cache").load_orders(
+                order_path
+            )
+            result = self.service.run_existing_layout(
+                payload,
+                dataset,
+                self.service.load_network(network_path),
+                baseline_path="/input/baseline.slotting.json",
+                source_orders=str(order_path),
+            )
+        self.assertEqual(result.workflow_mode, "existing_layout")
+        self.assertEqual(result.initial_strategy, "basic")
+        self.assertEqual(
+            [
+                (row["sku"], row["handling_unit_id"])
+                for row in result.pretraffic_payload["assignments"]
+            ],
+            baseline_membership,
+        )
+        self.assertEqual(
+            result.output_payload["sources"]["traffic_baseline_layout"],
+            "/input/baseline.slotting.json",
+        )
+        self.assertEqual(
+            result.output_payload["traffic_configuration"]["workflow_mode"],
+            "existing_layout",
+        )
+
+    def test_existing_layout_rejects_unassigned_skus(self):
+        payload = self.payload()
+        payload["assignments"][1]["assignment_status"] = (
+            "UNASSIGNED_NO_COMPATIBLE_LOCATION"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            order_path = directory / "orders.xlsx"
+            network_path = directory / "network.json"
+            self.write_orders(order_path)
+            self.write_network(network_path)
+            dataset = AffinityService(directory / "cache").load_orders(
+                order_path
+            )
+            with self.assertRaises(InsufficientStorageError):
+                self.service.run_existing_layout(
+                    payload,
+                    dataset,
+                    self.service.load_network(network_path),
+                )
 
     def test_strict_oversize_uses_contiguous_slots_and_overweight_uses_level_two(self):
         project = GridProject(

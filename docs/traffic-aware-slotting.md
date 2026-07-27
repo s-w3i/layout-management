@@ -1,14 +1,26 @@
 # Traffic-Aware Slotting
 
-The **Traffic-Aware Slotting** tab runs the complete recommendation pipeline
-from an editable grid project, velocity data, and order history. It does not
-require an assignment from the Inventory Slotting tab or a building YAML.
+The **Traffic-Aware Slotting** tab supports two workflows:
 
-The stages are ABC baseline generation, affinity-based SKU grouping, shared hard-rule
-validation, handling-unit visit calculation, traffic-aware complete-unit
-placement, and final comparison. The `.grid.json` project supplies the physical
+1. **Optimize Existing Layout** loads a complete `.slotting.json`, validates its
+   existing assignments, and applies traffic-aware complete-unit relocation.
+   It never regenerates or reorders the baseline with ABC or affinity.
+2. **Generate Layout + Optimize Traffic** starts from an editable `.grid.json`,
+   velocity data, and order history. Select either **ABC** or
+   **ABC + Affinity** as the initial layout strategy, then run hard-rule
+   validation, demand calculation, traffic optimization, and final comparison.
+
+Neither workflow reads a building YAML. The grid project supplies the physical
 map, generated buffers, rack zones, chilled/capacity settings, attribute
-catalog, and inherited hierarchy values.
+catalog, and inherited hierarchy values. A saved layout carries the same data
+as a self-contained baseline.
+
+The UI separates these inputs into two panels. **Initial ABC / affinity layout
+generation** contains the grid project, velocity/chilled data, initial strategy,
+and affinity weight used only by the full pipeline. **Traffic-aware
+optimization** contains the optional existing layout, order history, movement
+network, date range, congestion/travel parameters, and optimized output used by
+the traffic stage.
 
 ## Warehouse configuration and complete assignment
 
@@ -21,8 +33,9 @@ not duplicate its editors.
 If chilled or compatible capacity is insufficient, generation stops and directs
 the operator to update and resave the grid project before rerunning.
 
-The generated ABC and affinity baselines use the same allocator and hard rules
-as Inventory Slotting. Standard inventory is placed before exception inventory.
+The generated ABC or ABC + affinity baseline uses the same allocator and hard
+rules as Inventory Slotting. Only the selected baseline is generated. Standard
+inventory is placed before exception inventory.
 Ambient user zones remain non-mixed `STANDARD` or `OVERSIZE` zones. A chilled
 zone can split by whole rack into `*_chill_normal` and `*_chill_oversize`, with
 standard chilled demand receiving capacity first. Known overweight and
@@ -40,18 +53,25 @@ bypassed, and units with incomplete physical data remain fixed and reported.
 ## Demand definition
 
 The order workbook must contain `Date`, `Store ID`, and `Item or SKU`. One
-fulfillment group is one `(Store ID, Date)`. Each `handling_unit_id` contributes
-one visit per group, regardless of how many requested SKUs or duplicate order
-lines from that group are stored in the unit. Workbook SKUs absent from the
-layout are reported.
+fulfillment group is one `(Store ID, Date)`. For an AMR layout, each movable
+shelf contributes one visit per group regardless of how many requested SKUs or
+duplicate lines are stored on that shelf. For an ASRS layout, each occupied
+slot/tote required by the group contributes one retrieval; multi-slot items
+therefore count every occupied physical unit. Those retrievals remain grouped
+under the item's primary relocatable unit during traffic optimization. Workbook
+SKUs absent from the layout are reported.
 
 ## Movement networks
 
-An embedded RMF map is adapted automatically. Pickup dispensers become storage
-nodes, drop-off ingestors become equally weighted endpoints, and directed lanes
-become movement resources.
+An embedded RMF map is adapted automatically. The **Use network / grid project
+JSON** option can also load an editable `rmf_grid_map_editor/v2` `.grid.json`
+directly, including `warehouse_grid.grid.json`; no separate network conversion
+is required. In either case, pickup dispensers become storage nodes, drop-off
+ingestors become equally weighted endpoints, and directed lanes become movement
+resources.
 
-Other delivery systems use `warehouse_movement_network/v1`:
+For explicit resources, capacities, travel times, or non-RMF delivery systems,
+use `warehouse_movement_network/v1`:
 
 ```json
 {
@@ -104,8 +124,9 @@ at that location. Swapped racks remain outlined in both Before and After views.
 ## Outputs
 
 **Save layout** writes an `inventory_slotting_layout/v2` document containing the
-new assignments, source paths, traffic settings, before/after metrics, trials,
-relocations, fixed units, and an operation-log record.
+new assignments, refreshed buffer occupancy, workflow mode, initial strategy,
+source paths, traffic settings, before/after metrics, trials, relocations, fixed
+units, and an operation-log record.
 
 **Export report** writes:
 

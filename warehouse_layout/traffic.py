@@ -21,7 +21,12 @@ from .attributes import (
     STANDARD_STORAGE_DEFAULTS,
     StorageAttributeService,
 )
-from .config import SLOTTING_SCHEMA
+from .config import (
+    LEGACY_PROJECT_SCHEMA,
+    PROJECT_SCHEMA,
+    SLOTTING_SCHEMA,
+)
+from .domain import GridProject
 from .slotting import SlottingService
 from .slotting_rules import overweight_storage_level, planned_storage_type
 
@@ -129,7 +134,7 @@ class TrafficOptimizationResult:
 
 @dataclass(slots=True)
 class TrafficPipelineResult:
-    """All ABC, grouping, visit, and traffic stages from raw inputs."""
+    """One traffic workflow, optionally including initial layout generation."""
 
     basic_assignments: list[dict]
     basic_summary: dict
@@ -142,6 +147,32 @@ class TrafficPipelineResult:
     pretraffic_analysis: TrafficAnalysis
     optimization: TrafficOptimizationResult | None
     output_payload: dict | None
+    workflow_mode: str = "full_pipeline"
+    initial_strategy: str = "abc_affinity"
+
+    @property
+    def baseline_assignments(self) -> list[dict]:
+        return (
+            self.basic_assignments
+            if self.initial_strategy == "basic"
+            else self.affinity_assignments
+        )
+
+    @property
+    def baseline_summary(self) -> dict:
+        return (
+            self.basic_summary
+            if self.initial_strategy == "basic"
+            else self.affinity_summary
+        )
+
+    @property
+    def baseline_demand(self) -> TrafficDemand:
+        return (
+            self.basic_demand
+            if self.initial_strategy == "basic"
+            else self.affinity_demand
+        )
 
 
 class TrafficAwareSlottingService:
@@ -156,6 +187,7 @@ class TrafficAwareSlottingService:
         "zone_storage_type", "effective_location_attributes",
         "auto_attribute_overrides", "occupied_static_addresses",
         "occupied_storage_location_addresses", "occupied_buffer_ids",
+        "occupied_handling_units",
     )
 
     def __init__(
@@ -240,11 +272,24 @@ class TrafficAwareSlottingService:
         )
 
     def load_network(self, path: Path) -> MovementNetwork:
-        """Load and validate a generic movement network JSON document."""
+        """Load a generic movement network or adapt an editable grid project."""
         source = Path(path).expanduser().resolve()
         payload = json.loads(source.read_text(encoding="utf-8"))
+        if payload.get("schema") in {
+            PROJECT_SCHEMA,
+            LEGACY_PROJECT_SCHEMA,
+        }:
+            project = GridProject.from_project_dict(payload)
+            network = self.network_from_rmf(project.to_building_dict())
+            network.source_type = "grid_project_json"
+            network.source_path = str(source)
+            return network
         if payload.get("schema") != NETWORK_SCHEMA:
-            raise ValueError(f"movement network schema must be {NETWORK_SCHEMA}")
+            raise ValueError(
+                "network JSON must be a warehouse movement network "
+                f"({NETWORK_SCHEMA}) or RMF grid project "
+                f"({PROJECT_SCHEMA})"
+            )
         nodes: dict[str, MovementNode] = {}
         storage_nodes: dict[str, str] = {}
         for value in payload.get("nodes", []):
@@ -329,35 +374,55 @@ class TrafficAwareSlottingService:
         end = end_date or dataset.max_date
         if start > end:
             raise ValueError("Start date must be on or before end date")
-        sku_units: dict[str, str] = {}
+        sku_units: dict[str, dict[str, set[str]]] = {}
         for row in assignments:
             if row.get("assignment_status") != "ASSIGNED":
                 continue
-            sku, unit = str(row.get("sku", "")).strip(), str(row.get("handling_unit_id", "")).strip()
-            if sku and unit:
-                sku_units[sku] = unit
+            sku = str(row.get("sku", "")).strip()
+            if not sku:
+                continue
+            occupied_units = row.get("occupied_handling_units") or []
+            if row.get("handling_unit_type") == "AMR shelf" or not occupied_units:
+                occupied_units = [{
+                    "handling_unit_id": row.get("handling_unit_id", "")
+                }]
+            units = {
+                str(item.get("handling_unit_id", "")).strip()
+                for item in occupied_units
+                if str(item.get("handling_unit_id", "")).strip()
+            }
+            if units:
+                primary = str(row.get("handling_unit_id", "")).strip()
+                if primary:
+                    sku_units.setdefault(sku, {}).setdefault(
+                        primary, set()
+                    ).update(units)
         mask = (dataset.dates >= start.toordinal()) & (dataset.dates <= end.toordinal())
         indices = np.flatnonzero(mask)
         if not len(indices):
             raise ValueError("No valid order events fall within the selected date range")
-        groups: dict[tuple[int, int], set[str]] = {}
+        groups: dict[tuple[int, int], dict[str, set[str]]] = {}
         unmatched: set[str] = set()
         matched_events = 0
         for event in indices:
             sku = dataset.skus[int(dataset.sku_indices[event])]
-            unit = sku_units.get(sku)
-            if unit is None:
+            unit_groups = sku_units.get(sku)
+            if not unit_groups:
                 unmatched.add(sku)
                 continue
             key = (int(dataset.dates[event]), int(dataset.store_indices[event]))
-            groups.setdefault(key, set()).add(unit)
+            task_units = groups.setdefault(key, {})
+            for primary, units in unit_groups.items():
+                task_units.setdefault(primary, set()).update(units)
             matched_events += 1
         if not groups:
             raise ValueError("No order SKU is assigned in the selected slotting layout")
         unit_visits: dict[str, int] = {}
         for units in groups.values():
-            for unit in units:
-                unit_visits[unit] = unit_visits.get(unit, 0) + 1
+            for primary, physical_units in units.items():
+                unit_visits[primary] = (
+                    unit_visits.get(primary, 0) + len(physical_units)
+                )
         return TrafficDemand(
             unit_visits=unit_visits,
             fulfillment_groups=len(groups),
@@ -729,6 +794,28 @@ class TrafficAwareSlottingService:
             for shape, row in grouped[source].items():
                 row.update(snapshots[target][shape])
                 level, slot = shape
+                source_units = (
+                    snapshots[source][shape].get("occupied_handling_units") or []
+                )
+                target_units = (
+                    snapshots[target][shape].get("occupied_handling_units") or []
+                )
+                relocated_units = []
+                for index, target_location in enumerate(target_units):
+                    location = dict(target_location)
+                    source_unit_id = (
+                        source_units[index].get("handling_unit_id")
+                        if index < len(source_units)
+                        else source
+                    )
+                    location["handling_unit_id"] = source_unit_id
+                    relocated_units.append(location)
+                row["occupied_handling_units"] = relocated_units or [{
+                    "handling_unit_id": source,
+                    "rack_id": row.get("rack_id", ""),
+                    "storage_level": level,
+                    "storage_slot": slot,
+                }]
                 row["dynamic_address"], row["dynamic_address_level"] = self.slotting.build_dynamic_address(
                     str(row["zone_id"]), str(row["aisle_id"]), str(row["static_bay_id"]),
                     level, slot, str(row.get("handling_unit_type", "")), source,
@@ -1158,13 +1245,313 @@ class TrafficAwareSlottingService:
             if not compatible:
                 raise ValueError(f"traffic result unit {unit} failed validation: {reason}")
 
+    def validate_traffic_baseline(self, payload: dict) -> dict:
+        """Apply the shared hard rules before any traffic relocation."""
+        rows = payload.get("assignments", [])
+        unassigned = [
+            row for row in rows if row.get("assignment_status") != "ASSIGNED"
+        ]
+        if unassigned:
+            summary = copy.deepcopy(payload.get("summary", {}))
+            counts: dict[str, int] = {}
+            for row in unassigned:
+                status = str(row.get("assignment_status", "UNASSIGNED"))
+                counts[status] = counts.get(status, 0) + 1
+            summary["unassigned_count"] = len(unassigned)
+            summary["unassigned_status_counts"] = counts
+            summary.setdefault("capacity", len(rows) - len(unassigned))
+            raise InsufficientStorageError(summary)
+        if not rows:
+            raise ValueError("slotting layout contains no assignments")
+
+        levels_per_rack = int(
+            payload.get("rack_capacity", {}).get("levels") or 1
+        )
+        catalog = self.attributes.normalize_catalog(
+            payload.get("attribute_catalog")
+        )
+        locations = payload.get("location_attributes", {})
+        invalid = []
+        unverified = 0
+        for row in rows:
+            requirements = row.get("sku_requirements") or {}
+            profile = self.attributes.physical_profile(requirements)
+            required_storage_type = planned_storage_type(profile)
+            actual_storage_type = str(
+                row.get("planned_storage_type")
+                or row.get("zone_storage_type")
+                or row.get("storage_area_type")
+                or ""
+            ).upper()
+            if actual_storage_type and actual_storage_type != required_storage_type:
+                invalid.append(
+                    f"{row.get('sku', '')}: {required_storage_type} inventory "
+                    f"cannot use a {actual_storage_type} segment"
+                )
+                continue
+            if profile["data_status"] != "COMPLETE":
+                unverified += 1
+                continue
+            occupied_addresses = row.get("occupied_static_addresses") or [
+                str(row.get("static_address", ""))
+            ]
+            issues = []
+            primary_effective = None
+            generic_requirements = {
+                key: value for key, value in requirements.items()
+                if key not in PHYSICAL_DIMENSION_KEYS
+            }
+            for address in occupied_addresses:
+                effective, _sources = self.attributes.effective_attributes(
+                    str(row.get("storage_location_address") or address),
+                    locations,
+                )
+                primary_effective = primary_effective or effective
+                issues.extend(self.attributes.compatibility_issues(
+                    generic_requirements, effective, catalog
+                ))
+            level_span = int(row.get("occupied_level_span") or 1)
+            slot_span = int(
+                row.get("occupied_horizontal_slot_span")
+                or len(occupied_addresses)
+            )
+            if self.slotting.required_slot_footprint(
+                requirements, primary_effective or {}, level_span, slot_span
+            ) is None:
+                issues.append(
+                    f"requires more than the reserved {level_span} × {slot_span} "
+                    "level/slot footprint"
+                )
+            if (
+                profile["storage_class"]
+                in {"OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"}
+                and int(row.get("storage_level") or 1)
+                != overweight_storage_level(levels_per_rack)
+            ):
+                issues.append(
+                    "overweight inventory requires level "
+                    f"{overweight_storage_level(levels_per_rack)}"
+                )
+            if issues:
+                invalid.append(
+                    f"{row.get('sku', '')}: "
+                    + "; ".join(dict.fromkeys(issues))
+                )
+        if invalid:
+            raise ValueError(
+                "slotting layout failed hard compatibility validation: "
+                + " | ".join(invalid[:5])
+            )
+        return {
+            "hard_validation_status": "PASSED",
+            "unverified_physical_sku_count": unverified,
+        }
+
+    @staticmethod
+    def _buffer_records(payload: dict, rows: list[dict]) -> list[dict]:
+        """Rebuild occupied/empty buffer records from the supplied assignments."""
+        occupied: dict[str, set[str]] = {}
+        for row in rows:
+            if row.get("assignment_status") != "ASSIGNED":
+                continue
+            default_unit = str(row.get("handling_unit_id", ""))
+            units = row.get("occupied_handling_units") or [{
+                "handling_unit_id": default_unit
+            }]
+            buffer_ids = [
+                str(value) for value in (row.get("occupied_buffer_ids") or [])
+                if str(value)
+            ]
+            mapped = [
+                (
+                    str(unit.get("buffer_id", "")),
+                    str(unit.get("handling_unit_id", "")),
+                )
+                for unit in units
+                if str(unit.get("buffer_id", ""))
+                and str(unit.get("handling_unit_id", ""))
+            ]
+            if not mapped and len(buffer_ids) == len(units):
+                ordered_units = sorted(
+                    units,
+                    key=lambda unit: (
+                        int(unit.get("storage_level") or 1),
+                        int(unit.get("storage_slot") or 1),
+                    ),
+                )
+                mapped = [
+                    (buffer_id, str(unit.get("handling_unit_id", "")))
+                    for buffer_id, unit in zip(
+                        sorted(buffer_ids), ordered_units
+                    )
+                ]
+            if mapped:
+                for buffer_id, unit_id in mapped:
+                    occupied.setdefault(buffer_id, set()).add(unit_id)
+            else:
+                unit_ids = {
+                    str(unit.get("handling_unit_id", "")).strip()
+                    for unit in units
+                    if str(unit.get("handling_unit_id", "")).strip()
+                }
+                for buffer_id in buffer_ids:
+                    occupied.setdefault(buffer_id, set()).update(unit_ids)
+        source_records = payload.get("buffers", [])
+        if not source_records:
+            storage_layout = payload.get("storage_layout") or {}
+            source_records = storage_layout.get("buffers", [])
+        records = []
+        for source in source_records:
+            buffer_id = str(source.get("buffer_id", ""))
+            records.append({
+                **dict(source),
+                "status": "OCCUPIED" if buffer_id in occupied else "EMPTY",
+                "handling_unit_ids": sorted(occupied.get(buffer_id, set())),
+            })
+        return records
+
+    def _complete_traffic_workflow(
+        self,
+        payload: dict,
+        dataset: AffinityDataset,
+        network: MovementNetwork,
+        *,
+        workflow_mode: str,
+        initial_strategy: str,
+        start_date=None,
+        end_date=None,
+        maximum_travel_increase: float | None = None,
+        hotspot_percentile: float | None = None,
+        baseline_path: str = "",
+        source_orders: str = "",
+        progress: ProgressCallback | None = None,
+        cancelled: CancelCallback | None = None,
+        progress_offset: int = 0,
+        progress_total: int = 5,
+        generation_summary: dict | None = None,
+        optimize_traffic: bool = True,
+    ) -> TrafficPipelineResult:
+        def stage(current: int, message: str) -> None:
+            if cancelled and cancelled():
+                raise TrafficCancelledError("Traffic pipeline was cancelled")
+            if progress:
+                progress(progress_offset + current, progress_total, message)
+
+        stage(1, "Validating hard storage compatibility")
+        validation = self.validate_traffic_baseline(payload)
+        stage(2, "Calculating Store ID + Date handling-unit visits")
+        demand = self.build_demand(
+            dataset, payload["assignments"], start_date, end_date
+        )
+        grouping_metrics = {
+            "baseline_handling_unit_visits": demand.handling_unit_visits,
+            "baseline_fulfillment_groups": demand.fulfillment_groups,
+            "initial_strategy": initial_strategy,
+            **validation,
+        }
+        payload = copy.deepcopy(payload)
+        payload.setdefault("summary", {})["pipeline_grouping"] = grouping_metrics
+        payload["buffers"] = self._buffer_records(payload, payload["assignments"])
+        stage(3, "Routing grouped handling-unit demand")
+        pretraffic_analysis = self.analyze(
+            payload["assignments"], network, demand
+        )
+        optimization = output_payload = None
+        if optimize_traffic:
+            stage(4, "Optimizing complete handling-unit placement")
+            optimization = self.optimize(
+                payload, network, demand,
+                maximum_travel_increase=maximum_travel_increase,
+                hotspot_percentile=hotspot_percentile,
+                progress=None,
+                cancelled=cancelled,
+            )
+            output_payload = self.result_payload(
+                payload, optimization,
+                baseline_path=baseline_path,
+                order_path=source_orders,
+                network=network,
+                workflow_mode=workflow_mode,
+                initial_strategy=initial_strategy,
+            )
+            output_payload["pipeline"] = {
+                "workflow_mode": workflow_mode,
+                "initial_strategy": initial_strategy,
+                "stages": [
+                    "initial_layout_generation"
+                    if workflow_mode == "full_pipeline"
+                    else "existing_layout_load",
+                    "hard_constraint_validation",
+                    "handling_unit_visit_calculation",
+                    "movement_resource_routing",
+                    "traffic_aware_handling_unit_placement",
+                    "final_validation_and_comparison",
+                ],
+                "grouping_metrics": grouping_metrics,
+                "generation_summary": generation_summary or {},
+            }
+        stage(5, "Final traffic validation and comparison complete")
+        basic_rows = payload["assignments"] if initial_strategy == "basic" else []
+        affinity_rows = (
+            payload["assignments"]
+            if initial_strategy == "abc_affinity" else []
+        )
+        basic_summary = payload["summary"] if initial_strategy == "basic" else {}
+        affinity_summary = (
+            payload["summary"] if initial_strategy == "abc_affinity" else {}
+        )
+        return TrafficPipelineResult(
+            basic_rows, basic_summary, affinity_rows, affinity_summary,
+            demand, demand, grouping_metrics, payload, pretraffic_analysis,
+            optimization, output_payload, workflow_mode, initial_strategy,
+        )
+
+    def run_existing_layout(
+        self,
+        payload: dict,
+        dataset: AffinityDataset,
+        network: MovementNetwork,
+        *,
+        start_date=None,
+        end_date=None,
+        maximum_travel_increase: float | None = None,
+        hotspot_percentile: float | None = None,
+        baseline_path: str = "",
+        source_orders: str = "",
+        progress: ProgressCallback | None = None,
+        cancelled: CancelCallback | None = None,
+    ) -> TrafficPipelineResult:
+        """Optimize traffic without regenerating a supplied slotting layout."""
+        baseline = copy.deepcopy(payload)
+        strategy = str(baseline.get("strategy") or "basic")
+        if strategy not in {"basic", "abc_affinity"}:
+            strategy = (
+                "abc_affinity"
+                if baseline.get("affinity_configuration") else "basic"
+            )
+        return self._complete_traffic_workflow(
+            baseline, dataset, network,
+            workflow_mode="existing_layout",
+            initial_strategy=strategy,
+            start_date=start_date,
+            end_date=end_date,
+            maximum_travel_increase=maximum_travel_increase,
+            hotspot_percentile=hotspot_percentile,
+            baseline_path=baseline_path,
+            source_orders=source_orders,
+            progress=progress,
+            cancelled=cancelled,
+            progress_total=5,
+        )
+
     def run_full_pipeline(
         self,
         building: dict,
         sku_rows: list[dict],
-        affinity_analysis: AffinityAnalysis,
+        affinity_source: AffinityAnalysis | AffinityDataset,
         network: MovementNetwork,
         *,
+        initial_strategy: str = "abc_affinity",
         affinity_weight: float = 0.5,
         levels_per_rack: int = 1,
         slots_per_level: int = 6,
@@ -1186,169 +1573,73 @@ class TrafficAwareSlottingService:
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TrafficPipelineResult:
-        """Run ABC through traffic placement without a prior slotting layout."""
-
-        def stage(current: int, message: str) -> None:
-            if cancelled and cancelled():
-                raise TrafficCancelledError("Traffic pipeline was cancelled")
-            if progress:
-                progress(current, 7, message)
+        """Generate the selected initial layout, then optimize its traffic."""
+        if initial_strategy not in {"basic", "abc_affinity"}:
+            raise ValueError("initial strategy must be basic or abc_affinity")
+        affinity_analysis = (
+            affinity_source
+            if isinstance(affinity_source, AffinityAnalysis) else None
+        )
+        dataset = (
+            affinity_source.dataset
+            if affinity_analysis is not None else affinity_source
+        )
+        if initial_strategy == "abc_affinity" and affinity_analysis is None:
+            raise ValueError("affinity strategy requires an affinity analysis")
+        if cancelled and cancelled():
+            raise TrafficCancelledError("Traffic pipeline was cancelled")
+        if progress:
+            progress(1, 7, "Loading warehouse configuration")
 
         catalog = attribute_catalog or self.attributes.starter_catalog()
         zones = dict(zone_assignments or {})
         configured_locations = copy.deepcopy(location_attributes or {})
         if not configured_locations:
-            # A fresh standalone run starts conservatively as standard ambient
-            # storage. Chilled inventory remains unassigned unless the caller
-            # supplies warehouse location attributes for real chilled zones.
             configured_locations[zone_id] = {
                 "chilled": False,
                 **STANDARD_STORAGE_DEFAULTS,
             }
-        stage(1, "Stage 1/7 · generating the ABC service baseline")
-        basic_locations = copy.deepcopy(configured_locations)
-        basic_rows, basic_summary = self.slotting.generate_basic(
-            copy.deepcopy(building), copy.deepcopy(sku_rows),
-            levels_per_rack, slots_per_level, handling_unit_type,
-            zone_id, zones, catalog, basic_locations,
-            storage_layout=storage_layout,
-            strict_compatibility=False,
-            ergonomic_weight_heuristic=True,
-            auto_plan_oversize=True,
-        )
-        stage(2, "Stage 2/7 · grouping SKUs by affinity and ABC priority")
-        affinity_locations = copy.deepcopy(configured_locations)
-        affinity_rows, affinity_summary = self.slotting.generate_abc_affinity(
-            copy.deepcopy(building), copy.deepcopy(sku_rows), affinity_analysis,
-            affinity_weight, levels_per_rack, slots_per_level,
-            handling_unit_type, zone_id, zones, catalog, affinity_locations,
-            storage_layout=storage_layout,
-            strict_compatibility=False,
-            ergonomic_weight_heuristic=True,
-            auto_plan_oversize=True,
-        )
-        if affinity_summary.get("unassigned_count", 0):
-            raise InsufficientStorageError(affinity_summary)
-        stage(3, "Stage 3/7 · validating hard storage compatibility")
-        unverified = 0
-        invalid = []
-        for row in affinity_rows:
-            if row.get("assignment_status") != "ASSIGNED":
-                continue
-            requirements = row.get("sku_requirements") or {}
-            profile = self.attributes.physical_profile(requirements)
-            required_storage_type = planned_storage_type(profile)
-            actual_storage_type = str(
-                row.get("planned_storage_type")
-                or row.get("zone_storage_type")
-                or row.get("storage_area_type")
-                or ""
-            ).upper()
-            if actual_storage_type != required_storage_type:
-                invalid.append(
-                    f"{row.get('sku', '')}: {required_storage_type} inventory "
-                    f"cannot use a {actual_storage_type or 'UNPLANNED'} segment"
-                )
-                continue
-            if profile["data_status"] != "COMPLETE":
-                unverified += 1
-                continue
-            occupied_addresses = row.get("occupied_static_addresses") or [
-                str(row.get("static_address", ""))
-            ]
-            issues = []
-            primary_effective = None
-            generic_requirements = {
-                key: value for key, value in requirements.items()
-                if key not in PHYSICAL_DIMENSION_KEYS
-            }
-            for address in occupied_addresses:
-                effective, _sources = self.attributes.effective_attributes(
-                    str(row.get("storage_location_address") or address),
-                    affinity_locations,
-                )
-                primary_effective = primary_effective or effective
-                issues.extend(self.attributes.compatibility_issues(
-                    generic_requirements, effective, catalog
-                ))
-            level_span = int(row.get("occupied_level_span") or 1)
-            slot_span = int(
-                row.get("occupied_horizontal_slot_span")
-                or len(occupied_addresses)
+        if progress:
+            progress(
+                2, 7,
+                "Generating ABC layout"
+                if initial_strategy == "basic"
+                else "Generating ABC + affinity layout",
             )
-            required_footprint = self.slotting.required_slot_footprint(
-                requirements, primary_effective or {}, level_span, slot_span
+        baseline_locations = copy.deepcopy(configured_locations)
+        if initial_strategy == "basic":
+            rows, summary = self.slotting.generate_basic(
+                copy.deepcopy(building), copy.deepcopy(sku_rows),
+                levels_per_rack, slots_per_level, handling_unit_type,
+                zone_id, zones, catalog, baseline_locations,
+                storage_layout=storage_layout,
+                strict_compatibility=False,
+                ergonomic_weight_heuristic=True,
+                auto_plan_oversize=True,
             )
-            if required_footprint is None:
-                issues.append(
-                    f"requires more than the reserved {level_span} × {slot_span} "
-                    "level/slot footprint"
-                )
-            if (
-                profile["storage_class"]
-                in {"OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"}
-                and int(row.get("storage_level") or 1)
-                != overweight_storage_level(levels_per_rack)
-            ):
-                issues.append(
-                    "overweight inventory requires level "
-                    f"{overweight_storage_level(levels_per_rack)}"
-                )
-            if issues:
-                invalid.append(
-                    f"{row.get('sku', '')}: " + "; ".join(dict.fromkeys(issues))
-                )
-        if invalid:
-            raise ValueError(
-                "affinity layout failed hard compatibility validation: "
-                + " | ".join(invalid[:5])
+            affinity_configuration = {}
+        else:
+            rows, summary = self.slotting.generate_abc_affinity(
+                copy.deepcopy(building), copy.deepcopy(sku_rows),
+                affinity_analysis, affinity_weight,
+                levels_per_rack, slots_per_level, handling_unit_type,
+                zone_id, zones, catalog, baseline_locations,
+                storage_layout=storage_layout,
+                strict_compatibility=False,
+                ergonomic_weight_heuristic=True,
+                auto_plan_oversize=True,
             )
-        stage(4, "Stage 4/7 · calculating handling-unit visits")
-        basic_demand = self.build_demand(
-            affinity_analysis.dataset, basic_rows, start_date, end_date
+            affinity_configuration = summary.get("affinity_tuning", {})
+        if summary.get("unassigned_count", 0):
+            raise InsufficientStorageError(summary)
+
+        storage_layout_payload = (
+            storage_layout.to_dict() if storage_layout is not None else {}
         )
-        affinity_demand = self.build_demand(
-            affinity_analysis.dataset, affinity_rows, start_date, end_date
-        )
-        basic_visits = basic_demand.handling_unit_visits
-        affinity_visits = affinity_demand.handling_unit_visits
-        grouping_metrics = {
-            "basic_handling_unit_visits": basic_visits,
-            "affinity_handling_unit_visits": affinity_visits,
-            "handling_unit_visits_saved": basic_visits - affinity_visits,
-            "handling_unit_visit_reduction_fraction": (
-                (basic_visits - affinity_visits) / basic_visits
-                if basic_visits else 0.0
-            ),
-            "basic_fulfillment_groups": basic_demand.fulfillment_groups,
-            "affinity_fulfillment_groups": affinity_demand.fulfillment_groups,
-            "unverified_physical_sku_count": unverified,
-            "hard_validation_status": "PASSED",
-        }
-        occupied_units: dict[str, set[str]] = {}
-        for row in affinity_rows:
-            if row.get("assignment_status") != "ASSIGNED":
-                continue
-            unit_id = str(row.get("handling_unit_id", ""))
-            for buffer_id in row.get("occupied_buffer_ids", []):
-                occupied_units.setdefault(str(buffer_id), set()).add(unit_id)
-        buffer_records = []
-        if storage_layout is not None:
-            for source in storage_layout.buffers:
-                buffer_id = str(source.get("buffer_id", ""))
-                buffer_records.append({
-                    **dict(source),
-                    "status": (
-                        "OCCUPIED" if buffer_id in occupied_units else "EMPTY"
-                    ),
-                    "handling_unit_ids": sorted(
-                        unit for unit in occupied_units.get(buffer_id, set()) if unit
-                    ),
-                })
-        pretraffic_payload = {
+        payload = {
             "schema": SLOTTING_SCHEMA,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "strategy": "abc_affinity_traffic_pipeline",
+            "strategy": initial_strategy,
             "handling_unit_type": handling_unit_type,
             "rack_capacity": {
                 "levels": levels_per_rack,
@@ -1358,59 +1649,39 @@ class TrafficAwareSlottingService:
                 "grid_project_json": source_grid_project,
                 "sku_velocity_csv": source_velocity,
                 "chilled_requirements_csv": source_chilled,
-                "affinity_order_workbook": source_orders,
+                "affinity_order_workbook": (
+                    source_orders if initial_strategy == "abc_affinity" else ""
+                ),
             },
-            "affinity_configuration": affinity_summary.get("affinity_tuning", {}),
+            "affinity_configuration": affinity_configuration,
             "storage_defaults": {"standard": STANDARD_STORAGE_DEFAULTS},
             "zone_assignments": zones,
-            "storage_layout": (
-                storage_layout.to_dict() if storage_layout is not None else {}
-            ),
-            "buffers": buffer_records,
+            "storage_layout": storage_layout_payload,
+            "buffers": [],
             "attribute_catalog": self.attributes.serialize_catalog(catalog),
-            "location_attributes": affinity_locations,
-            "summary": {**affinity_summary, "pipeline_grouping": grouping_metrics},
+            "location_attributes": baseline_locations,
+            "summary": summary,
             "building": copy.deepcopy(building),
-            "assignments": affinity_rows,
+            "assignments": rows,
             "operation_log": [],
         }
-        stage(5, "Stage 5/7 · routing grouped handling-unit demand")
-        pretraffic_analysis = self.analyze(
-            affinity_rows, network, affinity_demand
-        )
-        optimization = output_payload = None
-        if optimize_traffic:
-            stage(6, "Stage 6/7 · optimizing complete handling-unit placement")
-            optimization = self.optimize(
-                pretraffic_payload, network, affinity_demand,
-                maximum_travel_increase=maximum_travel_increase,
-                hotspot_percentile=hotspot_percentile,
-                progress=None,
-                cancelled=cancelled,
-            )
-            output_payload = self.result_payload(
-                pretraffic_payload, optimization,
-                baseline_path="generated_in_full_pipeline",
-                order_path=source_orders, network=network,
-            )
-            output_payload["pipeline"] = {
-                "stages": [
-                    "abc_demand_and_baseline",
-                    "affinity_sku_grouping",
-                    "hard_constraint_validation",
-                    "handling_unit_visit_calculation",
-                    "traffic_aware_handling_unit_placement",
-                    "final_validation_and_comparison",
-                ],
-                "grouping_metrics": grouping_metrics,
-                "basic_summary": basic_summary,
-            }
-        stage(7, "Stage 7/7 · final validation and comparison complete")
-        return TrafficPipelineResult(
-            basic_rows, basic_summary, affinity_rows, affinity_summary,
-            basic_demand, affinity_demand, grouping_metrics,
-            pretraffic_payload, pretraffic_analysis,
-            optimization, output_payload,
+        payload["buffers"] = self._buffer_records(payload, rows)
+        return self._complete_traffic_workflow(
+            payload, dataset, network,
+            workflow_mode="full_pipeline",
+            initial_strategy=initial_strategy,
+            start_date=start_date,
+            end_date=end_date,
+            maximum_travel_increase=maximum_travel_increase,
+            hotspot_percentile=hotspot_percentile,
+            baseline_path="generated_in_full_pipeline",
+            source_orders=source_orders,
+            progress=progress,
+            cancelled=cancelled,
+            progress_offset=2,
+            progress_total=7,
+            generation_summary=summary,
+            optimize_traffic=optimize_traffic,
         )
 
     @staticmethod
@@ -1421,6 +1692,8 @@ class TrafficAwareSlottingService:
         baseline_path: str,
         order_path: str,
         network: MovementNetwork,
+        workflow_mode: str = "existing_layout",
+        initial_strategy: str = "basic",
     ) -> dict:
         payload = copy.deepcopy(baseline_payload)
         payload["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1430,6 +1703,8 @@ class TrafficAwareSlottingService:
         payload["sources"]["traffic_network"] = network.source_path or "embedded_rmf"
         payload["traffic_configuration"] = {
             **result.parameters,
+            "workflow_mode": workflow_mode,
+            "initial_strategy": initial_strategy,
             "network_type": network.source_type,
             "demand_model": "unique_handling_unit_per_store_day",
             "start_date": result.before.demand.start_date,
@@ -1453,6 +1728,9 @@ class TrafficAwareSlottingService:
             "operation": "traffic_aware_slotting",
             "relocation_count": len({row["handling_unit_id"] for row in result.relocations}),
         })
+        payload["buffers"] = TrafficAwareSlottingService._buffer_records(
+            payload, result.assignments
+        )
         return payload
 
     @staticmethod

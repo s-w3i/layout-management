@@ -51,8 +51,42 @@ class SlottingLayoutRepository:
             if row.get("assignment_status") != "ASSIGNED":
                 continue
             unit_id = str(row.get("handling_unit_id", ""))
-            for buffer_id in row.get("occupied_buffer_ids", []):
-                occupied_units.setdefault(str(buffer_id), set()).add(unit_id)
+            buffer_ids = [
+                str(value) for value in row.get("occupied_buffer_ids", [])
+                if str(value)
+            ]
+            physical_units = row.get("occupied_handling_units") or []
+            mapped = [
+                (
+                    str(unit.get("buffer_id", "")),
+                    str(unit.get("handling_unit_id", "")),
+                )
+                for unit in physical_units
+                if str(unit.get("buffer_id", ""))
+                and str(unit.get("handling_unit_id", ""))
+            ]
+            if not mapped and len(buffer_ids) == len(physical_units):
+                ordered_units = sorted(
+                    physical_units,
+                    key=lambda unit: (
+                        int(unit.get("storage_level") or 1),
+                        int(unit.get("storage_slot") or 1),
+                    ),
+                )
+                mapped = [
+                    (buffer_id, str(unit.get("handling_unit_id", "")))
+                    for buffer_id, unit in zip(
+                        sorted(buffer_ids), ordered_units
+                    )
+                ]
+            if mapped:
+                for buffer_id, physical_unit_id in mapped:
+                    occupied_units.setdefault(buffer_id, set()).add(
+                        physical_unit_id
+                    )
+            else:
+                for buffer_id in buffer_ids:
+                    occupied_units.setdefault(buffer_id, set()).add(unit_id)
         buffer_records = []
         if storage_layout is not None:
             for source in storage_layout.buffers:
@@ -201,6 +235,21 @@ class SlottingLayoutRepository:
             row.setdefault(
                 "occupied_storage_location_addresses",
                 list(row.get("occupied_static_addresses", [])),
+            )
+            row.setdefault(
+                "occupied_handling_units",
+                [{
+                    "handling_unit_id": row.get("handling_unit_id", ""),
+                    "rack_id": row.get("rack_id", ""),
+                    "storage_level": row.get("storage_level", 1),
+                    "storage_slot": row.get("storage_slot", 1),
+                    "buffer_id": row.get("buffer_id", ""),
+                    "static_address": row.get("static_address", ""),
+                    "storage_location_address": row.get(
+                        "storage_location_address", ""
+                    ),
+                }]
+                if row.get("assignment_status") == "ASSIGNED" else [],
             )
             row.setdefault("rack_frequency_rank", "")
             row.setdefault("rack_pick_frequency", "")

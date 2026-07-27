@@ -55,6 +55,22 @@ def main() -> None:
         "● A movement unit", "● B movement unit", "● C movement unit",
         "● Unranked unit", "◆ Workstation",
     ]
+    assert app.traffic_existing_button.cget("text") == (
+        "Optimize Existing Layout"
+    )
+    assert app.traffic_full_button.cget("text") == (
+        "Generate Layout + Optimize Traffic"
+    )
+    assert app.traffic_initial_settings_frame.cget("text") == (
+        "Initial ABC / affinity layout generation · Full pipeline only"
+    )
+    assert app.traffic_optimization_settings_frame.cget("text") == (
+        "Traffic-aware optimization · Both workflows"
+    )
+    assert app.traffic_strategy_box.cget("values") == (
+        "ABC",
+        "ABC + Affinity",
+    )
     assert set(app.grid_sidebar_sections) == {
         "grid", "tools", "point", "buffers", "settings", "files"
     }
@@ -444,11 +460,15 @@ def main() -> None:
         assert adjusted_payload["affinity_configuration"]["parameter_status"] == "USER_ADJUSTED"
         assert adjusted_payload["affinity_configuration"]["minimum_shared_store_days"] == 1
 
-        # Traffic-aware tab: reuse the warehouse configuration saved by the
-        # Grid Map Editor, run the independent pipeline, and persist the result.
+        # Traffic-aware tab: optimize a saved layout directly, then run the
+        # complete ABC-to-traffic pipeline from the grid project and SKU data.
+        app.traffic_layout_path.set(str(affinity_layout_path))
         app.traffic_grid_project_path.set(str(project_path))
         app.traffic_velocity_path.set(str(affinity_velocity_path))
         app.traffic_order_path.set(str(slot_affinity_path))
+        app.traffic_initial_strategy.set("ABC")
+        app.traffic_initial_strategy_changed()
+        assert "disabled" in app.traffic_affinity_spin.state()
         app.traffic_handling_unit.set("AMR shelf")
         app.traffic_levels.set("1")
         app.traffic_slots.set("12")
@@ -463,7 +483,7 @@ def main() -> None:
         assert app.traffic_canvas.find_withtag("traffic_area_rack")
         app.traffic_area_mode.set(False)
         app.draw_traffic_map()
-        app.start_traffic_analysis()
+        app.start_existing_layout_traffic()
         deadline = time.monotonic() + 10
         while app.traffic_worker and app.traffic_worker.is_alive():
             root.update()
@@ -472,6 +492,11 @@ def main() -> None:
         app.poll_traffic_work()
         root.update_idletasks()
         assert app.traffic_analysis is not None, (app.traffic_status.get(), errors)
+        assert app.traffic_result is not None
+        assert app.traffic_pipeline_result.workflow_mode == "existing_layout"
+        assert app.traffic_pipeline_result.pretraffic_payload[
+            "assignments"
+        ] == app.layouts.load(affinity_layout_path)["assignments"]
         assert app.traffic_demand.fulfillment_groups > 0
         assert "Groups" in app.traffic_kpis.get()
         assert app.traffic_resource_tree.get_children()
@@ -491,10 +516,11 @@ def main() -> None:
         assert app.traffic_pipeline_result.grouping_metrics[
             "hard_validation_status"
         ] == "PASSED"
-        assert app.traffic_pipeline_result.pretraffic_payload["sources"][
-            "grid_project_json"
-        ] == str(project_path.resolve())
-        app.start_traffic_generation()
+        assert app.traffic_pipeline_result.output_payload[
+            "traffic_configuration"
+        ]["workflow_mode"] == "existing_layout"
+
+        app.start_full_traffic_pipeline()
         deadline = time.monotonic() + 10
         while app.traffic_worker and app.traffic_worker.is_alive():
             root.update()
@@ -502,7 +528,12 @@ def main() -> None:
             assert time.monotonic() < deadline
         app.poll_traffic_work()
         root.update_idletasks()
-        assert app.traffic_result is not None
+        assert app.traffic_result is not None, (app.traffic_status.get(), errors)
+        assert app.traffic_pipeline_result.workflow_mode == "full_pipeline"
+        assert app.traffic_pipeline_result.initial_strategy == "basic"
+        assert app.traffic_pipeline_result.pretraffic_payload["sources"][
+            "grid_project_json"
+        ] == str(project_path.resolve())
         assert app.traffic_max_travel.get()
         assert app.traffic_hotspot_percentile.get()
         # Swapped source/destination racks remain highlighted in both views.
@@ -526,6 +557,12 @@ def main() -> None:
         assert traffic_layout_path.exists()
         saved_traffic_layout = app.layouts.load(traffic_layout_path)
         assert saved_traffic_layout["traffic_configuration"]
+        assert saved_traffic_layout["traffic_configuration"][
+            "workflow_mode"
+        ] == "full_pipeline"
+        assert saved_traffic_layout["traffic_configuration"][
+            "initial_strategy"
+        ] == "basic"
         assert saved_traffic_layout["sources"]["grid_project_json"] == str(
             project_path.resolve()
         )

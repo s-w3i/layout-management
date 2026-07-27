@@ -332,4 +332,9 @@ class InventoryService:
             "rack_id": row["rack_id"],
             "storage_level": level,
             "storage_slot": slot,
+            "buffer_id": row.get("buffer_id", ""),
+            "static_address": row["static_address"],
+            "storage_location_address": row[
+                "storage_location_address"
+            ],
         }]

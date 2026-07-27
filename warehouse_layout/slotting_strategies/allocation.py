@@ -939,6 +939,11 @@ def allocate(
                         "rack_id": item["rack_id"],
                         "storage_level": item["level"],
                         "storage_slot": item["slot"],
+                        "buffer_id": item["buffer_id"],
+                        "static_address": item["static_address"],
+                        "storage_location_address": item[
+                            "storage_location_address"
+                        ],
                     }
                     for item in occupied_positions
                 ]
