@@ -1,31 +1,16 @@
-# RMF Grid Map Editor — User Manual
+# Warehouse Layout Management
 
-`rmf_grid_map_editor.py` is a Python desktop application for creating a
-grid-based Open-RMF warehouse map, assigning inventory zones, generating a
-basic ABC slotting layout, exploring SKU/store affinity, traffic-aware
-complete-unit repositioning, exact global congestion balancing, and
-demonstrating inventory search and swaps.
+A Python desktop application for:
 
-The application does not require a warehouse drawing. Grid point `(0, 0)` is
-the bottom-left point of a generated map, and positive Y points upward.
+- creating grid-based Open-RMF warehouse maps;
+- generating ABC and affinity-based inventory layouts;
+- optimizing traffic and global congestion;
+- searching inventory and testing slot or shelf swaps.
 
-## Contents
+No warehouse drawing is required. Grid point `(0, 0)` is the bottom-left
+corner, and positive Y points upward.
 
-1. [Install and start](#install-and-start)
-2. [Application workflow](#application-workflow)
-3. [Grid Map Editor tab](#1-grid-map-editor-tab)
-4. [SKU Affinity tab](#2-sku-affinity-tab)
-5. [Inventory Slotting tab](#3-inventory-slotting-tab)
-6. [Traffic-Aware Slotting tab](#4-traffic-aware-slotting-tab)
-7. [Global Traffic Optimizer tab](#5-global-traffic-optimizer-tab)
-8. [Inventory Operations Demo tab](#6-inventory-operations-demo-tab)
-9. [Inventory address rules](#inventory-address-rules)
-10. [Command-line map generation](#command-line-map-generation)
-11. [Files and folders](#files-and-folders)
-12. [Code architecture](#code-architecture)
-13. [Troubleshooting](#troubleshooting)
-
-## Install and start
+## Quick start
 
 ### Requirements
 
@@ -33,14 +18,14 @@ the bottom-left point of a generated map, and positive Y points upward.
 - Tkinter
 - PyYAML, openpyxl, matplotlib and OR-Tools
 
-On Ubuntu or Debian, install the required packages with:
+On Ubuntu or Debian:
 
 ```bash
 sudo apt install python3 python3-tk python3-pip
 python3 -m pip install PyYAML openpyxl matplotlib ortools
 ```
 
-Clone the public repository and start the application:
+Clone and start:
 
 ```bash
 git clone https://github.com/s-w3i/layout-management.git
@@ -48,46 +33,29 @@ cd layout-management
 python3 rmf_grid_map_editor.py
 ```
 
-The application opens with seven tabs:
+## Main workflow
+
+Use the tabs from left to right:
 
 | Tab | Purpose |
 |---|---|
-| **Grid Map Editor** | Create the grid, place racks and workstations, and export RMF YAML |
-| **SKU Affinity** | Explore SKU–store frequency and SKU relationships from line-level orders |
-| **Inventory Slotting** | Generate an ABC-only or ABC-plus-affinity recommendation |
-| **Interactive Slotting Layout** | Load or inspect generated assignments and movement ranks |
-| **Traffic-Aware Slotting** | Reduce expected movement-resource congestion by repositioning complete handling units |
-| **Global Traffic Optimizer** | Solve the congestion-balanced complete-unit assignment globally or within a reported gap |
-| **Inventory Operations Demo** | Search inventory and demonstrate SKU or AMR-shelf swaps |
+| **Grid Map Editor** | Create the grid, racks, workstations, zones, and buffers |
+| **SKU Affinity** | Review SKU–store frequency and SKU relationships |
+| **Inventory Slotting** | Generate an ABC or ABC-plus-affinity layout |
+| **Interactive Slotting Layout** | Inspect assignments and movement ranks |
+| **Traffic-Aware Slotting** | Improve congestion using complete-unit swaps |
+| **Global Traffic Optimizer** | Search globally for a congestion-balanced layout |
+| **Inventory Operations Demo** | Find inventory and test slot or shelf swaps |
 
-## Application workflow
+For a new warehouse:
 
-For a new warehouse, use the tabs in this order:
+1. Build and configure the grid, then save the `.grid.json`.
+2. Analyze the order workbook in **SKU Affinity** when affinity is required.
+3. Generate a layout in **Inventory Slotting**.
+4. Improve it with **Traffic-Aware Slotting** or **Global Traffic Optimizer**.
+5. Inspect or test the result, then save the selected `.slotting.json`.
 
-1. Create the warehouse grid in **Grid Map Editor**.
-2. Place rack pickup points and workstation drop-off points.
-3. Select the storage-system type, configure capacity, and assign empty buffers.
-4. Assign every rack to a warehouse zone, configure chilled/capacity settings,
-   and add any advanced hierarchy attributes.
-5. Save the editable grid project. Export the unchanged RMF building YAML only
-   when it is needed by RMF.
-6. Open **SKU Affinity**, analyze the order workbook, and review SKU relationships.
-7. Export the affinity snapshot and CSV review files when required.
-8. Open **Inventory Slotting** and load the configured grid JSON.
-9. Load the ABC SKU velocity CSV and optional chilled-requirements CSV. Choose
-   `basic` or `abc_affinity`; for affinity, also select the order-history Excel
-   file and the desired ABC/affinity weight.
-10. Open **Traffic-Aware Slotting**. Either optimize an existing complete
-    `.slotting.json`, or select the editable grid JSON, velocity CSV, initial
-    ABC/affinity strategy, and order workbook to run the full pipeline.
-11. Save the traffic-aware layout when required.
-12. Use **Global Traffic Optimizer** when an exact or time-bounded global
-    recommendation is required. Optimize a saved layout, or run the complete
-    ABC/affinity-to-global pipeline.
-13. Open **Inventory Operations Demo**, search for SKUs or demonstrate position
-    swaps, then save changes when required.
-
-The included demonstration map can be opened and completed in Grid Map Editor:
+Start with the included demonstration map:
 
 ```text
 resources/map/demo.grid.json
