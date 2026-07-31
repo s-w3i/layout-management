@@ -3,7 +3,8 @@
 `rmf_grid_map_editor.py` is a Python desktop application for creating a
 grid-based Open-RMF warehouse map, assigning inventory zones, generating a
 basic ABC slotting layout, exploring SKU/store affinity, traffic-aware
-complete-unit repositioning, and demonstrating inventory search and swaps.
+complete-unit repositioning, exact global congestion balancing, and
+demonstrating inventory search and swaps.
 
 The application does not require a warehouse drawing. Grid point `(0, 0)` is
 the bottom-left point of a generated map, and positive Y points upward.
@@ -16,12 +17,13 @@ the bottom-left point of a generated map, and positive Y points upward.
 4. [SKU Affinity tab](#2-sku-affinity-tab)
 5. [Inventory Slotting tab](#3-inventory-slotting-tab)
 6. [Traffic-Aware Slotting tab](#4-traffic-aware-slotting-tab)
-7. [Inventory Operations Demo tab](#5-inventory-operations-demo-tab)
-7. [Inventory address rules](#inventory-address-rules)
-8. [Command-line map generation](#command-line-map-generation)
-9. [Files and folders](#files-and-folders)
-10. [Code architecture](#code-architecture)
-11. [Troubleshooting](#troubleshooting)
+7. [Global Traffic Optimizer tab](#5-global-traffic-optimizer-tab)
+8. [Inventory Operations Demo tab](#6-inventory-operations-demo-tab)
+9. [Inventory address rules](#inventory-address-rules)
+10. [Command-line map generation](#command-line-map-generation)
+11. [Files and folders](#files-and-folders)
+12. [Code architecture](#code-architecture)
+13. [Troubleshooting](#troubleshooting)
 
 ## Install and start
 
@@ -29,13 +31,13 @@ the bottom-left point of a generated map, and positive Y points upward.
 
 - Python 3.10 or newer
 - Tkinter
-- PyYAML, openpyxl and matplotlib
+- PyYAML, openpyxl, matplotlib and OR-Tools
 
 On Ubuntu or Debian, install the required packages with:
 
 ```bash
 sudo apt install python3 python3-tk python3-pip
-python3 -m pip install PyYAML openpyxl matplotlib
+python3 -m pip install PyYAML openpyxl matplotlib ortools
 ```
 
 Clone the public repository and start the application:
@@ -46,14 +48,16 @@ cd layout-management
 python3 rmf_grid_map_editor.py
 ```
 
-The application opens with five tabs:
+The application opens with seven tabs:
 
 | Tab | Purpose |
 |---|---|
 | **Grid Map Editor** | Create the grid, place racks and workstations, and export RMF YAML |
 | **SKU Affinity** | Explore SKU–store frequency and SKU relationships from line-level orders |
 | **Inventory Slotting** | Generate an ABC-only or ABC-plus-affinity recommendation |
+| **Interactive Slotting Layout** | Load or inspect generated assignments and movement ranks |
 | **Traffic-Aware Slotting** | Reduce expected movement-resource congestion by repositioning complete handling units |
+| **Global Traffic Optimizer** | Solve the congestion-balanced complete-unit assignment globally or within a reported gap |
 | **Inventory Operations Demo** | Search inventory and demonstrate SKU or AMR-shelf swaps |
 
 ## Application workflow
@@ -77,7 +81,10 @@ For a new warehouse, use the tabs in this order:
     `.slotting.json`, or select the editable grid JSON, velocity CSV, initial
     ABC/affinity strategy, and order workbook to run the full pipeline.
 11. Save the traffic-aware layout when required.
-12. Open **Inventory Operations Demo**, search for SKUs or demonstrate position
+12. Use **Global Traffic Optimizer** when an exact or time-bounded global
+    recommendation is required. Optimize a saved layout, or run the complete
+    ABC/affinity-to-global pipeline.
+13. Open **Inventory Operations Demo**, search for SKUs or demonstrate position
     swaps, then save changes when required.
 
 The included demonstration map can be opened and completed in Grid Map Editor:
@@ -464,8 +471,14 @@ The **basic** strategy:
 8. Uses SKU weight as a soft ergonomic heuristic: a positive weight prefers
    the middle rack level and then expands outward toward lower and upper
    levels. This is not a hard constraint; weight `0` disables the preference.
-9. Records known outlier requirements as generated segment capacities. Unknown
-   properties become unbounded planning assumptions on that segment.
+9. Reserves every position in the smallest rotation-aware contiguous footprint
+   required by a known dimension-oversize item. Width may span adjacent slots
+   and height may span rack levels; an item whose depth cannot fit in any
+   rotation is rejected. Weight-only exceptions remain single-slot inventory
+   on level 2. Unknown properties become unbounded planning assumptions on the
+   generated exception segment. The `occupied_dynamic_address` field presents
+   multi-position AMR occupancy compactly, for example
+   `SHELF_124/L02/S02,03`.
 10. Uses average workstation distance to rank otherwise equivalent racks and
    returns general not-enough-space only after every storage slot is occupied.
 
@@ -592,8 +605,9 @@ chilled normal and oversize stock use separate racks, and known overweight or
 oversize-plus-overweight stock is intentionally placed at level 2 when present.
 Generated buffers from the grid project are enforced and their occupancy is
 included in the result.
-Generation is rejected if even one SKU remains unassigned, so a partial result
-cannot be saved as a valid traffic-aware layout.
+Unassigned SKU rows are excluded from traffic demand and relocation, retained
+unchanged in the result, and reported in the status and saved metadata. The
+workflow stops only when no assigned inventory remains to optimize.
 
 The map contains two heat layers. Lane colour and width represent expected route
 load. Rack colour represents the handling-unit visits generated at that physical
@@ -609,7 +623,88 @@ not collision-free fleet simulation.
 See [Traffic-aware slotting](docs/traffic-aware-slotting.md) for the generic
 network contract and export details.
 
-## 5. Inventory Operations Demo tab
+## 5. Global Traffic Optimizer tab
+
+This separate tab leaves the original pair-swap Traffic-Aware Slotting
+workflow unchanged. It offers three buttons:
+
+1. **Optimize Existing Layout Globally** reuses a saved layout. Assigned
+   handling units are optimized; unassigned SKU rows are retained unchanged.
+2. **Generate Layout + Globally Optimize** first creates the selected ABC or
+   ABC-plus-affinity baseline from the grid project, then runs the global
+   solver.
+3. **Auto-search Best Layout** screens nine travel/relocation configurations
+   for an existing layout, refines the best three, ranks every valid result by
+   congestion first, and initially displays the recommended winner.
+
+Auto-search tries travel limits of 0%, 5%, and 10% crossed with relocation
+limits of 50%, 75%, and 100%. The screen/final solve times and finalist count
+are editable beside the optimizer settings. Select a successful trial and
+click **Save Layout** to write its `.slotting.json`; `parameter_comparison.csv`
+and `search_summary.json` are written to its adjacent `_search` report folder.
+
+Historical demand is grouped by `(Store ID, Date)`. The solver simultaneously
+assigns every movable AMR shelf or ASRS handling unit to a compatible occupied
+or empty candidate buffer. It does not require an empty buffer: when every
+candidate location is occupied, the result is a permutation or movement cycle
+rather than a sequence of pair swaps.
+
+Hard-incompatible variables are never added. Chilled, standard/oversize,
+dimensions, contiguous footprint, ergonomic overweight level, and inherited
+attributes therefore remain mandatory. An AMR shelf containing incomplete
+SKU physical data may move as one complete shelf between equivalent compatible
+segments because its SKUs stay in the same internal slots. Unknown-data ASRS
+units remain fixed.
+
+OR-Tools CP-SAT solves these objectives lexicographically:
+
+1. Peak normalized layout-controllable resource utilization.
+2. Layout-controllable nearest-rank P95.
+3. CVaR95 and convex queue-risk penalties.
+4. Shared-entrance neighbourhood concentration.
+5. Zone utilization.
+6. Expected travel within the configured increase.
+7. Relocation count.
+
+The tab displays solver stages, bounds, gaps, relocations, controllable versus
+structural resource loads, before/after balance, and a pan/zoom network heat
+map. Its **Auto-search Trials** view shows every accepted or failed parameter
+run and identifies the recommended and currently viewed plans. Selecting a
+successful row refreshes the congestion view and all result tables. Resources
+whose load cannot change
+under any candidate placement remain
+visible but do not block the placement objective. The default acceptance guards
+reject a recommendation if nearest-rank controllable-resource P95 or the
+shared-entrance neighbourhood peak is worse than the baseline. Travel may not
+increase by default, and at most 50% of handling units may be relocated.
+`OPTIMAL` is written only when every stage has a proven zero gap. A time-limited
+incumbent is written as `FEASIBLE`; an unavailable proof gap is shown as
+unproven.
+
+The network view overlays two heat layers. Lane colour represents normalized
+resource load. Rack fill represents Store ID + Date handling-unit visit
+frequency at that location, scaled to the rack P95 so one extreme rack does not
+hide variation among the others. The **Rack picking-frequency heat** checkbox
+toggles the rack layer; exact visit counts remain visible in rack labels.
+
+Global routes use deterministic shortest paths through transit grids. Rack
+grids are terminal-only: a route may start or end at its task rack, but may not
+cross any other rack grid as an intermediate path node.
+
+The same independent pipeline is available without Tkinter:
+
+```bash
+python3 global_traffic_slotting.py \
+  --mode existing \
+  --layout resources/data/basic_slotting_layout.slotting.json \
+  --orders resources/data/Sample\ Data.xlsx \
+  --output resources/data/global_traffic_layout.slotting.json
+```
+
+See [Global traffic optimizer](docs/global-traffic-optimizer.md) for the full
+pipeline command and model scope.
+
+## 6. Inventory Operations Demo tab
 
 ### Load a slotting layout
 
@@ -745,6 +840,7 @@ column 0, row 0.
 layout_management_master/
 ├── README.md
 ├── rmf_grid_map_editor.py                         Application launcher only
+├── global_traffic_slotting.py                     Independent global optimizer CLI
 ├── sku_velocity_analysis.py
 ├── warehouse_layout/
 │   ├── cli.py                                     CLI application controller
@@ -755,6 +851,9 @@ layout_management_master/
 │   ├── zone_settings_editor.py                    Core zone-capacity editor
 │   ├── domain.py                                  Grid domain models
 │   ├── gui.py                                     Tkinter application class
+│   ├── global_traffic.py                          Exact/bounded global CP-SAT service
+│   ├── global_traffic_gui.py                      Independent global optimizer tab
+│   ├── global_traffic_search.py                   Automatic parameter portfolio and reports
 │   ├── inventory.py                               Search and swap service
 │   ├── rmf.py                                     RMF/project persistence service
 │   ├── slotting.py                                Routing, addressing and slotting
@@ -763,11 +862,14 @@ layout_management_master/
 │   ├── test_attributes.py                         Attribute and compatibility tests
 │   ├── test_affinity.py                           Affinity analysis and cache tests
 │   ├── test_services.py                           Service regression tests
+│   ├── test_global_traffic.py                     Global solver and CLI tests
+│   ├── test_global_traffic_search.py              Automatic parameter-search tests
 │   └── test_traffic.py                            Traffic network, constraints and export tests
 ├── docs/
 │   ├── README.md                                  Documentation index
 │   ├── rmf-grid-map-editor.md                     Additional editor notes
 │   ├── sku-velocity-analysis.md                   ABC analysis guide
+│   ├── global-traffic-optimizer.md                Global congestion model and CLI
 │   └── traffic-aware-slotting.md                  Traffic algorithm and network contract
 └── resources/
     ├── data/

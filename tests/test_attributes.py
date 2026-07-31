@@ -354,6 +354,52 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(summary["assigned_count"], 1)
 
+    def test_known_oversize_and_overweight_uses_footprint_from_level_two(self):
+        project = GridProject(
+            GridSpec(2, 1, 1, "oversize-overweight-footprint", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (2, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        rows, summary = self.slotting.generate_basic(
+            project.to_building_dict(),
+            [{
+                "sku": "LARGE_HEAVY",
+                "pick_frequency": 1,
+                "velocity_class": "A",
+                "sku_requirements": {
+                    "chilled": False,
+                    "max_item_length": 14,
+                    "max_item_width": 26,
+                    "max_item_height": 20,
+                    "max_item_weight": 500,
+                },
+            }],
+            3,
+            4,
+            "AMR shelf",
+            attribute_catalog=self.catalog,
+            location_attributes={"Z01": {
+                "chilled": False,
+                "max_item_length": 15,
+                "max_item_width": 16,
+                "max_item_height": 13,
+                "max_item_weight": 250,
+            }},
+        )
+        row = rows[0]
+        self.assertEqual(row["assignment_status"], "ASSIGNED")
+        self.assertEqual(row["physical_storage_class"], "OVERSIZE_AND_OVERWEIGHT")
+        self.assertEqual(row["storage_level"], 2)
+        self.assertEqual(row["occupied_level_span"], 2)
+        self.assertEqual(row["occupied_horizontal_slot_span"], 2)
+        self.assertEqual(row["occupied_slot_count"], 4)
+        self.assertEqual(row["auto_attribute_overrides"], {
+            "max_item_weight": 500,
+        })
+        self.assertEqual(summary["occupied_slot_count"], 4)
+
     def test_velocity_csv_accepts_zero_weight_as_heuristic_opt_out(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "velocity.csv"
@@ -635,12 +681,16 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         rows, summary = self.slotting.generate_basic(
             copy.deepcopy(self.building),
             [self.sku("TOO_LONG", 1, {"max_item_length": 26})],
-            1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
+            1, 2, "AMR shelf", "Z01", self.zones, self.catalog, local,
         )
         self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
         self.assertEqual(rows[0]["planned_storage_type"], "OVERSIZE")
         self.assertEqual(rows[0]["planned_zone_id"], "Z01_OVERSIZE")
-        self.assertEqual(rows[0]["auto_attribute_overrides"]["max_item_length"], 26)
+        self.assertEqual(rows[0]["occupied_slot_count"], 2)
+        self.assertEqual(rows[0]["occupied_horizontal_slot_span"], 2)
+        self.assertNotIn(
+            "max_item_length", rows[0]["auto_attribute_overrides"]
+        )
         self.assertEqual(summary["auto_planned_oversize_segment_count"], 1)
 
         heavy_rows, _summary = self.slotting.generate_basic(
@@ -660,10 +710,11 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
                 "max_item_length": 26,
                 "max_item_weight": 0,
             })],
-            1, 1, "AMR shelf", "Z01", self.zones, self.catalog,
+            1, 2, "AMR shelf", "Z01", self.zones, self.catalog,
             copy.deepcopy(self.base_local),
         )
         self.assertEqual(zero_weight_rows[0]["assignment_status"], "ASSIGNED")
+        self.assertEqual(zero_weight_rows[0]["occupied_slot_count"], 2)
         self.assertEqual(
             zero_weight_rows[0]["physical_missing_data_type"], "UNKNOWN_WEIGHT"
         )
@@ -805,7 +856,7 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
                 self.sku("AMBIENT_STANDARD", 100),
                 self.sku("AMBIENT_OUTLIER", 1, {"max_item_length": 26}),
             ],
-            1, 1, "AMR shelf", "Z01", zones, self.catalog, local,
+            1, 2, "AMR shelf", "Z01", zones, self.catalog, local,
         )
         by_sku = {row["sku"]: row for row in rows}
         self.assertEqual(by_sku["AMBIENT_OUTLIER"]["planned_storage_type"], "OVERSIZE")
@@ -820,7 +871,7 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
         )
         self.assertNotIn("MIXED", summary["zone_storage_types"].values())
 
-    def test_auto_planning_overwrites_segment_capacity_for_outlier(self):
+    def test_outlier_is_rejected_when_no_contiguous_footprint_exists(self):
         local = copy.deepcopy(self.base_local)
         local[self.slot_paths[0]] = {
             "oversize_capable": True,
@@ -836,9 +887,13 @@ class AttributeSlottingIntegrationTests(unittest.TestCase):
             })],
             1, 1, "AMR shelf", "Z01", self.zones, self.catalog, local,
         )
-        self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
         self.assertEqual(
-            rows[0]["auto_attribute_overrides"]["max_item_length"], 151
+            rows[0]["assignment_status"],
+            "UNASSIGNED_NO_COMPATIBLE_LOCATION",
+        )
+        self.assertIn(
+            "item dimensions do not fit this rack footprint in any rotation",
+            rows[0]["compatibility_issues"],
         )
 
     def test_swap_cannot_move_oversize_sku_into_standard_slot(self):

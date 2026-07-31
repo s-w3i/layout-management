@@ -14,7 +14,6 @@ from openpyxl import Workbook
 from warehouse_layout import (
     GridProject,
     GridSpec,
-    InsufficientStorageError,
     Marker,
     StorageAttributeService,
     TrafficAwareSlottingService,
@@ -395,7 +394,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             "existing_layout",
         )
 
-    def test_existing_layout_rejects_unassigned_skus(self):
+    def test_existing_layout_excludes_and_retains_unassigned_skus(self):
         payload = self.payload()
         payload["assignments"][1]["assignment_status"] = (
             "UNASSIGNED_NO_COMPATIBLE_LOCATION"
@@ -409,12 +408,22 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             dataset = AffinityService(directory / "cache").load_orders(
                 order_path
             )
-            with self.assertRaises(InsufficientStorageError):
-                self.service.run_existing_layout(
-                    payload,
-                    dataset,
-                    self.service.load_network(network_path),
-                )
+            result = self.service.run_existing_layout(
+                payload,
+                dataset,
+                self.service.load_network(network_path),
+            )
+        retained = next(
+            row for row in result.optimization.assignments
+            if row["sku"] == "SKU_L"
+        )
+        self.assertEqual(
+            retained["assignment_status"],
+            "UNASSIGNED_NO_COMPATIBLE_LOCATION",
+        )
+        self.assertEqual(
+            result.grouping_metrics["excluded_unassigned_sku_count"], 1
+        )
 
     def test_strict_oversize_uses_contiguous_slots_and_overweight_uses_level_two(self):
         project = GridProject(
@@ -539,7 +548,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertEqual(rows[0]["occupied_slot_count"], 2)
         self.assertEqual(summary["occupied_slot_count"], 2)
 
-    def test_full_pipeline_rejects_partial_layout_when_capacity_is_insufficient(self):
+    def test_full_pipeline_proceeds_with_partial_layout(self):
         project = GridProject(
             GridSpec(2, 1, 1, "capacity", "L1"),
             {
@@ -560,16 +569,25 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             self.write_orders(order_path)
             affinity_service = AffinityService(directory / "cache")
             affinity = affinity_service.analyze(affinity_service.load_orders(order_path))
-            with self.assertRaises(InsufficientStorageError) as caught:
-                self.service.run_full_pipeline(
-                    building, skus, affinity,
-                    self.service.network_from_rmf(building),
-                    levels_per_rack=1, slots_per_level=1,
-                    attribute_catalog=self.catalog,
-                    optimize_traffic=False,
-                )
-        self.assertEqual(caught.exception.summary["assigned_count"], 1)
-        self.assertEqual(caught.exception.summary["unassigned_count"], 1)
+            result = self.service.run_full_pipeline(
+                building, skus, affinity,
+                self.service.network_from_rmf(building),
+                levels_per_rack=1, slots_per_level=1,
+                attribute_catalog=self.catalog,
+                optimize_traffic=False,
+            )
+        self.assertEqual(result.baseline_summary["assigned_count"], 1)
+        self.assertEqual(result.baseline_summary["unassigned_count"], 1)
+        self.assertEqual(
+            result.grouping_metrics["excluded_unassigned_sku_count"], 1
+        )
+        self.assertEqual(
+            sum(
+                row["assignment_status"] != "ASSIGNED"
+                for row in result.pretraffic_payload["assignments"]
+            ),
+            1,
+        )
 
     def test_full_pipeline_uses_dedicated_ambient_oversize_zone(self):
         project = GridProject(
@@ -621,7 +639,8 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             row for row in result.affinity_assignments if row["sku"] == "SKU_L"
         )
         self.assertEqual(result.affinity_summary["assigned_count"], 2)
-        self.assertEqual(oversize["occupied_slot_count"], 1)
+        self.assertEqual(oversize["occupied_slot_count"], 2)
+        self.assertEqual(oversize["occupied_horizontal_slot_span"], 2)
         self.assertEqual(oversize["planned_storage_type"], "OVERSIZE")
         self.assertEqual(standard["planned_storage_type"], "STANDARD")
         self.assertNotEqual(oversize["rack_id"], standard["rack_id"])
@@ -728,7 +747,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             result = self.service.run_full_pipeline(
                 building, skus, affinity,
                 self.service.network_from_rmf(building),
-                levels_per_rack=1, slots_per_level=2,
+                levels_per_rack=1, slots_per_level=4,
                 attribute_catalog=self.catalog,
                 location_attributes={
                     "Z01": {**self.capacity, "chilled": True},

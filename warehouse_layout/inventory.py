@@ -9,6 +9,7 @@ from .attributes import (
     StorageAttributeService,
 )
 from .slotting import SlottingService
+from .storage_planning import combined_occupied_dynamic_address
 
 
 class InventoryService:
@@ -24,6 +25,7 @@ class InventoryService:
         "average_workstation_distance_m", "routing_status",
         "occupied_static_addresses", "occupied_buffer_ids",
         "occupied_storage_location_addresses", "occupied_handling_units",
+        "occupied_dynamic_address",
     )
     STATIC_PROFILE_FIELDS = (
         "rmf_grid_address", "zone_id", "aisle_id", "static_bay_id", "buffer_id",
@@ -338,3 +340,4 @@ class InventoryService:
                 "storage_location_address"
             ],
         }]
+        row["occupied_dynamic_address"] = combined_occupied_dynamic_address(row)

@@ -6,6 +6,7 @@ import itertools
 import math
 
 from .attributes import OVERSIZE_CAPABLE_KEY, StorageAttributeService
+from .slotting_rules import required_slot_footprint
 
 
 def plan_storage_zones(
@@ -30,29 +31,59 @@ def plan_storage_zones(
             else str(address)
         )
 
-    demand = {
-        False: {"STANDARD": 0, "OVERSIZE": 0},
-        True: {"STANDARD": 0, "OVERSIZE": 0},
-    }
-    for row in sku_rows:
-        requirements = row.get("sku_requirements")
-        if not isinstance(requirements, dict):
-            requirements = attributes.requirements_from_row(row, catalog)
-        profile = attributes.physical_profile(requirements)
-        storage_type = (
-            "STANDARD"
-            if profile["storage_class"] == "STANDARD"
-            else "OVERSIZE"
-        )
-        demand[requirements.get("chilled") is True][storage_type] += 1
-
     for chilled in (False, True):
         pool = [
             position for position in positions
             if position["effective_location_attributes"].get("chilled") is chilled
         ]
-        exception_required = demand[chilled]["OVERSIZE"]
-        standard_required = demand[chilled]["STANDARD"]
+        maximum_horizontal_slots = max(
+            (int(position["slot"]) for position in pool),
+            default=0,
+        )
+        exception_required = 0
+        standard_required = 0
+        for row in sku_rows:
+            requirements = row.get("sku_requirements")
+            if not isinstance(requirements, dict):
+                requirements = attributes.requirements_from_row(row, catalog)
+            if (requirements.get("chilled") is True) is not chilled:
+                continue
+            profile = attributes.physical_profile(requirements)
+            if profile["storage_class"] == "STANDARD":
+                standard_required += 1
+                continue
+
+            required_positions = 1
+            if (
+                all(
+                    key in profile.get("values", {})
+                    for key in (
+                        "max_item_length",
+                        "max_item_width",
+                        "max_item_height",
+                    )
+                )
+                and attributes.is_volumetric_oversize(profile)
+            ):
+                feasible_footprints = [
+                    footprint
+                    for position in pool
+                    if (
+                        footprint := required_slot_footprint(
+                            requirements,
+                            position["effective_location_attributes"],
+                            levels_per_rack,
+                            maximum_horizontal_slots,
+                        )
+                    ) is not None
+                ]
+                if feasible_footprints:
+                    required_positions = min(
+                        level_span * slot_span
+                        for level_span, slot_span in feasible_footprints
+                    )
+            exception_required += required_positions
+
         chilled_split_required = bool(chilled and exception_required and standard_required)
         oversize_ids: set[int] = set()
         if chilled:
@@ -80,22 +111,19 @@ def plan_storage_zones(
                     break
                 standard_racks.add(rack_id)
                 standard_capacity += len(by_rack[rack_id])
-            remaining_for_oversize = [
-                item
-                for rack_id in ranked_racks
-                if rack_id not in standard_racks
-                for item in sorted(
-                    by_rack[rack_id],
-                    key=lambda value: (
-                        abs(float(value["level"]) - (levels_per_rack + 1) / 2.0),
-                        int(value["level"]),
-                        int(value["slot"]),
-                    ),
-                )
-            ]
+            oversize_racks: set[str] = set()
+            oversize_capacity = 0
+            for rack_id in ranked_racks:
+                if rack_id in standard_racks:
+                    continue
+                if oversize_capacity >= exception_required:
+                    break
+                oversize_racks.add(rack_id)
+                oversize_capacity += len(by_rack[rack_id])
             oversize_ids = {
                 id(item)
-                for item in remaining_for_oversize[:exception_required]
+                for rack_id in oversize_racks
+                for item in by_rack[rack_id]
             }
         else:
             # Ambient zones are atomic: standard demand keeps first claim on
@@ -321,3 +349,94 @@ def build_dynamic_address(
             "slot",
         )
     raise ValueError(f"unsupported handling unit type: {handling_unit_type}")
+
+
+def combined_occupied_dynamic_address(row: dict) -> str:
+    """Return one compact display address for every position occupied by a SKU."""
+    canonical = str(row.get("dynamic_address", ""))
+    occupied = row.get("occupied_handling_units") or []
+    if len(occupied) <= 1:
+        return canonical
+
+    dynamic_level = str(row.get("dynamic_address_level", ""))
+    buffer_model = dynamic_level in {"shelf_slot", "handling_unit"}
+    if str(row.get("handling_unit_type", "")) == "AMR shelf":
+        unit_ids = {
+            str(
+                location.get("handling_unit_id")
+                or row.get("handling_unit_id", "")
+            )
+            for location in occupied
+        }
+        coordinates = {
+            (
+                int(location.get("storage_level") or 1),
+                int(location.get("storage_slot") or 1),
+            )
+            for location in occupied
+        }
+        levels = sorted({level for level, _slot in coordinates})
+        slots = sorted({slot for _level, slot in coordinates})
+        rectangle = {
+            (level, slot)
+            for level in levels
+            for slot in slots
+        }
+        if len(unit_ids) == 1 and coordinates == rectangle:
+            anchor, _level = build_dynamic_address(
+                str(row.get("zone_id", "")),
+                str(row.get("aisle_id", "")),
+                str(row.get("static_bay_id", "")),
+                levels[0],
+                slots[0],
+                "AMR shelf",
+                next(iter(unit_ids)),
+                buffer_model=buffer_model,
+            )
+            base = anchor.rsplit("/L", 1)[0]
+            level_label = f"L{levels[0]:02d}" + "".join(
+                f",{level:02d}" for level in levels[1:]
+            )
+            slot_label = f"S{slots[0]:02d}" + "".join(
+                f",{slot:02d}" for slot in slots[1:]
+            )
+            return f"{base}/{level_label}/{slot_label}"
+
+    addresses = []
+    for location in occupied:
+        try:
+            address, _level = build_dynamic_address(
+                str(row.get("zone_id", "")),
+                str(row.get("aisle_id", "")),
+                str(row.get("static_bay_id", "")),
+                int(location.get("storage_level") or 1),
+                int(location.get("storage_slot") or 1),
+                str(row.get("handling_unit_type", "")),
+                str(
+                    location.get("handling_unit_id")
+                    or row.get("handling_unit_id", "")
+                ),
+                buffer_model=buffer_model,
+            )
+        except (TypeError, ValueError):
+            return canonical
+        if address and address not in addresses:
+            addresses.append(address)
+
+    if len(addresses) <= 1:
+        return addresses[0] if addresses else canonical
+
+    split_addresses = [address.split("/") for address in addresses]
+    common_length = 0
+    for segments in zip(*split_addresses):
+        if len(set(segments)) != 1:
+            break
+        common_length += 1
+    if common_length:
+        prefix = "/".join(split_addresses[0][:common_length])
+        suffixes = [
+            "/".join(parts[common_length:])
+            for parts in split_addresses
+        ]
+        return f"{prefix}/[{', '.join(suffixes)}]"
+    return " | ".join(addresses)

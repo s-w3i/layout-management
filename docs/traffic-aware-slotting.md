@@ -2,9 +2,10 @@
 
 The **Traffic-Aware Slotting** tab supports two workflows:
 
-1. **Optimize Existing Layout** loads a complete `.slotting.json`, validates its
-   existing assignments, and applies traffic-aware complete-unit relocation.
-   It never regenerates or reorders the baseline with ABC or affinity.
+1. **Optimize Existing Layout** loads a `.slotting.json`, validates its assigned
+   inventory, and applies traffic-aware complete-unit relocation. Unassigned
+   SKU rows are excluded and retained unchanged. It never regenerates or
+   reorders the baseline with ABC or affinity.
 2. **Generate Layout + Optimize Traffic** starts from an editable `.grid.json`,
    velocity data, and order history. Select either **ABC** or
    **ABC + Affinity** as the initial layout strategy, then run hard-rule
@@ -42,8 +43,9 @@ standard chilled demand receiving capacity first. Known overweight and
 oversize-plus-overweight inventory is assigned to level 2 when that level
 exists (otherwise level 1). Unknown-size, unknown-weight, and non-volumetric
 records use the exception segment and remain visibly unverified. If cumulative
-compatible capacity is insufficient,
-generation stops with a warning and does not expose a partial layout for saving.
+compatible capacity is insufficient, assigned inventory continues through
+traffic optimization while unassigned rows are excluded, retained unchanged,
+and reported. A layout with no assigned inventory still stops.
 
 Traffic optimization swaps complete handling units only. It preserves the
 destination's zone, segment, buffer, capacity, and static address metadata.

@@ -39,8 +39,10 @@ from .config import (
 )
 from .domain import GridPosition, GridProject, GridSpec, Marker, StorageLayout
 from .inventory import InventoryService
+from .global_traffic_gui import GlobalTrafficOptimizerTab
 from .rmf import RmfMapService
 from .slotting import SlottingLayoutRepository, SlottingService
+from .storage_planning import combined_occupied_dynamic_address
 from .traffic import (
     InsufficientStorageError,
     TrafficAwareSlottingService,
@@ -50,7 +52,7 @@ from .zone_settings_editor import ZoneStorageSettingsEditor
 
 
 class GridMapEditorApp:
-    """Coordinate the five-tab desktop UI and application services."""
+    """Coordinate the seven-tab desktop UI and application services."""
 
     @staticmethod
     def sku_storage_flags(row):
@@ -106,6 +108,15 @@ class GridMapEditorApp:
             for row in rows
         )
         return chilled, physical_exceptions
+
+    @staticmethod
+    def occupied_dynamic_address(row):
+        """Show all occupied positions while retaining canonical address data."""
+        return (
+            row.get("occupied_dynamic_address")
+            or combined_occupied_dynamic_address(row)
+            or row.get("dynamic_address", "")
+        )
 
     def __init__(self, root, initial_project: GridProject | None = None):
         self.root = root
@@ -364,12 +375,14 @@ class GridMapEditorApp:
         slotting_tab = ttk.Frame(notebook)
         slotting_layout_tab = ttk.Frame(notebook)
         traffic_tab = ttk.Frame(notebook)
+        global_traffic_tab = ttk.Frame(notebook)
         operations_tab = ttk.Frame(notebook)
         notebook.add(map_tab, text="Grid Map Editor")
         notebook.add(affinity_tab, text="SKU Affinity")
         notebook.add(slotting_tab, text="Inventory Slotting")
         notebook.add(slotting_layout_tab, text="Interactive Slotting Layout")
         notebook.add(traffic_tab, text="Traffic-Aware Slotting")
+        notebook.add(global_traffic_tab, text="Global Traffic Optimizer")
         notebook.add(operations_tab, text="Inventory Operations Demo")
         map_tab.columnconfigure(1, weight=1)
         map_tab.rowconfigure(0, weight=1)
@@ -545,6 +558,9 @@ class GridMapEditorApp:
         self._build_slotting_tab(slotting_tab)
         self._build_interactive_slotting_tab(slotting_layout_tab)
         self._build_traffic_tab(traffic_tab)
+        self.global_traffic_ui = GlobalTrafficOptimizerTab(
+            global_traffic_tab, self
+        )
         self._build_operations_tab(operations_tab)
 
     def _build_affinity_tab(self, parent):
@@ -1595,7 +1611,7 @@ class GridMapEditorApp:
         tree_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=8, pady=(8, 0))
         tree_frame.columnconfigure(0, weight=1); tree_frame.rowconfigure(0, weight=1)
         self.slot_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-        headings = {"abc_rank":"ABC rank", "affinity_rank":"Affinity order", "sku":"SKU", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Current dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
+        headings = {"abc_rank":"ABC rank", "affinity_rank":"Affinity order", "sku":"SKU", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Occupied dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
         widths = {"abc_rank":65, "affinity_rank":85, "sku":95, "class":50, "flags":180, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
         for column in columns:
             self.slot_tree.heading(column, text=headings[column]); self.slot_tree.column(column, width=widths[column], anchor="center" if column not in {"flags","static","dynamic"} else "w")
@@ -2473,13 +2489,17 @@ class GridMapEditorApp:
             f"Mapped {len(before.mapped_units):,}  · "
             f"Raw peak {before.metrics['raw_peak_load']:.1f} → {after.metrics['raw_peak_load']:.1f}  · "
             f"Raw P95 {before.metrics['raw_p95_load']:.1f} → {after.metrics['raw_p95_load']:.1f}  · "
-            f"Travel {before.metrics['expected_travel']:.1f} → {after.metrics['expected_travel']:.1f}  · Relocated {relocated:,}"
+            f"Travel {before.metrics['expected_travel']:.1f} → {after.metrics['expected_travel']:.1f}  · "
+            f"Relocated {relocated:,}  · "
+            f"Excluded unassigned {int(grouping.get('excluded_unassigned_sku_count', 0)):,}"
         )
         self.traffic_status.set(
             f"{len(before.unmapped_units):,} unmapped and {len(before.unreachable_units):,} unreachable units · "
             f"{len(before.demand.unmatched_skus):,} workbook SKUs absent from the layout · "
             f"hard validation {grouping.get('hard_validation_status', 'not run')} · "
-            f"unverified physical SKUs {int(grouping.get('unverified_physical_sku_count', 0)):,}."
+            f"unverified physical SKUs {int(grouping.get('unverified_physical_sku_count', 0)):,} · "
+            f"unassigned SKUs retained unchanged "
+            f"{int(grouping.get('excluded_unassigned_sku_count', 0)):,}."
         )
         before_resources = {row["resource_id"]: row for row in before.resources}
         after_resources = {row["resource_id"]: row for row in after.resources}
@@ -2915,7 +2935,7 @@ class GridMapEditorApp:
         inventory=ttk.LabelFrame(control,text="SELECTED RACK INVENTORY",padding=6); inventory.grid(row=2,column=0,sticky="nsew",pady=(0,8)); inventory.columnconfigure(0,weight=1); inventory.rowconfigure(0,weight=1)
         columns=("sku","class","flags","static","dynamic","unit")
         self.ops_inventory_tree=ttk.Treeview(inventory,columns=columns,show="headings",height=8)
-        headings={"sku":"SKU","class":"ABC","flags":"Storage flags","static":"Static address","dynamic":"Dynamic address","unit":"Shelf / unit"}
+        headings={"sku":"SKU","class":"ABC","flags":"Storage flags","static":"Static address","dynamic":"Occupied dynamic address","unit":"Shelf / unit"}
         widths={"sku":100,"class":45,"flags":180,"static":190,"dynamic":220,"unit":110}
         for column in columns:
             self.ops_inventory_tree.heading(column,text=headings[column]);self.ops_inventory_tree.column(column,width=widths[column],anchor="center" if column in {"class","unit"} else "w")
@@ -3084,7 +3104,7 @@ class GridMapEditorApp:
         rows=[row for row in self.ops_rows if row.get("assignment_status")=="ASSIGNED" and row.get("rack_id")==rack_id]
         rows.sort(key=lambda row:(int(row.get("storage_level") or 0),int(row.get("storage_slot") or 0),str(row.get("sku",""))))
         for row in rows:
-            item=self.ops_inventory_tree.insert("","end",values=(row.get("sku",""),row.get("velocity_class",""),self.sku_storage_flags(row),row.get("static_address",""),row.get("dynamic_address",""),row.get("handling_unit_id","")))
+            item=self.ops_inventory_tree.insert("","end",values=(row.get("sku",""),row.get("velocity_class",""),self.sku_storage_flags(row),row.get("static_address",""),self.occupied_dynamic_address(row),row.get("handling_unit_id","")))
             self.ops_inventory_rows[item]=row
 
     def ops_inventory_select(self,_event=None):
@@ -3117,7 +3137,8 @@ class GridMapEditorApp:
             f"Physical class: {row.get('physical_storage_class','NOT_EVALUATED')} · "
             f"data {row.get('physical_data_status','NOT_EVALUATED')} "
             f"{row.get('physical_missing_data_type', '')}\n"
-            f"Current static address: {row.get('static_address','')}\nCurrent dynamic address: {row.get('dynamic_address','')}\n"
+            f"Current static address: {row.get('static_address','')}\n"
+            f"Occupied dynamic address: {self.occupied_dynamic_address(row)}\n"
             f"Handling unit: {row.get('handling_unit_id','')} ({row.get('handling_unit_type','')})\nRMF grid position: {row.get('rmf_grid_address','')}\n"
             f"SKU requirements: {self.attributes.format_values(row.get('sku_requirements'))}\n"
             f"Effective location attributes: {self.attributes.format_values(effective)}\n"
@@ -3789,7 +3810,7 @@ class GridMapEditorApp:
                 row.get("abc_frequency_rank", row.get("sku_rank", "")),
                 row.get("affinity_placement_rank", ""),
                 row["sku"], row["velocity_class"], self.sku_storage_flags(row),
-                row["static_address"], row["dynamic_address"],
+                row["static_address"], self.occupied_dynamic_address(row),
                 row["handling_unit_type"], row["handling_unit_id"],
                 row["assignment_status"],
             ))

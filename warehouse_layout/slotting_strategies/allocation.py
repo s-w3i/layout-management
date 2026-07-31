@@ -16,6 +16,7 @@ from ..attributes import (
 )
 from ..storage_planning import (
     build_dynamic_address,
+    combined_occupied_dynamic_address,
     derive_zone_storage_types,
     plan_storage_zones,
 )
@@ -403,6 +404,14 @@ def allocate(
             and str(profile.get("storage_class", "STANDARD")).upper()
             != "STANDARD"
         )
+        known_volumetric_oversize = bool(
+            physical_enabled
+            and all(
+                key in profile.get("values", {})
+                for key in PHYSICAL_DIMENSION_KEYS
+            )
+            and service.attributes.is_volumetric_oversize(profile)
+        )
         position = None
         occupied_positions: list[dict] = []
         compatibility_status = "NOT_EVALUATED"
@@ -470,7 +479,14 @@ def allocate(
                     if issue not in hard_issues:
                         hard_issues.append(issue)
                     continue
-                if strict_compatibility and profile["data_status"] == "COMPLETE":
+                footprint_required = bool(
+                    (
+                        strict_compatibility
+                        and profile["data_status"] == "COMPLETE"
+                    )
+                    or known_volumetric_oversize
+                )
+                if footprint_required:
                     issues = []
                     footprint = required_slot_footprint(
                         requirements,
@@ -480,7 +496,8 @@ def allocate(
                     )
                     if footprint is None:
                         issues = [
-                            "item depth does not fit this location in any rotation"
+                            "item dimensions do not fit this rack footprint "
+                            "in any rotation"
                         ]
                     else:
                         level_span, slot_span = footprint
@@ -515,18 +532,83 @@ def allocate(
                                 f"{slot_span} slot footprint"
                             ]
                         else:
-                            generic_requirements = {
-                                key: value for key, value in requirements.items()
-                                if key not in PHYSICAL_DIMENSION_KEYS
-                                and not (overweight and key == PHYSICAL_WEIGHT_KEY)
-                            }
-                            issues = []
+                            if auto_plan_oversize:
+                                expected_storage_type = (
+                                    "OVERSIZE"
+                                    if exception_inventory else "STANDARD"
+                                )
+                                if any(
+                                    occupied.get("planned_storage_type")
+                                    != expected_storage_type
+                                    for occupied in occupied_positions
+                                ):
+                                    issues.append(
+                                        f"requires a contiguous {level_span} level × "
+                                        f"{slot_span} slot footprint entirely inside "
+                                        f"the {expected_storage_type} zone"
+                                    )
+                                if any(
+                                    occupied.get("planned_zone_id")
+                                    != candidate.get("planned_zone_id")
+                                    for occupied in occupied_positions
+                                ):
+                                    issues.append(
+                                        "contiguous footprint cannot cross a "
+                                        "planned-zone boundary"
+                                    )
+                            anchor_effective = candidate[
+                                "effective_location_attributes"
+                            ]
+                            if any(
+                                any(
+                                    service.attributes.physical_capacity(
+                                        occupied[
+                                            "effective_location_attributes"
+                                        ],
+                                        key,
+                                    )
+                                    < service.attributes.physical_capacity(
+                                        anchor_effective,
+                                        key,
+                                    )
+                                    for key in PHYSICAL_DIMENSION_KEYS
+                                )
+                                for occupied in occupied_positions
+                            ):
+                                issues.append(
+                                    "one or more positions in the contiguous "
+                                    "footprint are smaller than the selected "
+                                    "anchor slot"
+                                )
                             for occupied in occupied_positions:
-                                issues.extend(service.attributes.compatibility_issues(
-                                    generic_requirements,
-                                    occupied["effective_location_attributes"],
-                                    catalog,
-                                ))
+                                issues.extend(
+                                    service.attributes.hard_compatibility_issues(
+                                        requirements,
+                                        occupied[
+                                            "effective_location_attributes"
+                                        ],
+                                    )
+                                )
+                            if strict_compatibility:
+                                generic_requirements = {
+                                    key: value
+                                    for key, value in requirements.items()
+                                    if key not in PHYSICAL_DIMENSION_KEYS
+                                    and not (
+                                        overweight
+                                        and key == PHYSICAL_WEIGHT_KEY
+                                    )
+                                }
+                                for occupied in occupied_positions:
+                                    issues.extend(
+                                        service.attributes.compatibility_issues(
+                                            generic_requirements,
+                                            occupied[
+                                                "effective_location_attributes"
+                                            ],
+                                            catalog,
+                                        )
+                                    )
                 elif strict_compatibility:
                     generic_requirements = {
                         key: value for key, value in requirements.items()
@@ -555,6 +637,12 @@ def allocate(
                         catalog,
                     )
                 )
+                if known_volumetric_oversize:
+                    # The contiguous footprint satisfies the dimension
+                    # requirement. Do not disguise that occupancy by enlarging
+                    # a single slot's configured dimensions.
+                    for key in PHYSICAL_DIMENSION_KEYS:
+                        overrides.pop(key, None)
                 if auto_plan_oversize and exception_inventory:
                     if candidate["effective_location_attributes"].get(
                         OVERSIZE_CAPABLE_KEY
@@ -772,22 +860,23 @@ def allocate(
                     if id(item) not in occupied_ids
                 ]
                 if auto_overrides:
-                    override_path = position["storage_location_address"]
-                    local_attributes.setdefault(
-                        override_path, {}
-                    ).update(auto_overrides)
-                    position["effective_location_attributes"] = (
-                        service.attributes.effective_attributes(
-                            override_path, local_attributes
-                        )[0]
-                    )
-                    position["storage_area_type"] = (
-                        "OVERSIZE"
-                        if service.attributes.is_oversize_location(
-                            position["effective_location_attributes"]
+                    for occupied in occupied_positions:
+                        override_path = occupied["storage_location_address"]
+                        local_attributes.setdefault(
+                            override_path, {}
+                        ).update(auto_overrides)
+                        occupied["effective_location_attributes"] = (
+                            service.attributes.effective_attributes(
+                                override_path, local_attributes
+                            )[0]
                         )
-                        else "STANDARD"
-                    )
+                        occupied["storage_area_type"] = (
+                            "OVERSIZE"
+                            if service.attributes.is_oversize_location(
+                                occupied["effective_location_attributes"]
+                            )
+                            else "STANDARD"
+                        )
                 selected_state = rack_state.setdefault(
                     position["rack_id"],
                     {
@@ -992,6 +1081,10 @@ def allocate(
         else:
             row.update({key: "" for key in empty_location_fields})
             row["effective_location_attributes"] = {}
+        row["occupied_dynamic_address"] = (
+            combined_occupied_dynamic_address(row)
+            if position else ""
+        )
         output.append(row)
 
     output.sort(key=lambda row: int(row.get("sku_rank") or 10**9))

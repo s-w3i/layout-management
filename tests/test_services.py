@@ -20,6 +20,7 @@ from warehouse_layout import (
     SlottingService,
 )
 from warehouse_layout.affinity import AffinityService
+from warehouse_layout.storage_planning import combined_occupied_dynamic_address
 
 
 class WarehouseServiceTests(unittest.TestCase):
@@ -354,6 +355,29 @@ class WarehouseServiceTests(unittest.TestCase):
                 self.assertTrue(
                     all(row["dynamic_address_level"] == expected_layer for row in rows)
                 )
+
+    def test_combined_dynamic_address_compacts_oversize_footprint(self):
+        row = {
+            "dynamic_address": "SHELF_124/L02/S02",
+            "dynamic_address_level": "shelf_slot",
+            "zone_id": "Z03",
+            "aisle_id": "A04",
+            "static_bay_id": "B-G6_2",
+            "handling_unit_type": "AMR shelf",
+            "handling_unit_id": "SHELF_124",
+            "occupied_handling_units": [
+                {
+                    "handling_unit_id": "SHELF_124",
+                    "storage_level": 2,
+                    "storage_slot": slot,
+                }
+                for slot in (2, 3)
+            ],
+        }
+        self.assertEqual(
+            combined_occupied_dynamic_address(row),
+            "SHELF_124/L02/S02,03",
+        )
 
     def test_unreachable_racks_remain_last_resort_storage_capacity(self):
         building = copy.deepcopy(self.building)

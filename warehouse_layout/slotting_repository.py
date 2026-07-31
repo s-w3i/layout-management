@@ -14,7 +14,10 @@ from .attributes import (
     StorageAttributeService,
 )
 from .config import LEGACY_SLOTTING_SCHEMA, SLOTTING_SCHEMA
-from .storage_planning import derive_zone_storage_types
+from .storage_planning import (
+    combined_occupied_dynamic_address,
+    derive_zone_storage_types,
+)
 
 
 class SlottingLayoutRepository:
@@ -250,6 +253,11 @@ class SlottingLayoutRepository:
                     ),
                 }]
                 if row.get("assignment_status") == "ASSIGNED" else [],
+            )
+            row.setdefault(
+                "occupied_dynamic_address",
+                combined_occupied_dynamic_address(row)
+                if row.get("assignment_status") == "ASSIGNED" else "",
             )
             row.setdefault("rack_frequency_rank", "")
             row.setdefault("rack_pick_frequency", "")

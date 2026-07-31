@@ -29,6 +29,7 @@ from .config import (
 from .domain import GridProject
 from .slotting import SlottingService
 from .slotting_rules import overweight_storage_level, planned_storage_type
+from .storage_planning import combined_occupied_dynamic_address
 
 
 NETWORK_SCHEMA = "warehouse_movement_network/v1"
@@ -52,9 +53,14 @@ class InsufficientStorageError(ValueError):
             f"{status}={count}"
             for status, count in sorted(counts.items()) if count
         ) or "no compatible contiguous capacity"
+        sku_details = summary.get("unassigned_sku_details") or []
+        sku_text = (
+            "; " + " | ".join(str(value) for value in sku_details[:5])
+            if sku_details else ""
+        )
         super().__init__(
             f"{summary.get('unassigned_count', 0)} SKU(s) do not fit the configured "
-            f"storage areas ({detail})"
+            f"storage areas ({detail}){sku_text}"
         )
 
 
@@ -821,6 +827,9 @@ class TrafficAwareSlottingService:
                     level, slot, str(row.get("handling_unit_type", "")), source,
                     buffer_model=bool(payload.get("storage_layout")),
                 )
+                row["occupied_dynamic_address"] = (
+                    combined_occupied_dynamic_address(row)
+                )
                 row["compatibility_status"] = "COMPATIBLE"
                 row["compatibility_issues"] = []
 
@@ -1246,23 +1255,42 @@ class TrafficAwareSlottingService:
                 raise ValueError(f"traffic result unit {unit} failed validation: {reason}")
 
     def validate_traffic_baseline(self, payload: dict) -> dict:
-        """Apply the shared hard rules before any traffic relocation."""
+        """Validate assigned inventory and report unassigned rows as exclusions."""
         rows = payload.get("assignments", [])
         unassigned = [
             row for row in rows if row.get("assignment_status") != "ASSIGNED"
         ]
+        unassigned_counts: dict[str, int] = {}
+        unassigned_details = []
         if unassigned:
-            summary = copy.deepcopy(payload.get("summary", {}))
-            counts: dict[str, int] = {}
             for row in unassigned:
                 status = str(row.get("assignment_status", "UNASSIGNED"))
-                counts[status] = counts.get(status, 0) + 1
-            summary["unassigned_count"] = len(unassigned)
-            summary["unassigned_status_counts"] = counts
-            summary.setdefault("capacity", len(rows) - len(unassigned))
-            raise InsufficientStorageError(summary)
+                unassigned_counts[status] = (
+                    unassigned_counts.get(status, 0) + 1
+                )
+            unassigned_details = [
+                (
+                    f"{row.get('sku', '')}: "
+                    f"{row.get('assignment_status', 'UNASSIGNED')}"
+                    + (
+                        " · " + "; ".join(
+                            str(issue)
+                            for issue in row.get("compatibility_issues", [])
+                        )
+                        if row.get("compatibility_issues") else ""
+                    )
+                )
+                for row in unassigned
+            ]
         if not rows:
             raise ValueError("slotting layout contains no assignments")
+        assigned = [
+            row for row in rows if row.get("assignment_status") == "ASSIGNED"
+        ]
+        if not assigned:
+            raise ValueError(
+                "slotting layout contains no assigned inventory to optimize"
+            )
 
         levels_per_rack = int(
             payload.get("rack_capacity", {}).get("levels") or 1
@@ -1273,7 +1301,7 @@ class TrafficAwareSlottingService:
         locations = payload.get("location_attributes", {})
         invalid = []
         unverified = 0
-        for row in rows:
+        for row in assigned:
             requirements = row.get("sku_requirements") or {}
             profile = self.attributes.physical_profile(requirements)
             required_storage_type = planned_storage_type(profile)
@@ -1343,8 +1371,15 @@ class TrafficAwareSlottingService:
                 + " | ".join(invalid[:5])
             )
         return {
-            "hard_validation_status": "PASSED",
+            "hard_validation_status": (
+                "PASSED_WITH_UNASSIGNED_EXCLUSIONS"
+                if unassigned else "PASSED"
+            ),
             "unverified_physical_sku_count": unverified,
+            "assigned_sku_count": len(assigned),
+            "excluded_unassigned_sku_count": len(unassigned),
+            "excluded_unassigned_status_counts": unassigned_counts,
+            "excluded_unassigned_sku_details": unassigned_details,
         }
 
     @staticmethod
@@ -1630,9 +1665,6 @@ class TrafficAwareSlottingService:
                 auto_plan_oversize=True,
             )
             affinity_configuration = summary.get("affinity_tuning", {})
-        if summary.get("unassigned_count", 0):
-            raise InsufficientStorageError(summary)
-
         storage_layout_payload = (
             storage_layout.to_dict() if storage_layout is not None else {}
         )

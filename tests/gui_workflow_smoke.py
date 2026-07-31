@@ -14,6 +14,9 @@ from types import SimpleNamespace
 from openpyxl import Workbook
 
 import warehouse_layout.gui as gui
+from warehouse_layout.global_traffic_search import (
+    GlobalTrafficSearchScenario,
+)
 
 
 def assigned_rows(rows):
@@ -33,10 +36,11 @@ def main() -> None:
     root = tk.Tk()
     app = gui.GridMapEditorApp(root)
     root.update_idletasks()
-    assert len(app.notebook.tabs()) == 6
+    assert len(app.notebook.tabs()) == 7
     assert app.notebook.tab(app.notebook.tabs()[1], "text") == "SKU Affinity"
     assert app.notebook.tab(app.notebook.tabs()[3], "text") == "Interactive Slotting Layout"
     assert app.notebook.tab(app.notebook.tabs()[4], "text") == "Traffic-Aware Slotting"
+    assert app.notebook.tab(app.notebook.tabs()[5], "text") == "Global Traffic Optimizer"
     assert app.grid_sidebar_canvas.cget("yscrollcommand")
     assert app.grid_sidebar_scrollbar.cget("command")
     assert app.grid_sidebar_canvas.bind("<MouseWheel>")
@@ -87,6 +91,7 @@ def main() -> None:
         app.affinity_graph_canvas,
         app.slot_canvas,
         app.traffic_canvas,
+        app.global_traffic_ui.canvas,
         app.ops_canvas,
     )
     assert all(canvas.bind("<ButtonPress-3>") for canvas in layout_canvases)
@@ -577,6 +582,132 @@ def main() -> None:
         app.export_traffic_report()
         assert traffic_export.exists()
         assert traffic_export.with_name("workflow-traffic_traffic_resources.csv").exists()
+
+        # Independent global optimizer: reuse a saved layout, solve a complete
+        # no-empty-buffer permutation, and preserve proof metadata.
+        global_ui = app.global_traffic_ui
+        global_ui.layout_path.set(str(affinity_layout_path))
+        global_ui.order_path.set(str(slot_affinity_path))
+        global_ui.time_limit.set("10")
+        global_ui.gap_percent.set("0")
+        global_ui.max_travel.set("100")
+        global_output = temp / "workflow-global.slotting.json"
+        global_ui.output_path.set(str(global_output))
+        global_ui.start("existing_layout")
+        deadline = time.monotonic() + 15
+        while global_ui.worker and global_ui.worker.is_alive():
+            root.update()
+            time.sleep(0.01)
+            assert time.monotonic() < deadline
+        global_ui.poll()
+        root.update_idletasks()
+        assert global_ui.result is not None, (global_ui.status.get(), errors)
+        assert global_ui.result.solver["status"] in {"OPTIMAL", "FEASIBLE"}
+        assert global_ui.result.output_payload[
+            "global_traffic_configuration"
+        ]["workflow_mode"] == "existing_layout"
+        assert global_ui.solver_tree.get_children()
+        assert global_ui.canvas.find_withtag("global_link")
+        assert global_ui.canvas.find_withtag("global_rack")
+        global_rack_colours = {
+            global_ui.canvas.itemcget(item, "fill")
+            for item in global_ui.canvas.find_withtag("global_rack_heat")
+        }
+        assert global_rack_colours != {"#eff4f5"}
+        global_rack_visits = {
+            next(
+                tag for tag in global_ui.canvas.gettags(item)
+                if tag.startswith("rack_visits:")
+            )
+            for item in global_ui.canvas.find_withtag("global_rack_heat")
+        }
+        if len(global_rack_visits) >= 2:
+            assert len(global_rack_colours) >= 2
+        assert all(
+            any(
+                tag.startswith("rack_visits:")
+                for tag in global_ui.canvas.gettags(item)
+            )
+            for item in global_ui.canvas.find_withtag("global_rack_heat")
+        )
+        global_ui.show_rack_heat.set(False)
+        global_ui.draw_map()
+        assert {
+            global_ui.canvas.itemcget(item, "fill")
+            for item in global_ui.canvas.find_withtag("global_rack_heat")
+        } == {"#eff4f5"}
+        global_ui.show_rack_heat.set(True)
+        global_ui.draw_map()
+        global_ui.save()
+        assert global_output.exists()
+        saved_global = app.layouts.load(global_output)
+        assert saved_global["strategy"] == "global_congestion_balanced"
+        assert saved_global["global_traffic_configuration"]["backend"] == (
+            "OR-Tools CP-SAT"
+        )
+        auto_output = temp / "workflow-global-auto.slotting.json"
+        global_ui.output_path.set(str(auto_output))
+        global_ui.search_screen_seconds.set("1")
+        global_ui.search_final_seconds.set("1")
+        global_ui.search_finalists.set("1")
+        global_ui.search.default_scenarios = lambda: (
+            GlobalTrafficSearchScenario("SMOKE", 1.0, 1.0),
+        )
+        global_ui.start("auto_search")
+        deadline = time.monotonic() + 20
+        while global_ui.worker and global_ui.worker.is_alive():
+            root.update()
+            time.sleep(0.01)
+            assert time.monotonic() < deadline
+        global_ui.poll()
+        root.update_idletasks()
+        assert global_ui.search_result is not None, (
+            global_ui.status.get(), errors
+        )
+        assert global_ui.search_tree.get_children()
+        selected_trial = next(
+            trial for trial in global_ui.search_result.trials
+            if trial.accepted
+            and trial is not global_ui.search_result.best_trial
+        )
+        selected_item = next(
+            item for item, trial in global_ui.search_trials_by_item.items()
+            if trial is selected_trial
+        )
+        global_ui.search_tree.selection_set(selected_item)
+        global_ui.select_search_trial()
+        assert global_ui.result is selected_trial.result
+        global_ui.save()
+        assert auto_output.exists()
+        auto_report = auto_output.with_name(
+            f"{auto_output.stem}_search"
+        )
+        assert (auto_report / "parameter_comparison.csv").exists()
+        assert (auto_report / "search_summary.json").exists()
+        auto_layout = app.layouts.load(auto_output)
+        assert auto_layout["global_traffic_configuration"][
+            "parameter_search"
+        ]["selected_scenario"] == "SMOKE"
+        assert auto_layout["global_traffic_configuration"][
+            "parameter_search"
+        ]["selected_phase"] == selected_trial.phase
+        global_ui.grid_path.set(str(project_path))
+        global_ui.velocity_path.set(str(affinity_velocity_path))
+        global_ui.initial_strategy.set("ABC")
+        global_ui.start("full_pipeline")
+        deadline = time.monotonic() + 15
+        while global_ui.worker and global_ui.worker.is_alive():
+            root.update()
+            time.sleep(0.01)
+            assert time.monotonic() < deadline
+        global_ui.poll()
+        root.update_idletasks()
+        assert global_ui.result is not None, (global_ui.status.get(), errors)
+        assert global_ui.result.workflow_mode == "full_pipeline"
+        assert global_ui.result.initial_strategy == "basic"
+        assert global_ui.result.output_payload["sources"][
+            "grid_project_json"
+        ] == str(project_path.resolve())
 
         app.slot_location_attributes = {}
         original_open_dialog = gui.filedialog.askopenfilename

@@ -22,3 +22,6 @@ DEFAULT_TRAFFIC_INPUT = DEFAULT_AFFINITY_INPUT
 DEFAULT_TRAFFIC_CACHE = PROJECT_ROOT / ".cache/rmf_grid_map_editor/traffic"
 DEFAULT_TRAFFIC_OUTPUT = PROJECT_ROOT / "resources/data/traffic_aware_layout.slotting.json"
 DEFAULT_TRAFFIC_REPORT = PROJECT_ROOT / "resources/data/traffic_analysis"
+DEFAULT_GLOBAL_TRAFFIC_OUTPUT = (
+    PROJECT_ROOT / "resources/data/global_traffic_layout.slotting.json"
+)

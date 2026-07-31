@@ -12,6 +12,18 @@ from .attributes import (
 from .affinity import AffinityAnalysis, AffinityDataset, AffinityService
 from .domain import GridPosition, GridProject, GridSpec, Marker, StorageLayout
 from .inventory import InventoryService
+from .global_traffic import (
+    GlobalTrafficCancelledError,
+    GlobalTrafficOptimizationError,
+    GlobalTrafficResult,
+    GlobalTrafficSlottingService,
+)
+from .global_traffic_search import (
+    GlobalTrafficParameterSearch,
+    GlobalTrafficSearchResult,
+    GlobalTrafficSearchScenario,
+    GlobalTrafficSearchTrial,
+)
 from .rmf import RmfMapService
 from .slotting import SlottingLayoutRepository, SlottingService
 from .traffic import (
@@ -39,6 +51,14 @@ __all__ = [
     "GridProject",
     "GridSpec",
     "InventoryService",
+    "GlobalTrafficCancelledError",
+    "GlobalTrafficOptimizationError",
+    "GlobalTrafficResult",
+    "GlobalTrafficSlottingService",
+    "GlobalTrafficParameterSearch",
+    "GlobalTrafficSearchResult",
+    "GlobalTrafficSearchScenario",
+    "GlobalTrafficSearchTrial",
     "Marker",
     "RmfMapService",
     "SlottingLayoutRepository",
