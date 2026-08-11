@@ -114,6 +114,7 @@ class SlottingLayoutRepository:
                 "building_yaml": source_building,
                 "grid_project_json": source_grid_project,
                 "sku_velocity_csv": source_velocity,
+                "sku_attributes_csv": source_chilled,
                 "chilled_requirements_csv": source_chilled,
                 "affinity_order_workbook": source_affinity,
             },
@@ -123,7 +124,7 @@ class SlottingLayoutRepository:
                 "oversize": oversize_storage_defaults or OVERSIZE_STORAGE_DEFAULTS,
             },
             "chilled_requirements": {
-                "missing_sku_is_ambient": True,
+                "missing_sku_is_ambient": False,
                 "demo_rate": chilled_demo_rate,
                 "demo_seed": chilled_demo_seed,
             },
@@ -161,6 +162,10 @@ class SlottingLayoutRepository:
         payload.setdefault("sources", {})
         payload["sources"].setdefault("grid_project_json", "")
         payload["sources"].setdefault("chilled_requirements_csv", "")
+        payload["sources"].setdefault(
+            "sku_attributes_csv",
+            payload["sources"].get("chilled_requirements_csv", ""),
+        )
         payload["sources"].setdefault("affinity_order_workbook", "")
         payload.setdefault("affinity_configuration", {})
         payload.setdefault("storage_layout", {})
@@ -170,7 +175,7 @@ class SlottingLayoutRepository:
             "oversize": {},
         })
         payload.setdefault("chilled_requirements", {
-            "missing_sku_is_ambient": True,
+            "missing_sku_is_ambient": False,
             "demo_rate": 0.10,
             "demo_seed": 42,
         })

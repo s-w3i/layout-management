@@ -20,7 +20,6 @@ from matplotlib.figure import Figure
 from .affinity import AffinityCancelledError, AffinityService
 from .attribute_editor import HierarchyAttributeEditor
 from .attributes import (
-    OVERSIZE_CAPABLE_KEY,
     PHYSICAL_ATTRIBUTE_KEYS,
     STANDARD_STORAGE_DEFAULTS,
     StorageAttributeService,
@@ -30,13 +29,14 @@ from .config import (
     DEFAULT_AFFINITY_OUTPUT,
     DEFAULT_GRID_INPUT,
     DEFAULT_BUILDING_OUTPUT,
-    DEFAULT_CHILLED_INPUT,
+    DEFAULT_SKU_ATTRIBUTES_INPUT,
     DEFAULT_SLOTTING_OUTPUT,
     DEFAULT_TRAFFIC_INPUT,
     DEFAULT_TRAFFIC_OUTPUT,
     DEFAULT_TRAFFIC_REPORT,
     DEFAULT_VELOCITY_INPUT,
 )
+from .ctbsa import CtbsaParameters
 from .domain import GridPosition, GridProject, GridSpec, Marker, StorageLayout
 from .inventory import InventoryService
 from .global_traffic_gui import GlobalTrafficOptimizerTab
@@ -130,10 +130,9 @@ class GridMapEditorApp:
         self.inventory = InventoryService(self.slotting, self.attributes)
         self.traffic = TrafficAwareSlottingService(self.attributes, self.slotting)
         self.project = initial_project or GridProject()
-        if not self.project.attribute_catalog:
-            self.project.attribute_catalog = self.attributes.serialize_catalog(
-                self.attributes.starter_catalog()
-            )
+        self.attributes.set_standard_storage_defaults(
+            self.project.warehouse_storage_defaults
+        )
         self.selected: GridPosition | None = None
         self.bulk_anchor: GridPosition | None = None
         self.bulk_drag_position: GridPosition | None = None
@@ -147,6 +146,10 @@ class GridMapEditorApp:
         self.grid_zone_summary = tk.StringVar(
             value="Assign every rack to a warehouse zone."
         )
+        self.grid_warehouse_capacity_values = {
+            key: tk.StringVar(value=str(self.project.warehouse_storage_defaults[key]))
+            for key in PHYSICAL_ATTRIBUTE_KEYS
+        }
         self.map_name = tk.StringVar(value=self.project.grid.map_name)
         self.level_name = tk.StringVar(value=self.project.grid.level_name)
         self.width = tk.StringVar(value=str(self.project.grid.width_m))
@@ -154,6 +157,8 @@ class GridMapEditorApp:
         self.spacing = tk.StringVar(value=str(self.project.grid.spacing_m))
         self.spacing_y = tk.StringVar(value=str(self.project.grid.spacing_y_m))
         self.selected_coordinate = tk.StringVar(value="No grid point selected")
+        self.selected_x = tk.StringVar()
+        self.selected_y = tk.StringVar()
         self.role = tk.StringVar(value="none")
         self.endpoint_id = tk.StringVar()
         storage_layout = self.project.storage_layout
@@ -172,10 +177,19 @@ class GridMapEditorApp:
                 if storage_layout else "Storage buffers have not been assigned."
             )
         )
+        self.grid_sku_attributes_path = tk.StringVar(
+            value=self.project.sku_attribute_source
+        )
+        self.grid_sku_attribute_summary = tk.StringVar(
+            value=self.format_sku_attribute_summary(
+                self.project.sku_attribute_summary
+            )
+        )
         self.summary = tk.StringVar()
         self.status = tk.StringVar(value="Bottom-left grid point is (0, 0)")
         self.canvas_viewports = {}
         self._build_ui()
+        self.sync_grid_sku_overlay_attribute_list()
         self.root.bind_all("<Control-z>", self.undo)
         self.root.bind_all("<Control-y>", self.redo)
         self.root.bind_all("<Control-Shift-Z>", self.redo)
@@ -233,6 +247,8 @@ class GridMapEditorApp:
         state["offset_x"] += delta_x
         state["offset_y"] += delta_y
         state["pan"] = (event.x, event.y)
+        if canvas is getattr(self, "canvas", None):
+            self.draw_grid_demand_overlay()
         self.update_canvas_scrollregion(canvas)
         return "break"
 
@@ -262,6 +278,8 @@ class GridMapEditorApp:
             state["offset_y"] - anchor_y
         )
         state["scale"] = target_scale
+        if canvas is getattr(self, "canvas", None):
+            self.draw_grid_demand_overlay()
         self.update_canvas_scrollregion(canvas)
         return "break"
 
@@ -454,43 +472,103 @@ class GridMapEditorApp:
         ]
         for row, (label, value) in enumerate(tools, start=10):
             ttk.Radiobutton(left, text=label, variable=self.tool, value=value).grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+        delete_tools = ttk.Frame(left)
+        delete_tools.grid(row=15, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(
+            delete_tools, text="Delete points", variable=self.tool,
+            value="delete_grid",
+        ).pack(side="left")
+        ttk.Radiobutton(
+            delete_tools, text="Delete lanes", variable=self.tool,
+            value="delete_lane",
+        ).pack(side="left", padx=(8, 0))
 
         ttk.Label(left, text="Rack ID prefix").grid(row=16, column=0, sticky="w", pady=(7, 3))
         ttk.Entry(left, textvariable=self.rack_prefix, width=19).grid(row=16, column=1, sticky="ew", pady=(7, 3))
 
         ttk.Separator(left).grid(row=17, column=0, columnspan=2, sticky="ew", pady=7)
         ttk.Label(left, textvariable=self.selected_coordinate).grid(row=19, column=0, columnspan=2, sticky="w", pady=(3, 6))
-        ttk.Label(left, text="Role").grid(row=20, column=0, sticky="w", pady=3)
+        ttk.Label(left, text="Position X / Y (m)").grid(row=20, column=0, sticky="w", pady=3)
+        coordinate_frame = ttk.Frame(left)
+        coordinate_frame.grid(row=20, column=1, sticky="ew", pady=3)
+        ttk.Entry(coordinate_frame, textvariable=self.selected_x, width=8).pack(side="left")
+        ttk.Label(coordinate_frame, text="/").pack(side="left", padx=3)
+        ttk.Entry(coordinate_frame, textvariable=self.selected_y, width=8).pack(side="left")
+        ttk.Label(left, text="Role").grid(row=21, column=0, sticky="w", pady=3)
         role_box = ttk.Combobox(left, textvariable=self.role, state="readonly", values=("none", "rack", "workstation"), width=16)
-        role_box.grid(row=20, column=1, sticky="ew", pady=3)
-        ttk.Label(left, text="Endpoint ID").grid(row=21, column=0, sticky="w", pady=3)
-        ttk.Entry(left, textvariable=self.endpoint_id, width=19).grid(row=21, column=1, sticky="ew", pady=3)
-        ttk.Button(left, text="Apply point edit", command=self.apply_edit).grid(row=22, column=0, columnspan=2, sticky="ew", pady=(6, 9))
+        role_box.grid(row=21, column=1, sticky="ew", pady=3)
+        ttk.Label(left, text="Endpoint ID").grid(row=22, column=0, sticky="w", pady=3)
+        ttk.Entry(left, textvariable=self.endpoint_id, width=19).grid(row=22, column=1, sticky="ew", pady=3)
+        point_buttons = ttk.Frame(left)
+        point_buttons.grid(row=23, column=0, columnspan=2, sticky="ew", pady=(6, 9))
+        ttk.Button(
+            point_buttons, text="Apply point edit", command=self.apply_edit
+        ).pack(side="left", expand=True, fill="x")
+        ttk.Button(
+            point_buttons, text="Delete selected", command=self.delete_selected_grid_point
+        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
 
-        ttk.Separator(left).grid(row=23, column=0, columnspan=2, sticky="ew", pady=4)
-        ttk.Label(left, text="Layout type").grid(row=25, column=0, sticky="w", pady=3)
+        ttk.Separator(left).grid(row=24, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Label(left, text="Layout type").grid(row=26, column=0, sticky="w", pady=3)
         ttk.Combobox(
             left, textvariable=self.grid_storage_system, state="readonly",
             values=("AMR", "Mini-load ASRS", "Pallet ASRS"), width=16,
-        ).grid(row=25, column=1, sticky="ew", pady=3)
+        ).grid(row=26, column=1, sticky="ew", pady=3)
         buffer_capacity = ttk.Frame(left)
-        buffer_capacity.grid(row=26, column=0, columnspan=2, sticky="w", pady=3)
+        buffer_capacity.grid(row=27, column=0, columnspan=2, sticky="w", pady=3)
         ttk.Label(buffer_capacity, text="Levels").pack(side="left")
         ttk.Spinbox(buffer_capacity, from_=1, to=100, textvariable=self.grid_storage_levels, width=4).pack(side="left", padx=(4, 8))
         ttk.Label(buffer_capacity, text="Slots/level").pack(side="left")
         ttk.Spinbox(buffer_capacity, from_=1, to=100, textvariable=self.grid_storage_slots, width=4).pack(side="left", padx=(4, 0))
-        ttk.Button(left, text="Assign empty storage buffers", command=self.assign_grid_buffers).grid(row=27, column=0, columnspan=2, sticky="ew", pady=(4, 2))
-        ttk.Label(left, textvariable=self.grid_buffer_summary, foreground="#315b66", wraplength=230).grid(row=28, column=0, columnspan=2, sticky="w", pady=(1, 4))
+        ttk.Button(left, text="Assign empty storage buffers", command=self.assign_grid_buffers).grid(row=28, column=0, columnspan=2, sticky="ew", pady=(4, 2))
+        ttk.Label(left, textvariable=self.grid_buffer_summary, foreground="#315b66", wraplength=230).grid(row=29, column=0, columnspan=2, sticky="w", pady=(1, 4))
 
-        ttk.Separator(left).grid(row=29, column=0, columnspan=2, sticky="ew", pady=4)
-        ttk.Label(left, text="Zone ID").grid(row=31, column=0, sticky="w", pady=2)
-        ttk.Entry(left, textvariable=self.grid_zone_id, width=19).grid(row=31, column=1, sticky="ew", pady=2)
+        ttk.Separator(left).grid(row=30, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Label(left, text="Zone ID").grid(row=32, column=0, sticky="w", pady=2)
+        ttk.Entry(left, textvariable=self.grid_zone_id, width=19).grid(row=32, column=1, sticky="ew", pady=2)
         ttk.Checkbutton(
             left, text="Advance zone ID automatically",
             variable=self.grid_zone_auto,
-        ).grid(row=32, column=0, columnspan=2, sticky="w")
+        ).grid(row=33, column=0, columnspan=2, sticky="w")
+        ttk.Label(left, text="Default storage L / W").grid(
+            row=34, column=0, sticky="w", pady=(4, 2)
+        )
+        warehouse_dimensions_1 = ttk.Frame(left)
+        warehouse_dimensions_1.grid(row=34, column=1, sticky="ew", pady=(4, 2))
+        ttk.Entry(
+            warehouse_dimensions_1,
+            textvariable=self.grid_warehouse_capacity_values["max_item_length"],
+            width=8,
+        ).pack(side="left")
+        ttk.Label(warehouse_dimensions_1, text="/").pack(side="left", padx=3)
+        ttk.Entry(
+            warehouse_dimensions_1,
+            textvariable=self.grid_warehouse_capacity_values["max_item_width"],
+            width=8,
+        ).pack(side="left")
+        ttk.Label(left, text="Default storage H / weight").grid(
+            row=35, column=0, sticky="w", pady=2
+        )
+        warehouse_dimensions_2 = ttk.Frame(left)
+        warehouse_dimensions_2.grid(row=35, column=1, sticky="ew", pady=2)
+        ttk.Entry(
+            warehouse_dimensions_2,
+            textvariable=self.grid_warehouse_capacity_values["max_item_height"],
+            width=8,
+        ).pack(side="left")
+        ttk.Label(warehouse_dimensions_2, text="/").pack(side="left", padx=3)
+        ttk.Entry(
+            warehouse_dimensions_2,
+            textvariable=self.grid_warehouse_capacity_values["max_item_weight"],
+            width=8,
+        ).pack(side="left")
+        ttk.Button(
+            left,
+            text="Apply storage defaults to zones",
+            command=self.apply_grid_warehouse_storage_defaults,
+        ).grid(row=36, column=0, columnspan=2, sticky="ew", pady=(3, 2))
         zone_buttons = ttk.Frame(left)
-        zone_buttons.grid(row=33, column=0, columnspan=2, sticky="ew", pady=(3, 2))
+        zone_buttons.grid(row=37, column=0, columnspan=2, sticky="ew", pady=(3, 2))
         ttk.Button(
             zone_buttons, text="Zone settings…",
             command=self.open_grid_zone_storage_settings,
@@ -501,23 +579,63 @@ class GridMapEditorApp:
         ).pack(side="left", expand=True, fill="x", padx=(4, 0))
         ttk.Button(
             left, text="Clear rack zones", command=self.clear_grid_zones,
-        ).grid(row=34, column=0, columnspan=2, sticky="ew", pady=2)
+        ).grid(row=38, column=0, columnspan=2, sticky="ew", pady=2)
         ttk.Label(
             left, textvariable=self.grid_zone_summary, foreground="#315b66",
             wraplength=230,
-        ).grid(row=35, column=0, columnspan=2, sticky="w", pady=(1, 4))
+        ).grid(row=39, column=0, columnspan=2, sticky="w", pady=(1, 4))
 
-        ttk.Separator(left).grid(row=36, column=0, columnspan=2, sticky="ew", pady=4)
-        ttk.Button(left, text="Save grid project JSON…", command=self.save_project_dialog).grid(row=38, column=0, columnspan=2, sticky="ew", pady=2)
-        ttk.Button(left, text="Load grid project JSON…", command=self.load_project_dialog).grid(row=39, column=0, columnspan=2, sticky="ew", pady=2)
-        ttk.Button(left, text="Export RMF building YAML…", command=self.export_yaml_dialog).grid(row=40, column=0, columnspan=2, sticky="ew", pady=(5, 2))
+        ttk.Separator(left).grid(row=40, column=0, columnspan=2, sticky="ew", pady=4)
+        sku_attribute_input = ttk.Frame(left)
+        sku_attribute_input.grid(row=42, column=0, columnspan=2, sticky="ew", pady=2)
+        sku_attribute_input.columnconfigure(0, weight=1)
+        ttk.Entry(
+            sku_attribute_input, textvariable=self.grid_sku_attributes_path,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            sku_attribute_input, text="Load CSV…",
+            command=self.load_grid_sku_attributes_dialog,
+        ).grid(row=0, column=1, padx=(4, 0))
+        overlay_attribute_frame = ttk.Frame(left)
+        overlay_attribute_frame.grid(
+            row=43, column=0, columnspan=2, sticky="ew", pady=(3, 2)
+        )
+        overlay_attribute_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            overlay_attribute_frame,
+            text="Overlay grouping attributes (Ctrl-click to select)",
+        ).grid(row=0, column=0, sticky="w")
+        self.grid_sku_overlay_attribute_list = tk.Listbox(
+            overlay_attribute_frame,
+            selectmode="extended",
+            exportselection=False,
+            height=4,
+        )
+        self.grid_sku_overlay_attribute_list.grid(
+            row=1, column=0, sticky="ew", pady=(2, 2)
+        )
+        ttk.Button(
+            overlay_attribute_frame,
+            text="Apply overlay selection",
+            command=self.apply_grid_sku_overlay_attributes,
+        ).grid(row=2, column=0, sticky="ew")
+        ttk.Label(
+            left, textvariable=self.grid_sku_attribute_summary,
+            foreground="#315b66", wraplength=255, justify="left",
+        ).grid(row=44, column=0, columnspan=2, sticky="w", pady=(2, 5))
+
+        ttk.Separator(left).grid(row=45, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Button(left, text="Save grid project JSON…", command=self.save_project_dialog).grid(row=47, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(left, text="Load grid project JSON…", command=self.load_project_dialog).grid(row=48, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(left, text="Export RMF building YAML…", command=self.export_yaml_dialog).grid(row=49, column=0, columnspan=2, sticky="ew", pady=(5, 2))
 
         self.add_grid_sidebar_section(left, "grid", "WAREHOUSE GRID", 0, range(1, 8))
         self.add_grid_sidebar_section(left, "tools", "CLICK TOOLS", 9, range(10, 17))
-        self.add_grid_sidebar_section(left, "point", "SELECTED GRID POINT", 18, range(19, 23))
-        self.add_grid_sidebar_section(left, "buffers", "STORAGE BUFFERS", 24, range(25, 29))
-        self.add_grid_sidebar_section(left, "settings", "WAREHOUSE SETTINGS", 30, range(31, 36))
-        self.add_grid_sidebar_section(left, "files", "PROJECT FILES", 37, range(38, 41))
+        self.add_grid_sidebar_section(left, "point", "SELECTED GRID POINT", 18, range(19, 24))
+        self.add_grid_sidebar_section(left, "buffers", "STORAGE BUFFERS", 25, range(26, 30))
+        self.add_grid_sidebar_section(left, "settings", "WAREHOUSE SETTINGS", 31, range(32, 40))
+        self.add_grid_sidebar_section(left, "sku_attributes", "SKU ATTRIBUTES", 41, range(42, 45))
+        self.add_grid_sidebar_section(left, "files", "PROJECT FILES", 46, range(47, 50))
 
         self.bind_mousewheel_tree(
             self.grid_sidebar_canvas, self.scroll_grid_sidebar
@@ -528,6 +646,7 @@ class GridMapEditorApp:
         self.canvas.bind("<Button-1>", self.canvas_click)
         self.canvas.bind("<B1-Motion>", self.canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
+        self.canvas.bind("<Delete>", self.delete_selected_grid_point)
         self.canvas.bind("<Configure>", lambda _event: self.redraw())
         self.enable_canvas_viewport(self.canvas)
         ttk.Label(canvas_frame, textvariable=self.status).grid(row=1, column=0, sticky="ew", pady=(6, 0))
@@ -1254,7 +1373,7 @@ class GridMapEditorApp:
     def _build_slotting_tab(self, parent):
         self.slot_building_path = tk.StringVar(value=str(DEFAULT_GRID_INPUT))
         self.slot_velocity_path = tk.StringVar(value=str(DEFAULT_VELOCITY_INPUT))
-        self.slot_chilled_path = tk.StringVar(value=str(DEFAULT_CHILLED_INPUT))
+        self.slot_chilled_path = tk.StringVar(value=str(DEFAULT_SKU_ATTRIBUTES_INPUT))
         self.slot_output_path = tk.StringVar(value=str(DEFAULT_SLOTTING_OUTPUT))
         self.slot_strategy = tk.StringVar(value="basic")
         self.slot_affinity_path = tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
@@ -1275,6 +1394,10 @@ class GridMapEditorApp:
         self.slot_progress_text = tk.StringVar(value="Ready")
         self.slot_zone_detail = tk.StringVar(value="Generate a layout, then click a rack to inspect its zone.")
         self.slot_rack_detail = tk.StringVar(value="Generate a layout, then click a rack to inspect it.")
+        self.slot_rack_zone_name = tk.StringVar()
+        self.slot_rack_zone_edit_status = tk.StringVar(
+            value="Select a rack to rename its zone."
+        )
         self.slot_building = None
         self.slot_grid_project = None
         self.slot_rows = []
@@ -1282,7 +1405,7 @@ class GridMapEditorApp:
         self.slot_selected_rack = None
         self.slot_loaded_path = None
         self.slot_zone_assignments = {}
-        self.slot_attribute_catalog = self.attributes.starter_catalog()
+        self.slot_attribute_catalog = {}
         self.slot_location_attributes = {}
         self.slot_hierarchy_paths = []
         self.slot_storage_initialized = False
@@ -1304,7 +1427,7 @@ class GridMapEditorApp:
         ttk.Entry(form, textvariable=self.slot_velocity_path).grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Button(form, text="Browse…", command=lambda: self.browse_slot_input(self.slot_velocity_path, [("CSV", "*.csv"), ("All files", "*")])).grid(row=1, column=2, padx=(8, 0), pady=4)
 
-        ttk.Label(form, text="Chilled SKU CSV (optional)").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(form, text="SKU attributes CSV (optional)").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(form, textvariable=self.slot_chilled_path).grid(row=2, column=1, sticky="ew", pady=4)
         ttk.Button(form, text="Browse…", command=lambda: self.browse_slot_input(self.slot_chilled_path, [("CSV", "*.csv"), ("All files", "*")])).grid(row=2, column=2, padx=(8, 0), pady=4)
 
@@ -1556,7 +1679,7 @@ class GridMapEditorApp:
         self.slot_canvas.tag_bind("rack", "<Button-1>", self.slot_rack_click)
         ttk.Label(
             layout_view,
-            text="Read-only generated assignment view · click a rack to inspect it",
+            text="Click a rack to inspect it or rename its zone",
             foreground="#4d646d",
         ).grid(row=1, column=0, sticky="w", pady=(5, 0))
         self.slot_dot_legend = ttk.Frame(layout_view)
@@ -1584,7 +1707,7 @@ class GridMapEditorApp:
         self.slot_dot_legend_labels.append(workstation_legend)
         ttk.Label(
             self.slot_dot_legend,
-            text="AMR: shelf dot · ASRS: slot dots · outline + badge = zone",
+            text="AMR: shelf dot · ASRS: slot dots · outline = zone",
             foreground="#4d646d",
         ).grid(row=0, column=5, sticky="w")
 
@@ -1606,6 +1729,26 @@ class GridMapEditorApp:
             justify="left",
             wraplength=210,
         ).grid(row=0, column=0, sticky="ew")
+        zone_name_editor = ttk.Frame(rack_detail_frame)
+        zone_name_editor.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        zone_name_editor.columnconfigure(1, weight=1)
+        ttk.Label(zone_name_editor, text="Zone name").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        ttk.Entry(
+            zone_name_editor, textvariable=self.slot_rack_zone_name
+        ).grid(row=0, column=1, sticky="ew")
+        ttk.Button(
+            zone_name_editor,
+            text="Apply & save",
+            command=self.rename_selected_slot_zone,
+        ).grid(row=0, column=2, padx=(6, 0))
+        ttk.Label(
+            zone_name_editor,
+            textvariable=self.slot_rack_zone_edit_status,
+            foreground="#4d646d",
+            wraplength=210,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
         columns = ("abc_rank", "affinity_rank", "sku", "class", "flags", "static", "dynamic", "unit_type", "unit_id", "status")
         tree_frame = ttk.Frame(rack_view)
         tree_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=8, pady=(8, 0))
@@ -1622,13 +1765,10 @@ class GridMapEditorApp:
         ttk.Button(rack_view, text="Show all assignments", command=lambda: self.show_slotting_rows(self.slot_rows)).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(7, 0))
 
     def _build_traffic_tab(self, parent):
-        self.traffic_layout_path = tk.StringVar(value=str(DEFAULT_SLOTTING_OUTPUT))
         self.traffic_grid_project_path = tk.StringVar(value=str(DEFAULT_GRID_INPUT))
         self.traffic_velocity_path = tk.StringVar(value=str(DEFAULT_VELOCITY_INPUT))
-        self.traffic_chilled_path = tk.StringVar()
+        self.traffic_chilled_path = tk.StringVar(value=str(DEFAULT_SKU_ATTRIBUTES_INPUT))
         self.traffic_order_path = tk.StringVar(value=str(DEFAULT_TRAFFIC_INPUT))
-        self.traffic_affinity_weight = tk.StringVar(value="50")
-        self.traffic_initial_strategy = tk.StringVar(value="ABC + Affinity")
         self.traffic_last_workflow = None
         self.traffic_handling_unit = tk.StringVar(value="AMR shelf")
         self.traffic_levels = tk.StringVar(value="1")
@@ -1638,21 +1778,28 @@ class GridMapEditorApp:
         self.traffic_start_date = tk.StringVar()
         self.traffic_end_date = tk.StringVar()
         self.traffic_output_path = tk.StringVar(value=str(DEFAULT_TRAFFIC_OUTPUT))
-        self.traffic_max_travel = tk.StringVar()
-        self.traffic_hotspot_percentile = tk.StringVar()
+        self.traffic_ctbsa_population = tk.StringVar(value="100")
+        self.traffic_ctbsa_generations = tk.StringVar(value="50000")
+        self.traffic_ctbsa_solution = tk.StringVar(value="3")
+        self.traffic_ctbsa_seed = tk.StringVar(value="0")
         self.traffic_parameter_status = tk.StringVar(
-            value="Run either workflow to calculate warehouse-specific parameters."
+            value="Paper defaults: NSGA-II P=100, G=50,000, Pc=0.9, Pm=0.1."
         )
         self.traffic_status = tk.StringVar(
             value=(
-                "Optimize a saved layout directly, or generate an ABC/affinity "
-                "layout and run the full traffic pipeline."
+                "Direct C&TBSA: warehouse grid + physical SKU data + order history."
             )
         )
         self.traffic_kpis = tk.StringVar(
             value="Groups —  · Unit visits —  · Mapped —  · Peak —  · P95 —  · Travel —  · Relocated —"
         )
-        self.traffic_view_mode = tk.StringVar(value="Before")
+        self.traffic_assignment_summary = tk.StringVar(
+            value="Assigned SKUs — / —  · Optimized by C&TBSA —  · Fixed exceptions —  · Unassigned —"
+        )
+        self.traffic_exception_summary = tk.StringVar(
+            value="Physical hard rules · OVERSIZE — · OVERWEIGHT — · INCOMPLETE DATA —"
+        )
+        self.traffic_view_mode = tk.StringVar(value="Feasibility seed")
         self.traffic_messages = queue.Queue()
         self.traffic_cancel_event = threading.Event()
         self.traffic_worker = None
@@ -1672,7 +1819,7 @@ class GridMapEditorApp:
         self.traffic_racks = []
         self.traffic_zone_assignments = {}
         self.traffic_location_attributes = {}
-        self.traffic_attribute_catalog = self.attributes.starter_catalog()
+        self.traffic_attribute_catalog = {}
         self.traffic_area_mode = tk.BooleanVar(value=False)
 
         parent.columnconfigure(0, weight=1)
@@ -1684,7 +1831,7 @@ class GridMapEditorApp:
 
         self.traffic_initial_settings_frame = ttk.LabelFrame(
             form,
-            text="Initial ABC / affinity layout generation · Full pipeline only",
+            text="Warehouse and SKU constraints · Direct C&TBSA inputs",
             padding=10,
         )
         self.traffic_initial_settings_frame.grid(
@@ -1707,7 +1854,7 @@ class GridMapEditorApp:
             ),
         ).grid(row=0, column=2, pady=3)
 
-        ttk.Label(initial, text="ABC SKU velocity CSV").grid(
+        ttk.Label(initial, text="SKU demand + physical CSV").grid(
             row=1, column=0, sticky="w", pady=3
         )
         ttk.Entry(
@@ -1721,7 +1868,7 @@ class GridMapEditorApp:
             ),
         ).grid(row=1, column=2, pady=3)
 
-        ttk.Label(initial, text="Chilled SKU CSV (optional)").grid(
+        ttk.Label(initial, text="SKU attributes CSV (optional)").grid(
             row=2, column=0, sticky="w", pady=3
         )
         ttk.Entry(
@@ -1735,40 +1882,13 @@ class GridMapEditorApp:
             ),
         ).grid(row=2, column=2, pady=3)
 
-        ttk.Label(initial, text="Initial slotting strategy").grid(
-            row=3, column=0, sticky="w", pady=3
-        )
-        strategy_controls = ttk.Frame(initial)
-        strategy_controls.grid(
-            row=3, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3
-        )
-        self.traffic_strategy_box = ttk.Combobox(
-            strategy_controls,
-            textvariable=self.traffic_initial_strategy,
-            state="readonly",
-            values=("ABC", "ABC + Affinity"),
-            width=17,
-        )
-        self.traffic_strategy_box.pack(side="left")
-        self.traffic_strategy_box.bind(
-            "<<ComboboxSelected>>", self.traffic_initial_strategy_changed
-        )
-        self.traffic_affinity_label = ttk.Label(
-            strategy_controls, text="Affinity weight %"
-        )
-        self.traffic_affinity_label.pack(side="left", padx=(10, 3))
-        self.traffic_affinity_spin = ttk.Spinbox(
-            strategy_controls, from_=0, to=100,
-            textvariable=self.traffic_affinity_weight, width=6,
-        )
-        self.traffic_affinity_spin.pack(side="left")
 
         ttk.Label(initial, text="Derived storage setup").grid(
-            row=4, column=0, sticky="w", pady=3
+            row=3, column=0, sticky="w", pady=3
         )
         setup = ttk.Frame(initial)
         setup.grid(
-            row=4, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3
+            row=3, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3
         )
         ttk.Label(setup, text="Unit").pack(side="left")
         ttk.Combobox(
@@ -1789,15 +1909,15 @@ class GridMapEditorApp:
         ttk.Label(
             initial,
             text=(
-                "Ignored by Optimize Existing Layout; that workflow reuses "
-                "the saved assignments."
+                "ABC and separate affinity slotting are not prerequisites. "
+                "Exception inventory is placed only to establish feasibility."
             ),
             foreground="#4d646d",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         self.traffic_optimization_settings_frame = ttk.LabelFrame(
             form,
-            text="Traffic-aware optimization · Both workflows",
+            text="Paper C&TBSA and static validation",
             padding=10,
         )
         self.traffic_optimization_settings_frame.grid(
@@ -1806,36 +1926,22 @@ class GridMapEditorApp:
         traffic_settings = self.traffic_optimization_settings_frame
         traffic_settings.columnconfigure(1, weight=1)
 
-        ttk.Label(
-            traffic_settings, text="Existing layout (traffic-only)"
-        ).grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Entry(
-            traffic_settings, textvariable=self.traffic_layout_path
-        ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
-        ttk.Button(
-            traffic_settings, text="Browse…",
-            command=lambda: self.browse_slot_input(
-                self.traffic_layout_path,
-                [("Slotting layout", "*.slotting.json"), ("JSON", "*.json")],
-            ),
-        ).grid(row=0, column=2, pady=3)
-
         ttk.Label(traffic_settings, text="Order-history Excel").grid(
-            row=1, column=0, sticky="w", pady=3
+            row=0, column=0, sticky="w", pady=3
         )
         ttk.Entry(
             traffic_settings, textvariable=self.traffic_order_path
-        ).grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(
             traffic_settings, text="Browse…",
             command=lambda: self.browse_slot_input(
                 self.traffic_order_path,
                 [("Excel workbook", "*.xlsx"), ("All files", "*")],
             ),
-        ).grid(row=1, column=2, pady=3)
+        ).grid(row=0, column=2, pady=3)
 
         ttk.Label(traffic_settings, text="Movement network").grid(
-            row=2, column=0, sticky="w", pady=3
+            row=1, column=0, sticky="w", pady=3
         )
         network_box = ttk.Combobox(
             traffic_settings,
@@ -1848,19 +1954,19 @@ class GridMapEditorApp:
             width=25,
         )
         network_box.grid(
-            row=2, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3
+            row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3
         )
         network_box.bind(
             "<<ComboboxSelected>>", self.traffic_network_mode_changed
         )
         ttk.Label(traffic_settings, text="Network JSON").grid(
-            row=3, column=0, sticky="w", pady=3
+            row=2, column=0, sticky="w", pady=3
         )
         self.traffic_network_entry = ttk.Entry(
             traffic_settings, textvariable=self.traffic_network_path
         )
         self.traffic_network_entry.grid(
-            row=3, column=1, sticky="ew", padx=(8, 4), pady=3
+            row=2, column=1, sticky="ew", padx=(8, 4), pady=3
         )
         self.traffic_network_browse = ttk.Button(
             traffic_settings, text="Browse…",
@@ -1872,11 +1978,11 @@ class GridMapEditorApp:
                 ],
             ),
         )
-        self.traffic_network_browse.grid(row=3, column=2, pady=3)
+        self.traffic_network_browse.grid(row=2, column=2, pady=3)
 
         dates = ttk.Frame(traffic_settings)
         dates.grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=3
+            row=3, column=0, columnspan=3, sticky="w", pady=3
         )
         ttk.Label(dates, text="Inclusive dates").pack(side="left")
         ttk.Entry(dates, textvariable=self.traffic_start_date, width=11).pack(side="left", padx=(8, 3))
@@ -1889,49 +1995,56 @@ class GridMapEditorApp:
 
         parameters = ttk.Frame(traffic_settings)
         parameters.grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=3
+            row=4, column=0, columnspan=3, sticky="w", pady=3
         )
-        ttk.Label(parameters, text="Traffic parameters").pack(side="left")
-        ttk.Label(
-            parameters, text="Max travel increase %"
-        ).pack(side="left", padx=(8, 3))
-        self.traffic_max_travel_entry = ttk.Entry(parameters, textvariable=self.traffic_max_travel, width=7)
-        self.traffic_max_travel_entry.pack(side="left")
-        ttk.Label(parameters, text="Hotspot percentile").pack(side="left", padx=(8, 3))
-        self.traffic_hotspot_entry = ttk.Entry(parameters, textvariable=self.traffic_hotspot_percentile, width=7)
-        self.traffic_hotspot_entry.pack(side="left")
+        ttk.Label(parameters, text="NSGA-II").pack(side="left")
+        ttk.Label(parameters, text="Population").pack(side="left", padx=(8, 3))
+        ttk.Entry(parameters, textvariable=self.traffic_ctbsa_population, width=6).pack(side="left")
+        ttk.Label(parameters, text="Generations").pack(side="left", padx=(8, 3))
+        ttk.Entry(parameters, textvariable=self.traffic_ctbsa_generations, width=8).pack(side="left")
+        ttk.Label(parameters, text="C&TBSA solution").pack(side="left", padx=(8, 3))
+        ttk.Spinbox(parameters, from_=1, to=5, textvariable=self.traffic_ctbsa_solution, width=3).pack(side="left")
+        ttk.Label(parameters, text="Seed").pack(side="left", padx=(8, 3))
+        ttk.Entry(parameters, textvariable=self.traffic_ctbsa_seed, width=5).pack(side="left")
 
         ttk.Label(traffic_settings, text="Optimized layout output").grid(
-            row=6, column=0, sticky="w", pady=3
+            row=5, column=0, sticky="w", pady=3
         )
         ttk.Entry(
             traffic_settings, textvariable=self.traffic_output_path
-        ).grid(row=6, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ).grid(row=5, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(
             traffic_settings,
             text="Browse…",
             command=lambda: self._browse_traffic_output(),
-        ).grid(row=6, column=2, pady=3)
+        ).grid(row=5, column=2, pady=3)
+
+        ttk.Label(
+            traffic_settings,
+            text=(
+                "Hard rules — Paper: each SKU appears in exactly one cluster; "
+                "cluster SKU count ≤ shelf locations. Warehouse: AMR shelves, "
+                "temperature and physical capacity enforced; exception racks fixed."
+            ),
+            foreground="#4d646d",
+            wraplength=560,
+            justify="left",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         actions = ttk.Frame(form)
         actions.grid(
             row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0)
         )
-        self.traffic_existing_button = ttk.Button(
-            actions,
-            text="Optimize Existing Layout",
-            command=self.start_existing_layout_traffic,
-        )
         self.traffic_full_button = ttk.Button(
             actions,
-            text="Generate Layout + Optimize Traffic",
+            text="Run Direct C&TBSA",
             command=self.start_full_traffic_pipeline,
         )
         self.traffic_cancel_button = ttk.Button(actions, text="Cancel", command=self.cancel_traffic_work, state="disabled")
         self.traffic_save_button = ttk.Button(actions, text="Save layout", command=self.save_traffic_layout, state="disabled")
         self.traffic_export_button = ttk.Button(actions, text="Export report…", command=self.export_traffic_report, state="disabled")
         for widget in (
-            self.traffic_existing_button, self.traffic_full_button,
+            self.traffic_full_button,
             self.traffic_cancel_button,
             self.traffic_save_button, self.traffic_export_button,
         ):
@@ -1943,10 +2056,20 @@ class GridMapEditorApp:
         self.traffic_progress.pack(side="left", padx=(8, 6))
         ttk.Label(actions, textvariable=self.traffic_parameter_status, foreground="#315b66").pack(side="left", padx=(5, 0))
         self.traffic_network_mode_changed()
-        self.traffic_initial_strategy_changed()
 
         summary = ttk.Frame(parent, padding=(12, 2))
         summary.grid(row=1, column=0, sticky="ew")
+        ttk.Label(
+            summary,
+            textvariable=self.traffic_assignment_summary,
+            font=("TkDefaultFont", 10, "bold"),
+            foreground="#174f5f",
+        ).pack(anchor="w")
+        ttk.Label(
+            summary,
+            textvariable=self.traffic_exception_summary,
+            foreground="#8a4b08",
+        ).pack(anchor="w")
         ttk.Label(summary, textvariable=self.traffic_kpis, font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
         ttk.Label(summary, textvariable=self.traffic_status, foreground="#4d646d").pack(anchor="w", pady=(2, 0))
 
@@ -1963,13 +2086,14 @@ class GridMapEditorApp:
         ttk.Label(view_actions, text="View").pack(side="left")
         view_box = ttk.Combobox(
             view_actions, textvariable=self.traffic_view_mode,
-            state="readonly", values=("Before", "After"), width=9,
+            state="readonly",
+            values=("Feasibility seed", "C&TBSA result"), width=17,
         )
         view_box.pack(side="left", padx=(6, 0))
         view_box.bind("<<ComboboxSelected>>", lambda _event: self.draw_traffic_map())
         ttk.Label(
             view_actions,
-            text="Lane colour = route load · rack colour = handling-unit visits · purple = swapped · ◇ endpoint",
+            text="Lane colour = route load · rack colour = handling-unit visits · purple = reassigned · ◇ endpoint",
             foreground="#4d646d",
         ).pack(side="left", padx=(10, 0))
         area_actions = ttk.Frame(map_frame)
@@ -2005,18 +2129,21 @@ class GridMapEditorApp:
         tabs.add(parameter_tab, text="Parameters")
         self.traffic_resource_tree = self._traffic_tree(
             resource_tab,
-            (("resource", "Resource", 135), ("before", "Before", 75),
-             ("after", "After", 75), ("change", "Change", 75),
+            (("resource", "Resource", 135), ("before", "Seed", 75),
+             ("after", "C&TBSA", 75), ("change", "Change", 75),
              ("capacity", "Capacity", 75)),
         )
         self.traffic_relocation_tree = self._traffic_tree(
             relocation_tab,
-            (("unit", "Handling unit", 120), ("from", "From", 120),
-             ("to", "To", 120), ("swap", "Swapped with", 110)),
+            (("unit", "Shelf", 105), ("sku", "SKU", 90),
+             ("from", "From", 145), ("to", "To", 145)),
         )
         self.traffic_relocation_tree.bind("<<TreeviewSelect>>", self.traffic_relocation_select)
         self.traffic_rejected_tree = self._traffic_tree(
-            rejected_tab, (("unit", "Handling unit", 130), ("reason", "Reason", 330)),
+            rejected_tab,
+            (("sku", "SKU", 85), ("class", "Physical class", 145),
+             ("shelf", "Shelf", 105), ("location", "Fixed location", 155),
+             ("reason", "Why C&TBSA cannot move it", 330)),
         )
         self.traffic_parameter_tree = self._traffic_tree(
             parameter_tab, (("parameter", "Parameter", 210), ("value", "Selected value", 190)),
@@ -2045,11 +2172,6 @@ class GridMapEditorApp:
         self.traffic_network_entry.configure(state=state)
         self.traffic_network_browse.configure(state=state)
 
-    def traffic_initial_strategy_changed(self, _event=None):
-        enabled = self.traffic_initial_strategy.get() == "ABC + Affinity"
-        self.traffic_affinity_spin.configure(
-            state="normal" if enabled else "disabled"
-        )
 
     def load_traffic_area_map(self):
         try:
@@ -2057,6 +2179,9 @@ class GridMapEditorApp:
                 self.traffic_grid_project_path.get()
             ).expanduser().resolve()
             project = self.rmf_maps.load_project(path)
+            self.attributes.set_standard_storage_defaults(
+                project.warehouse_storage_defaults
+            )
             if project.storage_layout is None or not project.storage_layout.buffers:
                 raise ValueError(
                     "grid project has no storage buffers; assign and save buffers "
@@ -2089,9 +2214,7 @@ class GridMapEditorApp:
             self.slotting.apply_zone_local_aisles(
                 building, racks, zones, default_zone
             )
-            catalog = project.attribute_catalog or self.attributes.serialize_catalog(
-                self.attributes.starter_catalog()
-            )
+            catalog = project.attribute_catalog
             paths = self.attributes.hierarchy_paths(
                 racks,
                 project.storage_layout.levels_per_rack,
@@ -2114,6 +2237,8 @@ class GridMapEditorApp:
         self.traffic_zone_assignments = zones
         self.traffic_location_attributes = locations
         self.traffic_attribute_catalog = self.attributes.normalize_catalog(catalog)
+        if project.sku_attribute_source:
+            self.traffic_chilled_path.set(project.sku_attribute_source)
         self.traffic_handling_unit.set(project.storage_layout.handling_unit_type)
         self.traffic_levels.set(str(project.storage_layout.levels_per_rack))
         self.traffic_slots.set(str(project.storage_layout.slots_per_level))
@@ -2141,118 +2266,71 @@ class GridMapEditorApp:
         if path:
             self.traffic_output_path.set(path)
 
-    def start_existing_layout_traffic(self):
-        self._start_traffic_work("existing_layout")
-
     def start_full_traffic_pipeline(self):
-        self._start_traffic_work("full_pipeline")
+        self._start_traffic_work()
 
-    def _start_traffic_work(self, workflow_mode):
+    def _start_traffic_work(self):
         if self.traffic_worker and self.traffic_worker.is_alive():
             return
         try:
             order_path = Path(self.traffic_order_path.get()).expanduser().resolve()
+            grid_project_path = Path(
+                self.traffic_grid_project_path.get()
+            ).expanduser().resolve()
+            velocity_path = Path(
+                self.traffic_velocity_path.get()
+            ).expanduser().resolve()
+            chilled_path = (
+                Path(self.traffic_chilled_path.get()).expanduser().resolve()
+                if self.traffic_chilled_path.get().strip() else None
+            )
             network_path = (
                 Path(self.traffic_network_path.get()).expanduser().resolve()
                 if self.traffic_network_mode.get() != "Use embedded RMF map"
                 else None
             )
-            start = date.fromisoformat(self.traffic_start_date.get()) if self.traffic_start_date.get().strip() else None
-            end = date.fromisoformat(self.traffic_end_date.get()) if self.traffic_end_date.get().strip() else None
-            use_adjusted = (
-                self.traffic_result is not None
-                and self.traffic_last_workflow == workflow_mode
-                and bool(self.traffic_max_travel.get().strip())
-                and bool(self.traffic_hotspot_percentile.get().strip())
+            start = (
+                date.fromisoformat(self.traffic_start_date.get())
+                if self.traffic_start_date.get().strip() else None
             )
-            max_travel = float(self.traffic_max_travel.get()) / 100.0 if use_adjusted else None
-            hotspot = float(self.traffic_hotspot_percentile.get()) if use_adjusted else None
-
-            layout_path = baseline_payload = None
-            grid_project_path = grid_project = building = storage_layout = None
-            velocity_path = chilled_path = None
-            levels = slots = None
-            handling_unit = ""
-            initial_strategy = "basic"
-            affinity_weight = 0.0
-            inline_zones = {}
-            inline_locations = {}
-            inline_catalog = self.attributes.starter_catalog()
-            if workflow_mode == "existing_layout":
-                layout_path = Path(
-                    self.traffic_layout_path.get()
-                ).expanduser().resolve()
-                baseline_payload = self.layouts.load(layout_path)
-                building = baseline_payload["building"]
-                capacity = baseline_payload.get("rack_capacity", {})
-                levels = int(capacity.get("levels") or 1)
-                slots = int(capacity.get("slots_per_level") or 1)
-                handling_unit = str(
-                    baseline_payload.get("handling_unit_type") or "AMR shelf"
+            end = (
+                date.fromisoformat(self.traffic_end_date.get())
+                if self.traffic_end_date.get().strip() else None
+            )
+            ctbsa_parameters = CtbsaParameters(
+                population_size=int(self.traffic_ctbsa_population.get()),
+                generations=int(self.traffic_ctbsa_generations.get()),
+                random_seed=int(self.traffic_ctbsa_seed.get()),
+                selected_solution=int(self.traffic_ctbsa_solution.get()),
+            )
+            ctbsa_parameters.validate()
+            grid_project = self.rmf_maps.load_project(grid_project_path)
+            if (
+                grid_project.storage_layout is None
+                or not grid_project.storage_layout.buffers
+            ):
+                raise ValueError(
+                    "grid project has no storage buffers; assign and save "
+                    "buffers in Grid Map Editor first"
                 )
-                initial_strategy = str(
-                    baseline_payload.get("strategy") or "basic"
-                )
-            elif workflow_mode == "full_pipeline":
-                grid_project_path = Path(
-                    self.traffic_grid_project_path.get()
-                ).expanduser().resolve()
-                grid_project = self.rmf_maps.load_project(grid_project_path)
-                if (
-                    grid_project.storage_layout is None
-                    or not grid_project.storage_layout.buffers
-                ):
-                    raise ValueError(
-                        "grid project has no storage buffers; assign and save "
-                        "buffers in Grid Map Editor first"
-                    )
-                building = grid_project.to_building_dict()
-                storage_layout = grid_project.storage_layout
-                velocity_path = Path(
-                    self.traffic_velocity_path.get()
-                ).expanduser().resolve()
-                chilled_path = (
-                    Path(self.traffic_chilled_path.get()).expanduser().resolve()
-                    if self.traffic_chilled_path.get().strip() else None
-                )
-                initial_strategy = (
-                    "basic"
-                    if self.traffic_initial_strategy.get() == "ABC"
-                    else "abc_affinity"
-                )
-                if initial_strategy == "abc_affinity":
-                    affinity_weight = float(
-                        self.traffic_affinity_weight.get()
-                    ) / 100.0
-                    if not 0 <= affinity_weight <= 1:
-                        raise ValueError(
-                            "affinity weight must be between 0% and 100%"
-                        )
-                levels = int(storage_layout.levels_per_rack)
-                slots = int(storage_layout.slots_per_level)
-                handling_unit = storage_layout.handling_unit_type
-                if self.traffic_loaded_grid_project_path != grid_project_path:
-                    if not self.load_traffic_area_map():
-                        return
-                inline_zones = copy.deepcopy(self.traffic_zone_assignments)
-                inline_locations = copy.deepcopy(
-                    self.traffic_location_attributes
-                )
-                inline_catalog = copy.deepcopy(
-                    self.traffic_attribute_catalog
-                )
-            else:
-                raise ValueError(f"unknown traffic workflow {workflow_mode}")
-
+            building = grid_project.to_building_dict()
+            storage_layout = grid_project.storage_layout
+            levels = int(storage_layout.levels_per_rack)
+            slots = int(storage_layout.slots_per_level)
+            handling_unit = storage_layout.handling_unit_type
+            if self.traffic_loaded_grid_project_path != grid_project_path:
+                if not self.load_traffic_area_map():
+                    return
+            inline_zones = copy.deepcopy(self.traffic_zone_assignments)
+            inline_locations = copy.deepcopy(self.traffic_location_attributes)
+            inline_catalog = copy.deepcopy(self.traffic_attribute_catalog)
             self.traffic_levels.set(str(levels))
             self.traffic_slots.set(str(slots))
             self.traffic_handling_unit.set(handling_unit)
         except (ValueError, OSError) as exc:
             messagebox.showerror("Traffic-aware slotting", str(exc))
             return
-        # A new attempt invalidates any prior saveable recommendation. If this
-        # run cannot place every SKU, the UI must not offer a stale layout as
-        # though it were the result of the current inputs.
+
         self.traffic_baseline_payload = None
         self.traffic_analysis = None
         self.traffic_result = None
@@ -2261,10 +2339,14 @@ class GridMapEditorApp:
         self.traffic_area_mode.set(False)
         self.traffic_cancel_event.clear()
         self.traffic_progress_value.set(0)
+        self.traffic_assignment_summary.set(
+            "Assigned SKUs — / —  · Reading SKU input…"
+        )
+        self.traffic_exception_summary.set(
+            "Physical hard rules · calculating OVERSIZE, OVERWEIGHT, and incomplete-data inventory…"
+        )
         self.traffic_status.set(
-            "Loading saved layout for traffic optimization…"
-            if workflow_mode == "existing_layout"
-            else f"Starting full pipeline from {self.traffic_initial_strategy.get()}…"
+            "Starting direct paper C&TBSA from warehouse and order data…"
         )
         self._set_traffic_busy(True)
 
@@ -2275,7 +2357,9 @@ class GridMapEditorApp:
             try:
                 dataset = self.affinity.load_orders(
                     order_path,
-                    progress=lambda current, total, message: report(current, total, message),
+                    progress=lambda current, total, message: report(
+                        current, total, message
+                    ),
                     cancelled=self.traffic_cancel_event.is_set,
                 )
                 network = (
@@ -2283,57 +2367,40 @@ class GridMapEditorApp:
                     if network_path is not None
                     else self.traffic.network_from_rmf(building)
                 )
-                if workflow_mode == "existing_layout":
-                    pipeline = self.traffic.run_existing_layout(
-                        baseline_payload, dataset, network,
-                        start_date=start,
-                        end_date=end,
-                        maximum_travel_increase=max_travel,
-                        hotspot_percentile=hotspot,
-                        baseline_path=str(layout_path),
-                        source_orders=str(order_path),
-                        progress=report,
-                        cancelled=self.traffic_cancel_event.is_set,
-                    )
-                else:
-                    sku_rows = self.slotting.load_velocity(
-                        velocity_path, inline_catalog, chilled_path
-                    )
-                    affinity_source = dataset
-                    if initial_strategy == "abc_affinity":
-                        affinity_source = self.affinity.analyze(
-                            dataset, start, end
-                        )
-                    pipeline = self.traffic.run_full_pipeline(
-                        building, sku_rows, affinity_source, network,
-                        initial_strategy=initial_strategy,
-                        affinity_weight=affinity_weight,
-                        levels_per_rack=levels,
-                        slots_per_level=slots,
-                        handling_unit_type=handling_unit,
-                        zone_assignments=inline_zones,
-                        attribute_catalog=inline_catalog,
-                        location_attributes=inline_locations,
-                        storage_layout=storage_layout,
-                        start_date=start,
-                        end_date=end,
-                        maximum_travel_increase=max_travel,
-                        hotspot_percentile=hotspot,
-                        source_grid_project=str(grid_project_path),
-                        source_velocity=str(velocity_path),
-                        source_chilled=str(chilled_path or ""),
-                        source_orders=str(order_path),
-                        progress=report,
-                        cancelled=self.traffic_cancel_event.is_set,
-                    )
-                payload = pipeline.pretraffic_payload
-                demand = pipeline.baseline_demand
-                analysis = pipeline.pretraffic_analysis
-                result = pipeline.optimization
-                output_payload = pipeline.output_payload
+                sku_rows = self.slotting.load_velocity(
+                    velocity_path, inline_catalog, chilled_path
+                )
+                self.traffic_messages.put(("sku_count", len(sku_rows)))
+                order_analysis = self.affinity.analyze(dataset, start, end)
+                pipeline = self.traffic.run_full_pipeline(
+                    building, sku_rows, order_analysis, network,
+                    initial_strategy="physical_feasibility",
+                    affinity_weight=0.0,
+                    levels_per_rack=levels,
+                    slots_per_level=slots,
+                    handling_unit_type=handling_unit,
+                    zone_assignments=inline_zones,
+                    attribute_catalog=inline_catalog,
+                    location_attributes=inline_locations,
+                    storage_layout=storage_layout,
+                    start_date=start,
+                    end_date=end,
+                    ctbsa_parameters=ctbsa_parameters,
+                    source_grid_project=str(grid_project_path),
+                    source_velocity=str(velocity_path),
+                    source_chilled=str(chilled_path or ""),
+                    source_orders=str(order_path),
+                    workflow_mode="direct_ctbsa",
+                    progress=report,
+                    cancelled=self.traffic_cancel_event.is_set,
+                    assignment_progress=lambda summary: self.traffic_messages.put(
+                        ("assignment_summary", summary)
+                    ),
+                )
                 self.traffic_messages.put((
-                    "done", payload, dataset, network, demand, analysis,
-                    result, output_payload, pipeline,
+                    "done", pipeline.pretraffic_payload, dataset, network,
+                    pipeline.baseline_demand, pipeline.pretraffic_analysis,
+                    pipeline.optimization, pipeline.output_payload, pipeline,
                 ))
             except (TrafficCancelledError, AffinityCancelledError) as exc:
                 self.traffic_messages.put(("cancelled", str(exc)))
@@ -2345,10 +2412,8 @@ class GridMapEditorApp:
         self.traffic_worker = threading.Thread(target=worker, daemon=True)
         self.traffic_worker.start()
         self.root.after(80, self.poll_traffic_work)
-
     def _set_traffic_busy(self, busy):
         state = "disabled" if busy else "normal"
-        self.traffic_existing_button.configure(state=state)
         self.traffic_full_button.configure(state=state)
         self.traffic_cancel_button.configure(state="normal" if busy else "disabled")
         self.traffic_save_button.configure(
@@ -2375,6 +2440,20 @@ class GridMapEditorApp:
                 _kind, current, total, status = message
                 self.traffic_progress_value.set(100.0 * current / max(1, total))
                 self.traffic_status.set(status)
+            elif kind == "sku_count":
+                total = int(message[1])
+                self.traffic_assignment_summary.set(
+                    f"Loaded SKUs {total:,}  · Building physical-feasibility assignments…"
+                )
+            elif kind == "assignment_summary":
+                summary = message[1]
+                assigned = int(summary.get("assigned_count", 0))
+                total = int(summary.get("sku_count", assigned))
+                unassigned = int(summary.get("unassigned_count", total - assigned))
+                self.traffic_assignment_summary.set(
+                    f"Assigned SKUs {assigned:,} / {total:,}  · "
+                    f"Unassigned {unassigned:,}  · C&TBSA optimization in progress…"
+                )
             elif kind == "done":
                 self.complete_traffic_work(*message[1:])
             elif kind == "cancelled":
@@ -2445,13 +2524,16 @@ class GridMapEditorApp:
         self.traffic_end_date.set(demand.end_date)
         if result is not None:
             params = result.parameters
-            self.traffic_max_travel.set(f"{params['maximum_travel_increase'] * 100:.4g}")
-            self.traffic_hotspot_percentile.set(f"{params['hotspot_percentile']:.4g}")
-            label = "Automatically suggested" if params["parameter_status"] == "AUTO_SUGGESTED" else "User adjusted"
-            self.traffic_parameter_status.set(f"{label} from this demand and network.")
-            self.traffic_view_mode.set("After")
+            self.traffic_ctbsa_population.set(str(params["population_size"]))
+            self.traffic_ctbsa_generations.set(str(params["generations"]))
+            self.traffic_ctbsa_solution.set(str(params["selected_solution"]))
+            self.traffic_ctbsa_seed.set(str(params["random_seed"]))
+            self.traffic_parameter_status.set(
+                "Paper C&TBSA completed; lane load is static validation only."
+            )
+            self.traffic_view_mode.set("C&TBSA result")
         else:
-            self.traffic_view_mode.set("Before")
+            self.traffic_view_mode.set("Feasibility seed")
             self.traffic_parameter_status.set(
                 "Traffic analysis completed without an optimization result."
             )
@@ -2470,7 +2552,7 @@ class GridMapEditorApp:
         after = self.traffic_result.after if self.traffic_result else before
         if before is None:
             return
-        relocated = len({row["handling_unit_id"] for row in self.traffic_result.relocations}) if self.traffic_result else 0
+        relocated = len(self.traffic_result.relocations) if self.traffic_result else 0
         grouping = (
             self.traffic_pipeline_result.grouping_metrics
             if self.traffic_pipeline_result else {}
@@ -2481,11 +2563,66 @@ class GridMapEditorApp:
         ))
         strategy = str(grouping.get("initial_strategy", "basic"))
         strategy_label = (
-            "ABC + Affinity" if strategy == "abc_affinity" else "ABC"
+            "Physical feasibility"
+            if strategy == "physical_feasibility"
+            else "ABC + Affinity" if strategy == "abc_affinity" else "ABC"
+        )
+        generation_summary = (
+            self.traffic_baseline_payload.get("summary", {})
+            if self.traffic_baseline_payload else {}
+        )
+        total_skus = int(generation_summary.get(
+            "sku_count", len(self.traffic_baseline_payload.get("assignments", []))
+            if self.traffic_baseline_payload else 0,
+        ))
+        assigned_skus = int(generation_summary.get(
+            "assigned_count", total_skus - int(generation_summary.get("unassigned_count", 0)),
+        ))
+        unassigned_skus = int(generation_summary.get(
+            "unassigned_count", max(0, total_skus - assigned_skus),
+        ))
+        optimized_skus = int(
+            self.traffic_result.parameters.get("optimized_sku_count", 0)
+            if self.traffic_result else 0
+        )
+        fixed_assigned_skus = max(0, assigned_skus - optimized_skus)
+        self.traffic_assignment_summary.set(
+            f"Assigned SKUs {assigned_skus:,} / {total_skus:,}  · "
+            f"Optimized by C&TBSA {optimized_skus:,}  · "
+            f"Fixed exceptions {fixed_assigned_skus:,}  · "
+            f"Unassigned {unassigned_skus:,}"
+        )
+        baseline_rows = (
+            self.traffic_baseline_payload.get("assignments", [])
+            if self.traffic_baseline_payload else []
+        )
+        verified_rows = [
+            row for row in baseline_rows
+            if not row.get("physical_missing_data_type")
+        ]
+        physical_classes = [
+            str(row.get("physical_storage_class") or "").upper()
+            for row in verified_rows
+        ]
+        oversize_count = sum(
+            value in {"OVERSIZE", "OVERSIZE_AND_OVERWEIGHT"}
+            for value in physical_classes
+        )
+        overweight_count = sum(
+            value in {"OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"}
+            for value in physical_classes
+        )
+        incomplete_count = sum(
+            bool(row.get("physical_missing_data_type")) for row in baseline_rows
+        )
+        self.traffic_exception_summary.set(
+            f"Physical hard rules · OVERSIZE {oversize_count:,} · "
+            f"OVERWEIGHT {overweight_count:,} · INCOMPLETE DATA {incomplete_count:,} · "
+            "fixed outside C&TBSA movement"
         )
         self.traffic_kpis.set(
             f"Groups {before.demand.fulfillment_groups:,}  · "
-            f"{strategy_label} unit visits {baseline_visits:,}  · "
+            f"Input unit visits {baseline_visits:,}  · "
             f"Mapped {len(before.mapped_units):,}  · "
             f"Raw peak {before.metrics['raw_peak_load']:.1f} → {after.metrics['raw_peak_load']:.1f}  · "
             f"Raw P95 {before.metrics['raw_p95_load']:.1f} → {after.metrics['raw_p95_load']:.1f}  · "
@@ -2521,41 +2658,60 @@ class GridMapEditorApp:
         if self.traffic_result:
             for row in self.traffic_result.relocations:
                 self.traffic_relocation_tree.insert("", "end", values=(
-                    row["handling_unit_id"], row["from"], row["to"], row["swap_with"],
+                    row["handling_unit_id"], row.get("sku", ""),
+                    row["from"], row["to"],
                 ))
             rejected = list(self.traffic_result.rejected_units)
             rejected.extend(
-                {"handling_unit_id": unit, "reason": "no movement-network location mapping"}
+                {"handling_unit_id": unit, "shelf_id": unit,
+                 "reason": "no movement-network location mapping"}
                 for unit in before.unmapped_units
             )
             rejected.extend(
-                {"handling_unit_id": unit, "reason": "no route to a service endpoint"}
+                {"handling_unit_id": unit, "shelf_id": unit,
+                 "reason": "no route to a service endpoint"}
                 for unit in before.unreachable_units
             )
             for row in rejected:
                 self.traffic_rejected_tree.insert("", "end", values=(
-                    row["handling_unit_id"], row["reason"],
+                    row.get("sku", ""),
+                    row.get("physical_storage_class", "NETWORK"),
+                    row.get("shelf_id", ""),
+                    row.get("location", ""),
+                    row["reason"],
                 ))
             labels = {
-                "parameter_status": "Parameter status",
-                "maximum_travel_increase": "Maximum travel increase",
-                "hotspot_percentile": "Hotspot percentile",
-                "hotspot_threshold": "Baseline hotspot threshold",
-                "baseline_peak_load": "Baseline peak load",
-                "feasible_swap_count": "Feasible unit swaps",
-                "empirical_candidate_count": "Pareto candidates",
+                "population_size": "NSGA-II population",
+                "generations": "NSGA-II generations",
+                "crossover_probability": "PMX crossover probability",
+                "mutation_probability": "2-opt mutation probability",
+                "selected_solution": "Selected C&TBSA solution",
+                "optimized_sku_count": "Optimized SKUs",
+                "fixed_sku_count": "Fixed physical-exception SKUs",
+                "hard_rule_profile": "Hard-rule profile",
+                "hard_rules": "Enforced hard rules",
+                "hard_rule_validation": "Final hard-rule audit",
             }
             if grouping:
                 for label, value in (
                     ("Traffic workflow", self.traffic_pipeline_result.workflow_mode),
-                    ("Initial strategy", strategy_label),
+                    ("Input preparation", strategy_label),
                     ("Baseline handling-unit visits", baseline_visits),
                     ("Fulfillment groups", before.demand.fulfillment_groups),
                 ):
                     self.traffic_parameter_tree.insert("", "end", values=(label, value))
             for key, value in self.traffic_result.parameters.items():
-                if key == "maximum_travel_increase":
-                    value = f"{value * 100:.4g}%"
+                if key in {"clusters", "regenerated_summary"}:
+                    continue
+                if key == "hard_rules":
+                    value = " · ".join(str(item) for item in value)
+                elif key == "hard_rule_validation":
+                    value = (
+                        f"{value.get('hard_validation_status', 'UNKNOWN')} · "
+                        f"assigned {int(value.get('assigned_sku_count', 0)):,} · "
+                        f"excluded unassigned "
+                        f"{int(value.get('excluded_unassigned_sku_count', 0)):,}"
+                    )
                 self.traffic_parameter_tree.insert("", "end", values=(labels.get(key, key), value))
 
     def _traffic_geometry(self):
@@ -2600,7 +2756,7 @@ class GridMapEditorApp:
         """Return one readable rack marker for every storage node."""
         rows = (
             self.traffic_result.assignments
-            if self.traffic_result and self.traffic_view_mode.get() == "After"
+            if self.traffic_result and self.traffic_view_mode.get() == "C&TBSA result"
             else (self.traffic_baseline_payload or {}).get("assignments", [])
         )
         racks = {}
@@ -2711,7 +2867,7 @@ class GridMapEditorApp:
             return
         analysis = (
             self.traffic_result.after
-            if self.traffic_result and self.traffic_view_mode.get() == "After"
+            if self.traffic_result and self.traffic_view_mode.get() == "C&TBSA result"
             else self.traffic_result.before if self.traffic_result else self.traffic_analysis
         )
         resource_rows = {row["resource_id"]: row for row in analysis.resources}
@@ -2747,17 +2903,27 @@ class GridMapEditorApp:
             )
 
         relocations = self.traffic_result.relocations if self.traffic_result else []
-        swapped_bays = {
+        reassigned_bays = {
             str(value)
-            for row in relocations for value in (row.get("from"), row.get("to"))
+            for row in relocations
+            for value in (
+                row.get("from_rack") or row.get("from"),
+                row.get("to_rack") or row.get("to"),
+            )
             if value
         }
         selected_rows = [
             row for row in relocations
             if highlight_unit and row.get("handling_unit_id") == highlight_unit
         ]
-        selected_from = {str(row.get("from")) for row in selected_rows}
-        selected_to = {str(row.get("to")) for row in selected_rows}
+        selected_from = {
+            str(row.get("from_rack") or row.get("from"))
+            for row in selected_rows
+        }
+        selected_to = {
+            str(row.get("to_rack") or row.get("to"))
+            for row in selected_rows
+        }
         racks = self._traffic_racks_for_view()
         positive_rack_visits = [
             rack["visits"] for rack in racks.values() if rack["visits"] > 0
@@ -2773,27 +2939,27 @@ class GridMapEditorApp:
             bay = rack["bay"]
             selected_source = bay in selected_from
             selected_destination = bay in selected_to
-            swapped = bay in swapped_bays
+            reassigned = bay in reassigned_bays
             visit_ratio = min(1.0, rack["visits"] / rack_heat_maximum)
             fill = (
                 self._traffic_heat_colour(visit_ratio)
                 if rack["visits"] > 0 else "#f2f5f6"
             )
-            outline = "#e07a1f" if selected_source else "#258b55" if selected_destination else "#7b2cbf" if swapped else "#344f5c"
-            width = 4 if selected_source or selected_destination else 3 if swapped else 1
+            outline = "#e07a1f" if selected_source else "#258b55" if selected_destination else "#7b2cbf" if reassigned else "#344f5c"
+            width = 4 if selected_source or selected_destination else 3 if reassigned else 1
             size = 8 if selected_source or selected_destination else 6
-            tags = ("traffic_rack", f"traffic_rack:{bay}") + (("swapped_rack",) if swapped else ())
+            tags = ("traffic_rack", f"traffic_rack:{bay}") + (("reassigned_rack",) if reassigned else ())
             self.traffic_canvas.create_rectangle(
                 x - size, y - size, x + size, y + size,
                 fill=fill, outline=outline, width=width, tags=tags,
             )
-            if show_all_labels or swapped or selected_source or selected_destination:
+            if show_all_labels or reassigned or selected_source or selected_destination:
                 suffix = " FROM" if selected_source else " TO" if selected_destination else ""
                 self.traffic_canvas.create_text(
                     x, y - size - 5,
                     text=f"{rack['label']}{suffix} · {rack['visits']:,}",
-                    fill="#6a1b83" if swapped else "#344f5c",
-                    font=("TkDefaultFont", 7, "bold" if swapped else "normal"),
+                    fill="#6a1b83" if reassigned else "#344f5c",
+                    font=("TkDefaultFont", 7, "bold" if reassigned else "normal"),
                     tags=("traffic_rack_label",),
                 )
 
@@ -2824,7 +2990,12 @@ class GridMapEditorApp:
             None,
         )
         if resource:
-            analysis = self.traffic_result.after if self.traffic_result and self.traffic_view_mode.get() == "After" else self.traffic_analysis
+            analysis = (
+                self.traffic_result.after
+                if self.traffic_result
+                and self.traffic_view_mode.get() == "C&TBSA result"
+                else self.traffic_analysis
+            )
             row = next((row for row in analysis.resources if row["resource_id"] == resource), None)
             if row:
                 contributors = ", ".join(
@@ -3303,7 +3474,10 @@ class GridMapEditorApp:
         source_grid_project = payload.get("sources", {}).get("grid_project_json", "")
         source_building = payload.get("sources", {}).get("building_yaml", "")
         source_velocity = payload.get("sources", {}).get("sku_velocity_csv", "")
-        source_chilled = payload.get("sources", {}).get("chilled_requirements_csv", "")
+        source_chilled = (
+            payload.get("sources", {}).get("sku_attributes_csv")
+            or payload.get("sources", {}).get("chilled_requirements_csv", "")
+        )
         source_affinity = payload.get("sources", {}).get(
             "affinity_order_workbook", ""
         )
@@ -3345,7 +3519,7 @@ class GridMapEditorApp:
             self.slot_affinity_min_score.set("")
             self.slot_strategy_changed()
         self.slot_handling_unit.set(payload.get("handling_unit_type", "AMR shelf"))
-        self.slot_attribute_catalog = catalog or self.attributes.starter_catalog()
+        self.slot_attribute_catalog = catalog
         self.slot_location_attributes = local
         self.slot_hierarchy_paths = paths
         self.slot_storage_initialized = any(
@@ -3366,6 +3540,8 @@ class GridMapEditorApp:
         )
         self.slot_output_path.set(str(layout_path))
         self.slot_selected_rack = None
+        self.slot_rack_zone_name.set("")
+        self.slot_rack_zone_edit_status.set("Select a rack to rename its zone.")
         self.show_slotting_rows(self.slot_rows)
         self.show_unassigned_slotting_rows(self.slot_rows)
         self.draw_slotting_layout()
@@ -3436,6 +3612,9 @@ class GridMapEditorApp:
         try:
             path=Path(self.slot_building_path.get()).expanduser().resolve()
             project=self.rmf_maps.load_project(path)
+            self.attributes.set_standard_storage_defaults(
+                project.warehouse_storage_defaults
+            )
             if project.storage_layout is None or not project.storage_layout.buffers:
                 raise ValueError(
                     "grid project has no storage buffers; assign and save buffers "
@@ -3463,9 +3642,7 @@ class GridMapEditorApp:
             self.slotting.apply_zone_local_aisles(
                 building, racks, zones, default_zone
             )
-            catalog = project.attribute_catalog or self.attributes.serialize_catalog(
-                self.attributes.starter_catalog()
-            )
+            catalog = project.attribute_catalog
             paths = self.attributes.hierarchy_paths(
                 racks,
                 project.storage_layout.levels_per_rack,
@@ -3481,12 +3658,16 @@ class GridMapEditorApp:
         self.slot_levels.set(str(project.storage_layout.levels_per_rack))
         self.slot_slots.set(str(project.storage_layout.slots_per_level))
         self.slot_zone_assignments=zones; self.slot_rows=[]; self.slot_selected_rack=None
+        self.slot_rack_zone_name.set("")
+        self.slot_rack_zone_edit_status.set("Select a rack to rename its zone.")
         self.slot_movement_by_unit = {}
         self.slot_movement_summary = {}
         self.slot_movement_status.set(
             "Project loaded. Generate a layout before calculating movement ranks."
         )
         self.slot_attribute_catalog=self.attributes.normalize_catalog(catalog); self.slot_location_attributes=copy.deepcopy(local); self.slot_hierarchy_paths=paths
+        if project.sku_attribute_source:
+            self.slot_chilled_path.set(project.sku_attribute_source)
         self.slot_storage_initialized=True
         self.slot_zone_storage_types={}
         self.slot_zone.set(default_zone)
@@ -3625,6 +3806,9 @@ class GridMapEditorApp:
                 raise ValueError("load the selected grid project JSON before generating")
             if self.slot_grid_project is None or self.slot_grid_project.storage_layout is None:
                 raise ValueError("loaded grid project has no storage buffers")
+            self.attributes.set_standard_storage_defaults(
+                self.slot_grid_project.warehouse_storage_defaults
+            )
             self.prepare_slot_attribute_hierarchy()
             self.update_slot_progress(12, "Loading SKU data…")
             building=self.slot_building
@@ -3699,6 +3883,13 @@ class GridMapEditorApp:
                     self.slot_attribute_catalog, self.slot_location_attributes,
                     storage_layout=self.slot_grid_project.storage_layout,
                 )
+            self.slot_zone_assignments = dict(
+                summary.get("zone_assignments", self.slot_zone_assignments)
+            )
+            for rack in self.slot_racks:
+                rack["zone_id"] = self.slot_zone_assignments.get(
+                    rack.get("waypoint"), rack.get("zone_id", "")
+                )
             self.update_slot_progress(85, "Saving slotting layout…")
             self.layouts.save(
                 rows, building, summary, Path(self.slot_output_path.get()).expanduser(),
@@ -3736,6 +3927,8 @@ class GridMapEditorApp:
         self.slot_zone_storage_types = summary["zone_storage_types"]
         self.slotting.apply_zone_local_aisles(building,self.slot_racks,self.slot_zone_assignments,self.slot_zone.get())
         self.slot_selected_rack = None
+        self.slot_rack_zone_name.set("")
+        self.slot_rack_zone_edit_status.set("Select a rack to rename its zone.")
         self.show_slotting_rows(rows)
         self.show_unassigned_slotting_rows(rows)
         self.draw_slotting_layout()
@@ -3783,7 +3976,7 @@ class GridMapEditorApp:
             f"temperature-zone shortage "
             f"{summary['unassigned_status_counts'].get('UNASSIGNED_NO_CHILLED_LOCATION', 0) + summary['unassigned_status_counts'].get('UNASSIGNED_NO_AMBIENT_LOCATION', 0):,} · "
             f"all slots occupied {summary['unassigned_no_capacity_count']:,} · "
-            f"planned oversize segments {summary['auto_planned_oversize_segment_count']:,} · "
+            f"map-defined oversize zones {summary['auto_planned_oversize_segment_count']:,} · "
             f"{summary['rack_count']} racks ({summary['unreachable_rack_count']} unreachable) · "
             f"{summary['workstation_count']} workstations · {summary['zone_count']} zones · capacity {summary['capacity']:,} · "
             f"buffers occupied {summary['occupied_buffer_count']:,}/{summary['buffer_count']:,} "
@@ -3791,7 +3984,7 @@ class GridMapEditorApp:
             f"unverified physical data {summary['unverified_oversize_count']:,} "
             f"({summary['assigned_unverified_count']:,} assigned with warning) · "
             f"auto slot overrides {summary['auto_overridden_slot_count']:,} · "
-            f"generated zone types "
+            f"map zone types "
             + ", ".join(
                 f"{zone}={storage_type}"
                 for zone, storage_type in summary["zone_storage_types"].items()
@@ -3850,52 +4043,89 @@ class GridMapEditorApp:
             "#6c8cd5", "#31a6a0", "#d47b4c", "#8ca63c",
             "#c75d8b", "#81756e", "#3d8fbe", "#9b70c7",
         )
-        zone_ids = sorted({
-            str(rack.get("zone_id", "")).strip()
+        assigned_zone_by_rack = {
+            str(row.get("rack_id", "")): str(
+                row.get("generated_attribute_zone_id")
+                or row.get("planned_zone_id")
+                or row.get("zone_id", "")
+            )
+            for row in self.slot_rows
+            if row.get("assignment_status") == "ASSIGNED"
+        }
+        displayed_zone_by_rack = {
+            str(rack.get("rack_id", "")): assigned_zone_by_rack.get(
+                str(rack.get("rack_id", "")), str(rack.get("zone_id", ""))
+            )
             for rack in self.slot_racks
-            if str(rack.get("zone_id", "")).strip()
+        }
+        zone_ids = sorted({
+            zone.strip() for zone in displayed_zone_by_rack.values()
+            if zone.strip()
         })
         zone_colors = {
             zone: zone_palette[index % len(zone_palette)]
             for index, zone in enumerate(zone_ids)
         }
-        for zone in zone_ids:
-            positions = [
-                self.slotting_screen_point(rack["x"], rack["y"], geometry)
-                for rack in self.slot_racks
-                if str(rack.get("zone_id", "")).strip() == zone
-            ]
-            if not positions:
+        rack_zone_at = {
+            (float(rack["x"]), float(rack["y"])): displayed_zone_by_rack.get(
+                str(rack.get("rack_id", "")), ""
+            )
+            for rack in self.slot_racks
+        }
+        x_values = sorted({point[0] for point in rack_zone_at})
+        y_values = sorted({point[1] for point in rack_zone_at})
+
+        def cell_limits(value, values):
+            index = values.index(value)
+            previous = values[index - 1] if index else None
+            following = values[index + 1] if index + 1 < len(values) else None
+            fallback = min(
+                (right - left for left, right in zip(values, values[1:])),
+                default=1.0,
+            ) / 2
+            lower = (previous + value) / 2 if previous is not None else value - fallback
+            upper = (value + following) / 2 if following is not None else value + fallback
+            return lower, upper, previous, following
+
+        # Draw the perimeter of each rack-cell union instead of one bounding
+        # rectangle. L-shaped or sparse zones therefore cannot cover a rack
+        # belonging to another zone.
+        for (x, y), zone in rack_zone_at.items():
+            if not zone:
                 continue
-            boundary_padding = 10
-            left = min(x for x, _y in positions) - boundary_padding
-            top = min(y for _x, y in positions) - boundary_padding
-            right = max(x for x, _y in positions) + boundary_padding
-            bottom = max(y for _x, y in positions) + boundary_padding
-            canvas.create_rectangle(
-                left, top, right, bottom,
-                outline=zone_colors[zone],
-                width=3,
-                tags=("slot_zone_boundary",),
+            left, right, previous_x, following_x = cell_limits(x, x_values)
+            bottom, top, previous_y, following_y = cell_limits(y, y_values)
+            sides = (
+                (previous_x is None or rack_zone_at.get((previous_x, y)) != zone,
+                 (left, bottom), (left, top)),
+                (following_x is None or rack_zone_at.get((following_x, y)) != zone,
+                 (right, bottom), (right, top)),
+                (previous_y is None or rack_zone_at.get((x, previous_y)) != zone,
+                 (left, bottom), (right, bottom)),
+                (following_y is None or rack_zone_at.get((x, following_y)) != zone,
+                 (left, top), (right, top)),
             )
-            badge_width = max(42, len(zone) * 8 + 14)
-            badge_height = 22
-            badge_top = top - badge_height - 4
-            canvas.create_rectangle(
-                left, badge_top, left + badge_width, badge_top + badge_height,
-                fill=zone_colors[zone],
-                outline=zone_colors[zone],
-                tags=("slot_zone_label_badge",),
-            )
-            canvas.create_text(
-                left + badge_width / 2,
-                badge_top + badge_height / 2,
-                text=zone,
-                anchor="center",
-                fill="white",
-                font=("TkDefaultFont", 9, "bold"),
-                tags=("slot_zone_label",),
-            )
+            for visible, start, end in sides:
+                if not visible:
+                    continue
+                x1, y1 = self.slotting_screen_point(*start, geometry)
+                x2, y2 = self.slotting_screen_point(*end, geometry)
+                rack_x, rack_y = self.slotting_screen_point(x, y, geometry)
+                midpoint_x = (x1 + x2) / 2
+                midpoint_y = (y1 + y2) / 2
+                inward_x = rack_x - midpoint_x
+                inward_y = rack_y - midpoint_y
+                inward_length = math.hypot(inward_x, inward_y) or 1.0
+                boundary_gap = 3.0
+                offset_x = boundary_gap * inward_x / inward_length
+                offset_y = boundary_gap * inward_y / inward_length
+                canvas.create_line(
+                    x1 + offset_x, y1 + offset_y,
+                    x2 + offset_x, y2 + offset_y,
+                    fill=zone_colors[zone],
+                    width=3,
+                    tags=("slot_zone_boundary",),
+                )
         assignments={}
         for row in self.slot_rows:
             if row["assignment_status"]=="ASSIGNED": assignments.setdefault(row["rack_id"],[]).append(row)
@@ -3969,9 +4199,128 @@ class GridMapEditorApp:
             endpoint=str(self.slotting.typed_value(params["dropoff_ingestor"],vertex[3])); x,y=self.slotting_screen_point(vertex[0],vertex[1],geometry); r=6
             canvas.create_polygon(x,y-r,x+r,y,x,y+r,x-r,y,fill="#277da1",outline="white")
             canvas.create_text(x,y-11,text=endpoint,fill="#1d5d78",font=("TkDefaultFont",8,"bold"))
-        canvas.tag_raise("slot_zone_label_badge")
-        canvas.tag_raise("slot_zone_label")
         self.apply_canvas_viewport(canvas)
+
+    @staticmethod
+    def _renamed_zone_value(value, old_zone, new_zone):
+        if not isinstance(value, str):
+            return value
+        if value == old_zone:
+            return new_zone
+        for delimiter in ("/", "__", "_"):
+            prefix = old_zone + delimiter
+            if value.startswith(prefix):
+                return new_zone + value[len(old_zone):]
+        return value
+
+    @classmethod
+    def _rename_zone_in_layout_payload(cls, payload, old_zone, new_zone):
+        rename = lambda value: cls._renamed_zone_value(
+            value, old_zone, new_zone
+        )
+        payload["zone_assignments"] = {
+            waypoint: new_zone if zone == old_zone else zone
+            for waypoint, zone in payload.get("zone_assignments", {}).items()
+        }
+        payload["location_attributes"] = {
+            rename(path): values
+            for path, values in payload.get("location_attributes", {}).items()
+        }
+        scalar_fields = (
+            "zone_id", "planned_zone_id",
+            "generated_attribute_zone_id", "static_address",
+            "storage_location_address",
+        )
+        list_fields = (
+            "occupied_static_addresses",
+            "occupied_storage_location_addresses",
+        )
+        for row in payload.get("assignments", []):
+            for field in scalar_fields:
+                row[field] = rename(row.get(field, ""))
+            for field in list_fields:
+                row[field] = [rename(value) for value in row.get(field, [])]
+            for unit in row.get("occupied_handling_units", []):
+                for field in ("static_address", "storage_location_address"):
+                    if field in unit:
+                        unit[field] = rename(unit[field])
+        summary = payload.setdefault("summary", {})
+        summary["zone_storage_types"] = {
+            rename(zone): storage_type
+            for zone, storage_type
+            in summary.get("zone_storage_types", {}).items()
+        }
+        generated = {}
+        for zone, definition in summary.get(
+            "generated_attribute_zones", {}
+        ).items():
+            for step in definition.get("hierarchy_path", []):
+                step["zone_id"] = rename(step.get("zone_id", ""))
+            generated[rename(zone)] = definition
+        summary["generated_attribute_zones"] = generated
+        return payload
+
+    def rename_selected_slot_zone(self):
+        rack = next((
+            item for item in self.slot_racks
+            if item.get("rack_id") == self.slot_selected_rack
+        ), None)
+        if rack is None:
+            messagebox.showerror("Rename zone", "Select a rack first.")
+            return False
+        old_zone = str(rack.get("zone_id", "")).strip()
+        new_zone = self.slot_rack_zone_name.get().strip()
+        if not new_zone:
+            messagebox.showerror("Rename zone", "Zone name cannot be blank.")
+            return False
+        if "/" in new_zone:
+            messagebox.showerror(
+                "Rename zone", "Zone name cannot contain '/'."
+            )
+            return False
+        if new_zone == old_zone:
+            self.slot_rack_zone_edit_status.set("Zone name is unchanged.")
+            return True
+        existing = set(self.slot_zone_assignments.values())
+        if new_zone in existing:
+            messagebox.showerror(
+                "Rename zone",
+                f"Zone '{new_zone}' already exists; choose a unique name.",
+            )
+            return False
+        path = Path(self.slot_output_path.get()).expanduser().resolve()
+        try:
+            payload = self.layouts.load(path)
+            self._rename_zone_in_layout_payload(
+                payload, old_zone, new_zone
+            )
+            self.layouts.save_payload(payload, path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Rename zone", str(exc))
+            return False
+        self.slot_zone_assignments = dict(payload["zone_assignments"])
+        self.slot_rows = payload["assignments"]
+        self.slot_location_attributes = payload.get("location_attributes", {})
+        self.slot_zone_storage_types = payload.get("summary", {}).get(
+            "zone_storage_types", {}
+        )
+        for item in self.slot_racks:
+            item["zone_id"] = self.slot_zone_assignments.get(
+                item.get("waypoint"), item.get("zone_id", "")
+            )
+        if self.slot_zone.get() == old_zone:
+            self.slot_zone.set(new_zone)
+        self.slot_rack_zone_name.set(new_zone)
+        self.slot_viewer_status.set(f"Saved zone rename to: {path}")
+        self.draw_slotting_layout()
+        self.slot_rack_click_by_id(self.slot_selected_rack)
+        self.slot_rack_zone_edit_status.set(
+            f"Renamed {old_zone} to {new_zone} and saved the layout."
+        )
+        return True
+
+    def slot_rack_click_by_id(self, rack_id):
+        self._show_slot_rack_details(rack_id)
 
     def rack_attribute_detail_text(self, zone_path, bay_path):
         zone_effective, _zone_sources = self.attributes.effective_attributes(
@@ -3995,9 +4344,13 @@ class GridMapEditorApp:
         planned_zone = (
             assigned_rows[0].get("planned_zone_id", "") if assigned_rows else ""
         ) or zone_path
+        generated_zone = (
+            assigned_rows[0].get("generated_attribute_zone_id", "")
+            if assigned_rows else ""
+        ) or planned_zone
         display_zone = (
-            planned_zone
-            if planned_zone != zone_path and "_chill_" in planned_zone
+            generated_zone
+            if generated_zone != zone_path
             else zone_path
         )
         planned_type = (
@@ -4011,14 +4364,8 @@ class GridMapEditorApp:
             attributes_by_key = self.attributes.effective_attributes(
                 zone_path, self.slot_location_attributes
             )[0]
-        parent_line = (
-            f"Parent zone: {zone_path}\n"
-            if display_zone != zone_path
-            else ""
-        )
         return (
             f"Zone: {display_zone}\n"
-            f"{parent_line}"
             f"Generated storage type: {planned_type or 'UNUSED'}\n"
             f"Attributes: {self.attributes.format_values(attributes_by_key)}"
         )
@@ -4029,6 +4376,9 @@ class GridMapEditorApp:
         tags=self.slot_canvas.gettags(item[0]); rack_tags=[tag for tag in tags if tag.startswith("rack:")]
         if not rack_tags: return
         rack_id=rack_tags[0].split(":",1)[1]
+        self._show_slot_rack_details(rack_id)
+
+    def _show_slot_rack_details(self, rack_id):
         self.slot_selected_rack=rack_id
         rack=next((item for item in self.slot_racks if item["rack_id"]==rack_id),None)
         rows=[row for row in self.slot_rows if row["rack_id"]==rack_id and row["assignment_status"]=="ASSIGNED"]
@@ -4037,6 +4387,10 @@ class GridMapEditorApp:
         classes={label:sum(row["velocity_class"]==label for row in rows) for label in ("A","B","C")}
         unit_ids=sorted({row["handling_unit_id"] for row in rows})
         zone_path = rack.get("zone_id", "UNASSIGNED")
+        self.slot_rack_zone_name.set(zone_path)
+        self.slot_rack_zone_edit_status.set(
+            "Renaming here changes the entire zone."
+        )
         bay_path = f"{rack.get('zone_id','UNASSIGNED')}/{rack['aisle_id']}/{rack['static_bay_id']}"
         _zone_detail, rack_override_detail = self.rack_attribute_detail_text(
             zone_path, bay_path
@@ -4115,6 +4469,125 @@ class GridMapEditorApp:
         spec.validate()
         return spec
 
+    @staticmethod
+    def format_sku_attribute_summary(summary: dict | None) -> str:
+        if not summary:
+            return "Load a SKU attributes CSV to discover required zone attributes."
+        details = []
+        for key, item in (summary.get("attributes") or {}).items():
+            values = item.get("values") or []
+            if item.get("value_type") == "number":
+                value_text = (
+                    f"{item.get('minimum'):g}–{item.get('maximum'):g}"
+                    if item.get("minimum") is not None
+                    and item.get("maximum") is not None else "numeric"
+                )
+            else:
+                value_text = "/".join(values) if values else "configured value"
+            details.append(f"{key}: {value_text}")
+        selected = summary.get("combination_attributes") or []
+        selected_text = ", ".join(selected) if selected else "none"
+        return (
+            f"{int(summary.get('sku_count', 0)):,} SKUs loaded\n"
+            f"Overlay grouping: {selected_text}\n"
+            "Configure these attributes by zone:\n" + " · ".join(details)
+        )
+
+    def load_grid_sku_attributes_dialog(self):
+        path = filedialog.askopenfilename(
+            initialdir=str(DEFAULT_SKU_ATTRIBUTES_INPUT.parent),
+            initialfile=DEFAULT_SKU_ATTRIBUTES_INPUT.name,
+            filetypes=[("SKU attributes CSV", "*.csv"), ("All files", "*")],
+        )
+        if not path:
+            return
+        self.load_grid_sku_attributes(Path(path))
+
+    def load_grid_sku_attributes(self, path: Path) -> bool:
+        self.attributes.set_standard_storage_defaults(
+            self.project.warehouse_storage_defaults
+        )
+        try:
+            catalog, discovered_summary = self.slotting.inspect_sku_attribute_csv(
+                path, self.project.attribute_catalog
+            )
+            available = list(
+                discovered_summary.get("available_combination_attributes") or []
+            )
+            selected = (
+                [
+                    key for key in self.project.sku_overlay_attributes
+                    if key in available
+                ]
+                if self.project.sku_attribute_source else available
+            )
+            catalog, summary = self.slotting.inspect_sku_attribute_csv(
+                path, catalog, selected
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            messagebox.showerror("SKU attributes", str(exc))
+            return False
+        self.push_undo()
+        self.project.attribute_catalog = self.attributes.serialize_catalog(catalog)
+        self.project.sku_attribute_source = str(path.resolve())
+        self.project.sku_attribute_summary = copy.deepcopy(summary)
+        self.project.sku_overlay_attributes = list(
+            summary.get("combination_attributes") or []
+        )
+        self.grid_sku_attributes_path.set(self.project.sku_attribute_source)
+        self.grid_sku_attribute_summary.set(
+            self.format_sku_attribute_summary(summary)
+        )
+        self.sync_grid_sku_overlay_attribute_list()
+        active_physical = set(PHYSICAL_ATTRIBUTE_KEYS) & set(catalog)
+        for zone in set(self.project.zone_assignments.values()):
+            values = self.project.location_attributes.setdefault(zone, {})
+            for key in active_physical:
+                values.setdefault(key, self.project.warehouse_storage_defaults[key])
+        self.status.set(
+            f"Loaded attributes for {summary['sku_count']:,} SKUs. "
+            "Configure the listed values in warehouse zone settings."
+        )
+        self.redraw()
+        return True
+
+    def apply_grid_sku_overlay_attributes(self) -> bool:
+        source = Path(self.project.sku_attribute_source)
+        if not self.project.sku_attribute_source or not source.is_file():
+            messagebox.showerror(
+                "SKU attributes",
+                "Load a SKU attributes CSV before selecting overlay attributes.",
+            )
+            return False
+        selected = [
+            str(self.grid_sku_overlay_attribute_list.get(index))
+            for index in self.grid_sku_overlay_attribute_list.curselection()
+        ]
+        try:
+            catalog, summary = self.slotting.inspect_sku_attribute_csv(
+                source, self.project.attribute_catalog, selected
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            messagebox.showerror("SKU attributes", str(exc))
+            return False
+        self.push_undo()
+        self.project.attribute_catalog = self.attributes.serialize_catalog(catalog)
+        self.project.sku_overlay_attributes = list(
+            summary.get("combination_attributes") or []
+        )
+        self.project.sku_attribute_summary = copy.deepcopy(summary)
+        self.grid_sku_attribute_summary.set(
+            self.format_sku_attribute_summary(summary)
+        )
+        self.redraw()
+        selected_text = ", ".join(
+            self.project.sku_overlay_attributes
+        ) or "no Boolean attributes"
+        self.status.set(
+            f"Rack-demand overlay now groups SKUs by {selected_text}."
+        )
+        return True
+
     def generate_grid(self):
         try:
             spec = self.spec_from_inputs()
@@ -4123,11 +4596,14 @@ class GridMapEditorApp:
         if self.project.markers and not messagebox.askyesno("Reset grid", "Generating a new grid removes all rack and workstation markers. Continue?"):
             return
         self.push_undo()
-        self.project = GridProject(spec)
-        self.project.attribute_catalog = self.attributes.serialize_catalog(
-            self.attributes.starter_catalog()
+        warehouse_defaults = dict(self.project.warehouse_storage_defaults)
+        self.project = GridProject(
+            spec, warehouse_storage_defaults=warehouse_defaults
         )
+        self.project.attribute_catalog = []
+        self.attributes.set_standard_storage_defaults(warehouse_defaults)
         self.sync_grid_storage_controls()
+        self.sync_grid_sku_attribute_controls()
         self.selected = None
         self.bulk_anchor = None
         self.bulk_drag_position = None
@@ -4147,6 +4623,37 @@ class GridMapEditorApp:
             f"{len(layout.buffers)} empty {layout.buffer_level} buffer(s) · "
             f"dynamic unit {layout.handling_unit_type}"
         )
+
+    def sync_grid_warehouse_storage_controls(self):
+        self.attributes.set_standard_storage_defaults(
+            self.project.warehouse_storage_defaults
+        )
+        for key, variable in self.grid_warehouse_capacity_values.items():
+            variable.set(str(self.project.warehouse_storage_defaults[key]))
+
+    def sync_grid_sku_attribute_controls(self):
+        self.grid_sku_attributes_path.set(self.project.sku_attribute_source)
+        self.grid_sku_attribute_summary.set(
+            self.format_sku_attribute_summary(
+                self.project.sku_attribute_summary
+            )
+        )
+        self.sync_grid_sku_overlay_attribute_list()
+
+    def sync_grid_sku_overlay_attribute_list(self):
+        if not hasattr(self, "grid_sku_overlay_attribute_list"):
+            return
+        widget = self.grid_sku_overlay_attribute_list
+        widget.delete(0, "end")
+        summary = self.project.sku_attribute_summary or {}
+        available = list(
+            summary.get("available_combination_attributes") or []
+        )
+        selected = set(self.project.sku_overlay_attributes)
+        for index, key in enumerate(available):
+            widget.insert("end", key)
+            if key in selected:
+                widget.selection_set(index)
 
     def invalidate_grid_buffers(self):
         if self.project.storage_layout is not None:
@@ -4175,29 +4682,66 @@ class GridMapEditorApp:
             f"{self.project.storage_layout.buffer_level} storage buffer(s)."
         )
 
-    def geometry(self):
+    def calculate_grid_geometry(self):
         width = max(200, self.canvas.winfo_width())
         height = max(200, self.canvas.winfo_height())
         padding = 45
-        scale = min((width - 2 * padding) / self.project.grid.width_m, (height - 2 * padding) / self.project.grid.length_m)
-        return padding, scale, height
+        coordinates = [
+            self.project.coordinates(column, row)
+            for column, row in self.project.iter_positions()
+        ]
+        # Always include the predefined warehouse extent, while allowing an
+        # edited point to expand the visible area beyond it in any direction.
+        coordinates.extend([
+            (0.0, 0.0),
+            (self.project.grid.width_m, self.project.grid.length_m),
+        ])
+        min_x = min(point[0] for point in coordinates)
+        max_x = max(point[0] for point in coordinates)
+        min_y = min(point[1] for point in coordinates)
+        max_y = max(point[1] for point in coordinates)
+        span_x = max(max_x - min_x, 1e-9)
+        span_y = max(max_y - min_y, 1e-9)
+        scale = min((width - 2 * padding) / span_x, (height - 2 * padding) / span_y)
+        return padding, scale, height, min_x, min_y
+
+    def geometry(self):
+        geometry = getattr(self, "_grid_geometry", None)
+        if geometry is None:
+            geometry = self.calculate_grid_geometry()
+            self._grid_geometry = geometry
+        return geometry
+
+    def physical_screen_point(self, x, y):
+        padding, scale, height, min_x, min_y = self.geometry()
+        return (
+            padding + (x - min_x) * scale,
+            height - padding - (y - min_y) * scale,
+        )
 
     def screen_point(self, column, row):
-        padding, scale, height = self.geometry()
-        x = padding + self.project.grid.x_coordinate(column) * scale
-        y = height - padding - self.project.grid.y_coordinate(row) * scale
-        return x, y
+        return self.physical_screen_point(
+            *self.project.coordinates(column, row)
+        )
 
     def redraw(self):
         if not hasattr(self, "canvas"): return
+        self._grid_geometry = self.calculate_grid_geometry()
         self.canvas.delete("all")
         spec = self.project.grid
-        for row in range(spec.rows + 1):
-            x1, y1 = self.screen_point(0, row); x2, y2 = self.screen_point(spec.columns, row)
-            self.canvas.create_line(x1, y1, x2, y2, fill="#d7dfe2")
-        for column in range(spec.columns + 1):
-            x1, y1 = self.screen_point(column, 0); x2, y2 = self.screen_point(column, spec.rows)
-            self.canvas.create_line(x1, y1, x2, y2, fill="#d7dfe2")
+        boundary_start = self.physical_screen_point(0, 0)
+        boundary_end = self.physical_screen_point(spec.width_m, spec.length_m)
+        self.canvas.create_rectangle(
+            boundary_start[0], boundary_end[1], boundary_end[0], boundary_start[1],
+            outline="#aab7bc", dash=(5, 4), width=2,
+            tags=("warehouse_boundary",),
+        )
+        for start, end in self.project.iter_lane_positions():
+            x1, y1 = self.screen_point(*start)
+            x2, y2 = self.screen_point(*end)
+            self.canvas.create_line(
+                x1, y1, x2, y2, fill="#d7dfe2", tags=("grid_lane",)
+            )
         radius = max(
             2,
             min(5, self.geometry()[1] * min(spec.spacing_m, spec.spacing_y_m) * 0.10),
@@ -4318,41 +4862,215 @@ class GridMapEditorApp:
                 self.canvas.create_oval(
                     x-9, y-9, x+9, y+9, outline="#7b2cbf", width=3
                 )
-        x0, y0 = self.screen_point(0, 0)
+        x0, y0 = self.physical_screen_point(0, 0)
         self.canvas.create_text(x0, y0+20, text="(0, 0)", anchor="n", fill="#087f8c", font=("TkDefaultFont", 9, "bold"))
         self.apply_canvas_viewport(self.canvas)
-        self.summary.set(f"{spec.columns} columns × {spec.rows} rows\n{spec.vertex_count:,} vertices · {spec.edge_count:,} edges")
+        self.draw_grid_demand_overlay()
+        self.summary.set(
+            f"{spec.columns} columns × {spec.rows} rows\n"
+            f"{self.project.vertex_count:,} vertices · "
+            f"{self.project.edge_count:,} edges"
+        )
         self.update_grid_zone_summary()
 
+    def draw_grid_demand_overlay(self):
+        """Draw fixed, schema-driven SKU rack demand in the map viewport."""
+        if not hasattr(self, "canvas"):
+            return
+        self.canvas.delete("grid_demand_overlay")
+        summary = self.project.sku_attribute_summary or {}
+        combinations = summary.get("attribute_combinations") or []
+        if not combinations:
+            return
+        layout = self.project.storage_layout
+        try:
+            levels = int(
+                layout.levels_per_rack if layout else self.grid_storage_levels.get()
+            )
+            slots = int(
+                layout.slots_per_level if layout else self.grid_storage_slots.get()
+            )
+        except (TypeError, ValueError):
+            levels, slots = 1, 1
+        rack_capacity = max(1, levels * slots)
+        display_rows = []
+        total_racks = 0
+        for combination in combinations:
+            sku_count = int(combination.get("sku_count", 0))
+            racks = math.ceil(sku_count / rack_capacity)
+            total_racks += racks
+            attributes = combination.get("attributes") or {}
+            profile = " · ".join(
+                f"{key}={'T' if value is True else 'F' if value is False else '?'}"
+                for key, value in attributes.items()
+            ) or "no Boolean flags"
+            display_rows.append((
+                f"{combination.get('storage_type', 'STANDARD')} · {profile} · "
+                f"{sku_count:,} SKUs → {racks:,} racks",
+                self.grid_demand_combination_is_covered(combination, racks),
+            ))
+        x = float(self.canvas.canvasx(max(12, self.canvas.winfo_width() - 12)))
+        y = float(self.canvas.canvasy(12))
+        cursor_y = y + 9
+        text_ids = []
+
+        def add_line(text, fill="#243238", tags=(), bold=False):
+            nonlocal cursor_y
+            text_id = self.canvas.create_text(
+                x - 10, cursor_y,
+                text=text,
+                anchor="ne",
+                width=430,
+                justify="left",
+                fill=fill,
+                font=("TkDefaultFont", 9, "bold" if bold else "normal"),
+                tags=("grid_demand_overlay", *tags),
+            )
+            text_ids.append(text_id)
+            bounds = self.canvas.bbox(text_id)
+            cursor_y = (bounds[3] + 2) if bounds else cursor_y + 18
+
+        add_line(
+            f"Estimated rack demand · {rack_capacity} SKU slots/rack",
+            bold=True,
+        )
+        for text, covered in display_rows:
+            add_line(
+                text,
+                fill="#173f73" if covered else "#243238",
+                tags=("grid_demand_covered",) if covered else (),
+            )
+        add_line(f"Total estimated: {total_racks:,} racks", bold=True)
+        bounds = self.canvas.bbox("grid_demand_overlay")
+        if bounds:
+            rectangle_id = self.canvas.create_rectangle(
+                bounds[0] - 9, bounds[1] - 7,
+                bounds[2] + 9, bounds[3] + 7,
+                fill="#f8fbfc",
+                outline="#50656e",
+                width=1,
+                tags=("grid_demand_overlay",),
+            )
+            self.canvas.tag_lower(rectangle_id, text_ids[0])
+        for text_id in text_ids:
+            self.canvas.tag_raise(text_id)
+
+    def grid_demand_combination_is_covered(
+        self, combination: dict, required_racks: int
+    ) -> bool:
+        """Return whether configured zones provide enough exact-profile racks."""
+        if required_racks <= 0:
+            return True
+        rack_counts: dict[str, int] = {}
+        for (column, row), marker in self.project.markers.items():
+            if marker.role != "rack":
+                continue
+            zone = self.project.zone_assignments.get(
+                self.project.vertex_name(column, row), ""
+            )
+            if zone:
+                rack_counts[zone] = rack_counts.get(zone, 0) + 1
+        required_attributes = combination.get("attributes") or {}
+        required_storage_type = str(
+            combination.get("storage_type", "STANDARD")
+        ).upper()
+        matching_racks = 0
+        for zone, rack_count in rack_counts.items():
+            effective, _sources = self.attributes.effective_attributes(
+                zone, self.project.location_attributes
+            )
+            if any(
+                effective.get(key, False) is not value
+                for key, value in required_attributes.items()
+            ):
+                continue
+            oversize_planned = effective.get("oversize_capable") is True
+            zone_storage_type = "OVERSIZE" if oversize_planned else "STANDARD"
+            if zone_storage_type == required_storage_type:
+                matching_racks += rack_count
+        return matching_racks >= required_racks
+
     def nearest_position(self, event) -> GridPosition | None:
-        padding, scale, height = self.geometry()
         event_x, event_y = self.canvas_viewport_inverse_point(
             self.canvas, event.x, event.y
         )
-        physical_x = (event_x - padding) / scale
-        physical_y = (height - padding - event_y) / scale
-        column = min(
-            range(self.project.grid.columns + 1),
-            key=lambda value: abs(self.project.grid.x_coordinate(value) - physical_x),
+        positions = list(self.project.iter_positions())
+        if not positions:
+            return None
+        position = min(
+            positions,
+            key=lambda item: math.hypot(
+                event_x - self.screen_point(*item)[0],
+                event_y - self.screen_point(*item)[1],
+            ),
         )
-        row = min(
-            range(self.project.grid.rows + 1),
-            key=lambda value: abs(self.project.grid.y_coordinate(value) - physical_y),
-        )
-        if 0 <= column <= self.project.grid.columns and 0 <= row <= self.project.grid.rows:
-            x, y = self.screen_point(column, row)
-            if math.hypot(event_x-x, event_y-y) <= max(
-                12,
-                min(self.project.grid.spacing_m, self.project.grid.spacing_y_m)
-                * scale * .35,
-            ):
-                return column, row
+        x, y = self.screen_point(*position)
+        scale = self.geometry()[1]
+        if math.hypot(event_x-x, event_y-y) <= max(
+            12,
+            min(self.project.grid.spacing_m, self.project.grid.spacing_y_m)
+            * scale * .35,
+        ):
+            return position
         return None
 
+    @staticmethod
+    def point_segment_distance(px, py, x1, y1, x2, y2):
+        delta_x, delta_y = x2 - x1, y2 - y1
+        length_squared = delta_x * delta_x + delta_y * delta_y
+        if length_squared == 0:
+            return math.hypot(px - x1, py - y1)
+        ratio = max(0.0, min(
+            1.0,
+            ((px - x1) * delta_x + (py - y1) * delta_y) / length_squared,
+        ))
+        return math.hypot(
+            px - (x1 + ratio * delta_x),
+            py - (y1 + ratio * delta_y),
+        )
+
+    def nearest_lane(self, event):
+        event_x, event_y = self.canvas_viewport_inverse_point(
+            self.canvas, event.x, event.y
+        )
+        lanes = list(self.project.iter_lane_positions())
+        if not lanes:
+            return None
+        lane, distance = min(
+            (
+                (
+                    lane,
+                    self.point_segment_distance(
+                        event_x, event_y,
+                        *self.screen_point(*lane[0]),
+                        *self.screen_point(*lane[1]),
+                    ),
+                )
+                for lane in lanes
+            ),
+            key=lambda item: item[1],
+        )
+        return lane if distance <= 9 else None
+
     def canvas_click(self, event):
+        current = self.canvas.find_withtag("current")
+        if current and "grid_demand_overlay" in self.canvas.gettags(current[0]):
+            self.grid_overlay_pointer_down = True
+            return "break"
+        self.grid_overlay_pointer_down = False
+        self.canvas.focus_set()
+        action = self.tool.get()
+        if action == "delete_lane":
+            lane = self.nearest_lane(event)
+            if lane is None:
+                return
+            self.push_undo()
+            self.drag_undo_started = True
+            self.delete_grid_lane(lane)
+            self.redraw()
+            return
         position = self.nearest_position(event)
         if position is None: return
-        action = self.tool.get()
         if action == "clear":
             self.push_undo(); self.drag_undo_started = True
             self.invalidate_grid_buffers()
@@ -4379,13 +5097,28 @@ class GridMapEditorApp:
             self.invalidate_grid_buffers()
             self.project.markers[position] = Marker("workstation", f"WS_{position[0]}_{position[1]}")
             self.prune_grid_warehouse_configuration()
-        self.selected = position
+        elif action == "delete_grid":
+            self.push_undo()
+            self.drag_undo_started = True
+            self.delete_grid_position(position)
+        self.selected = None if action == "delete_grid" else position
         self.update_selected_editor()
         self.redraw()
 
     def canvas_drag(self, event):
+        if getattr(self, "grid_overlay_pointer_down", False):
+            return "break"
         action = self.tool.get()
-        if action not in {"clear", "rack_rectangle", "zone_rectangle"}: return
+        if action == "delete_lane":
+            lane = self.nearest_lane(event)
+            if lane is None:
+                return
+            if not self.drag_undo_started:
+                self.push_undo(); self.drag_undo_started = True
+            self.delete_grid_lane(lane)
+            self.redraw()
+            return
+        if action not in {"clear", "delete_grid", "rack_rectangle", "zone_rectangle"}: return
         position = self.nearest_position(event)
         if position is None: return
         if action in {"rack_rectangle", "zone_rectangle"}:
@@ -4393,6 +5126,14 @@ class GridMapEditorApp:
                 return
             self.bulk_drag_position = position
             self.selected = position
+            self.update_selected_editor()
+            self.redraw()
+            return
+        if action == "delete_grid":
+            if not self.drag_undo_started:
+                self.push_undo(); self.drag_undo_started = True
+            self.delete_grid_position(position)
+            self.selected = None
             self.update_selected_editor()
             self.redraw()
             return
@@ -4407,6 +5148,9 @@ class GridMapEditorApp:
         self.redraw()
 
     def canvas_release(self, event):
+        if getattr(self, "grid_overlay_pointer_down", False):
+            self.grid_overlay_pointer_down = False
+            return "break"
         action = self.tool.get()
         if action in {"rack_rectangle", "zone_rectangle"} and self.bulk_anchor is not None:
             position = self.nearest_position(event) or self.bulk_drag_position
@@ -4420,6 +5164,48 @@ class GridMapEditorApp:
             self.redraw()
         self.drag_undo_started = False
 
+    def delete_grid_position(self, position: GridPosition) -> bool:
+        """Delete one vertex; lane generation bridges to the next survivors."""
+        if position in self.project.deleted_positions:
+            return False
+        self.invalidate_grid_buffers()
+        self.project.markers.pop(position, None)
+        self.project.coordinate_overrides.pop(position, None)
+        self.project.deleted_lanes = {
+            lane for lane in self.project.deleted_lanes if position not in lane
+        }
+        self.project.deleted_positions.add(position)
+        self.prune_grid_warehouse_configuration()
+        self.status.set(
+            f"Deleted {self.project.vertex_name(*position)}; lanes reconnected "
+            "to the next available grid points."
+        )
+        return True
+
+    def delete_grid_lane(self, lane) -> bool:
+        lane = self.project.normalized_lane(*lane)
+        if lane in self.project.deleted_lanes:
+            return False
+        self.project.deleted_lanes.add(lane)
+        start, end = lane
+        self.status.set(
+            f"Deleted lane {self.project.vertex_name(*start)} ↔ "
+            f"{self.project.vertex_name(*end)}."
+        )
+        return True
+
+    def delete_selected_grid_point(self, _event=None):
+        if self.selected is None:
+            self.status.set("Select a grid point before deleting it.")
+            return "break"
+        self.push_undo()
+        position = self.selected
+        self.delete_grid_position(position)
+        self.selected = None
+        self.update_selected_editor()
+        self.redraw()
+        return "break"
+
     def fill_grid_rack_rectangle(self, start, end):
         """Fill every grid point inside a completed drag rectangle with racks."""
         self.push_undo()
@@ -4428,6 +5214,8 @@ class GridMapEditorApp:
         count = 0
         for row in range(min(r1, r2), max(r1, r2) + 1):
             for column in range(min(c1, c2), max(c1, c2) + 1):
+                if (column, row) in self.project.deleted_positions:
+                    continue
                 self.place_rack((column, row), redraw=False)
                 count += 1
         self.status.set(f"Placed {count} rack pickup point(s).")
@@ -4500,37 +5288,71 @@ class GridMapEditorApp:
         )
 
     def ensure_grid_zone_defaults(self):
-        catalog = self.attributes.normalize_catalog(
-            self.project.attribute_catalog or self.attributes.starter_catalog()
-        )
-        for key, definition in self.attributes.starter_catalog().items():
-            catalog.setdefault(key, definition)
-        self.project.attribute_catalog = self.attributes.serialize_catalog(catalog)
+        catalog = self.attributes.normalize_catalog(self.project.attribute_catalog)
         for zone in sorted(set(self.project.zone_assignments.values())):
             values = self.project.location_attributes.setdefault(zone, {})
-            for key, value in STANDARD_STORAGE_DEFAULTS.items():
-                values.setdefault(key, value)
-            values.setdefault("chilled", False)
-            values.setdefault(OVERSIZE_CAPABLE_KEY, False)
+            for key in PHYSICAL_ATTRIBUTE_KEYS:
+                if key in catalog:
+                    values.setdefault(
+                        key, self.project.warehouse_storage_defaults[key]
+                    )
+
+    def apply_grid_warehouse_storage_defaults(self):
+        try:
+            values = {
+                key: float(variable.get().strip())
+                for key, variable in self.grid_warehouse_capacity_values.items()
+            }
+            self.attributes.set_standard_storage_defaults(values)
+        except ValueError as exc:
+            messagebox.showerror("Warehouse storage defaults", str(exc))
+            return False
+        normalized = dict(self.attributes.standard_storage_defaults)
+        self.push_undo()
+        self.project.warehouse_storage_defaults = normalized
+        catalog = self.attributes.normalize_catalog(self.project.attribute_catalog)
+        for zone in set(self.project.zone_assignments.values()):
+            zone_values = self.project.location_attributes.setdefault(zone, {})
+            for key in PHYSICAL_ATTRIBUTE_KEYS:
+                if key in catalog:
+                    zone_values[key] = normalized[key]
+        source = Path(self.project.sku_attribute_source)
+        if self.project.sku_attribute_source and source.is_file():
+            try:
+                _catalog, summary = self.slotting.inspect_sku_attribute_csv(
+                    source, catalog, self.project.sku_overlay_attributes
+                )
+                self.project.sku_attribute_summary = copy.deepcopy(summary)
+                self.grid_sku_attribute_summary.set(
+                    self.format_sku_attribute_summary(summary)
+                )
+            except (OSError, ValueError, TypeError):
+                self.project.sku_attribute_summary.pop(
+                    "attribute_combinations", None
+                )
+        else:
+            self.project.sku_attribute_summary.pop("attribute_combinations", None)
+        self.sync_grid_warehouse_storage_controls()
+        self.redraw()
+        self.status.set(
+            "Warehouse storage defaults saved and carried forward to all zones."
+        )
+        return True
 
     def prepare_grid_attribute_hierarchy(self, confirm_orphans=True):
         layout = self.project.storage_layout
         if layout is None or not layout.buffers:
             raise ValueError("assign storage buffers before editing warehouse attributes")
-        rack_waypoints = {
-            self.project.vertex_name(column, row)
-            for (column, row), marker in self.project.markers.items()
-            if marker.role == "rack"
-        }
-        missing = sorted(rack_waypoints - set(self.project.zone_assignments))
-        if missing:
-            raise ValueError(
-                f"assign a zone to every rack first; {len(missing)} remain unassigned"
-            )
         building = self.project.to_building_dict()
         _level, racks, _workstations, _unreachable = self.slotting.rack_distances(
             building
         )
+        racks = [
+            rack for rack in racks
+            if rack["waypoint"] in self.project.zone_assignments
+        ]
+        if not racks:
+            raise ValueError("assign at least one rack to a zone before editing attributes")
         roots = {
             str(item["grid_waypoint"]): str(item["buffer_id"]).split("/L", 1)[0]
             for item in layout.buffers
@@ -4564,17 +5386,26 @@ class GridMapEditorApp:
         return paths
 
     def open_grid_zone_storage_settings(self):
-        try:
-            paths = self.prepare_grid_attribute_hierarchy()
-        except (TypeError, ValueError) as exc:
-            messagebox.showerror("Zone storage settings", str(exc))
+        zones = sorted({
+            str(zone).strip()
+            for zone in self.project.zone_assignments.values()
+            if str(zone).strip()
+        })
+        if not zones:
+            messagebox.showerror(
+                "Zone storage settings",
+                "Assign at least one rack to a zone before editing zone settings.",
+            )
             return
+        self.ensure_grid_zone_defaults()
         editor = ZoneStorageSettingsEditor(
             self.root,
             self.attributes,
-            [path for path in paths if "/" not in path],
+            zones,
             self.project.location_attributes,
             self.apply_grid_zone_storage_settings,
+            attribute_catalog=self.project.attribute_catalog,
+            warehouse_storage_defaults=self.project.warehouse_storage_defaults,
         )
         editor.grab_set()
 
@@ -4627,10 +5458,6 @@ class GridMapEditorApp:
 
     def restore_snapshot(self, snapshot: dict):
         self.project = GridProject.from_project_dict(snapshot)
-        if not self.project.attribute_catalog:
-            self.project.attribute_catalog = self.attributes.serialize_catalog(
-                self.attributes.starter_catalog()
-            )
         self.selected = None
         self.bulk_anchor = None
         self.bulk_drag_position = None
@@ -4641,6 +5468,8 @@ class GridMapEditorApp:
         self.spacing.set(str(self.project.grid.spacing_m))
         self.spacing_y.set(str(self.project.grid.spacing_y_m))
         self.sync_grid_storage_controls()
+        self.sync_grid_warehouse_storage_controls()
+        self.sync_grid_sku_attribute_controls()
         self.update_grid_zone_summary()
         self.update_selected_editor()
         self.redraw()
@@ -4672,13 +5501,16 @@ class GridMapEditorApp:
     def update_selected_editor(self):
         if self.selected is None:
             self.selected_coordinate.set("No grid point selected")
+            self.selected_x.set(""); self.selected_y.set("")
             self.role.set("none"); self.endpoint_id.set(""); return
         column, row = self.selected
+        x, y = self.project.coordinates(column, row)
         self.selected_coordinate.set(
             f"Column {column}, row {row}  →  "
-            f"({self.project.grid.x_coordinate(column):g}, "
-            f"{self.project.grid.y_coordinate(row):g}) m"
+            f"({x:g}, {y:g}) m"
         )
+        self.selected_x.set(f"{x:g}")
+        self.selected_y.set(f"{y:g}")
         marker = self.project.markers.get(self.selected)
         self.role.set(marker.role if marker else "none")
         self.endpoint_id.set(marker.endpoint_id if marker else "")
@@ -4688,7 +5520,23 @@ class GridMapEditorApp:
             messagebox.showinfo("Select a point", "Select a grid point first."); return
         role = self.role.get()
         before = self.snapshot()
+        try:
+            x = float(self.selected_x.get())
+            y = float(self.selected_y.get())
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise ValueError("X and Y coordinates must be finite numbers")
+        except ValueError as exc:
+            messagebox.showerror("Invalid position", str(exc)); return
         self.invalidate_grid_buffers()
+        column, row = self.selected
+        default_coordinates = (
+            self.project.grid.x_coordinate(column),
+            self.project.grid.y_coordinate(row),
+        )
+        if (x, y) == default_coordinates:
+            self.project.coordinate_overrides.pop(self.selected, None)
+        else:
+            self.project.coordinate_overrides[self.selected] = (x, y)
         if role == "none": self.project.markers.pop(self.selected, None)
         else:
             endpoint = self.endpoint_id.get().strip()
@@ -4703,7 +5551,8 @@ class GridMapEditorApp:
         self.undo_stack.append(before)
         if len(self.undo_stack) > 100: self.undo_stack.pop(0)
         self.redo_stack.clear()
-        self.redraw(); self.status.set("Point edit applied.")
+        self.update_selected_editor()
+        self.redraw(); self.status.set(f"Point edit applied at ({x:g}, {y:g}) m.")
 
     def save_project_dialog(self):
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Grid project", "*.json")], initialfile=f"{self.project.grid.map_name}.grid.json")
@@ -4717,14 +5566,12 @@ class GridMapEditorApp:
         try:
             loaded_project = self.rmf_maps.load_project(Path(path))
             self.push_undo(); self.project = loaded_project
-            if not self.project.attribute_catalog:
-                self.project.attribute_catalog = self.attributes.serialize_catalog(
-                    self.attributes.starter_catalog()
-                )
             self.selected = None; self.map_name.set(self.project.grid.map_name); self.level_name.set(self.project.grid.level_name)
             self.width.set(str(self.project.grid.width_m)); self.length.set(str(self.project.grid.length_m)); self.spacing.set(str(self.project.grid.spacing_m))
             self.spacing_y.set(str(self.project.grid.spacing_y_m))
             self.sync_grid_storage_controls()
+            self.sync_grid_warehouse_storage_controls()
+            self.sync_grid_sku_attribute_controls()
             self.update_grid_zone_summary()
             self.update_selected_editor(); self.redraw(); self.status.set(f"Project loaded: {path}")
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc: messagebox.showerror("Load failed", str(exc))
@@ -4735,7 +5582,7 @@ class GridMapEditorApp:
             try:
                 self.project.validate(); self.rmf_maps.export_building(self.project, Path(path))
                 self.status.set(f"RMF map exported: {path}")
-                messagebox.showinfo("Export complete", f"Generated {self.project.grid.vertex_count:,} vertices and {self.project.grid.edge_count:,} bidirectional edges.\n\n{path}")
+                messagebox.showinfo("Export complete", f"Generated {self.project.vertex_count:,} vertices and {self.project.edge_count:,} bidirectional edges.\n\n{path}")
             except (OSError, ValueError) as exc: messagebox.showerror("Export failed", str(exc))
 
 

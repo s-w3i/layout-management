@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+from collections import Counter
+from dataclasses import replace
 import heapq
 import math
 import re
@@ -10,6 +12,8 @@ from pathlib import Path
 
 from .affinity import AffinityAnalysis
 from .attributes import (
+    AttributeDefinition,
+    OVERSIZE_CAPABLE_KEY,
     PHYSICAL_ATTRIBUTE_KEYS,
     PHYSICAL_WEIGHT_KEY,
     StorageAttributeService,
@@ -32,6 +36,7 @@ from .slotting_rules import (
     apply_rack_frequency_ranks,
     candidate_sort_key,
     physical_allocation_bucket,
+    planned_storage_type,
     rack_frequency_class,
     required_horizontal_slot_span,
     required_slot_footprint,
@@ -92,33 +97,235 @@ class SlottingService:
                 ratios.append(real_distance / drawing_distance)
         return sorted(ratios)[len(ratios) // 2] if ratios else 1.0
 
+    SKU_ATTRIBUTE_COLUMN_ALIASES = {
+        "length": "max_item_length",
+        "width": "max_item_width",
+        "height": "max_item_height",
+        "weight": "max_item_weight",
+        "chilled_required": "chilled",
+    }
+
+    @classmethod
+    def sku_attribute_key(cls, column: str) -> str:
+        key = str(column).strip().lower()
+        if key.startswith("req_"):
+            key = key[4:]
+        return cls.SKU_ATTRIBUTE_COLUMN_ALIASES.get(key, key)
+
+    @staticmethod
+    def infer_attribute_definition(
+        key: str, raw_values: list[str], hierarchy_level: int | None = None
+    ) -> AttributeDefinition:
+        boolean_tokens = {"true", "false", "yes", "no", "y", "n", "1", "0"}
+        lowered = {value.lower() for value in raw_values}
+        label = key.replace("_", " ").title()
+        if key in PHYSICAL_ATTRIBUTE_KEYS:
+            definition = AttributeDefinition(
+                key, label, "number", "capacity",
+                (
+                    "source weight unit"
+                    if key == PHYSICAL_WEIGHT_KEY else "source length unit"
+                ),
+            )
+        elif raw_values and lowered.issubset(boolean_tokens):
+            definition = AttributeDefinition(
+                key, label, "boolean", "exact",
+                hierarchy_level=hierarchy_level,
+            )
+        else:
+            if not raw_values:
+                raise ValueError(
+                    f"cannot infer attribute '{key}' because its column is empty"
+                )
+            raise ValueError(
+                f"attribute '{key}' must contain Boolean true/false values; "
+                "only length, width, height, and weight may be numeric"
+            )
+        definition.validate()
+        return definition
+
+    def inspect_sku_attribute_csv(
+        self,
+        path: Path,
+        attribute_catalog=None,
+        combination_attribute_keys: list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[dict[str, AttributeDefinition], dict]:
+        """Infer custom requirement definitions and summarize their values."""
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        if not rows or "sku" not in rows[0]:
+            raise ValueError("SKU attributes CSV must contain a sku column")
+        catalog = self.attributes.normalize_catalog(attribute_catalog)
+        columns: dict[str, str] = {}
+        for column in rows[0]:
+            if not column or str(column).strip().lower() == "sku":
+                continue
+            key = self.sku_attribute_key(column)
+            if key in columns.values():
+                raise ValueError(
+                    f"SKU attributes CSV maps more than one column to '{key}'"
+                )
+            columns[str(column)] = key
+        if not columns:
+            raise ValueError("SKU attributes CSV contains no attribute columns")
+
+        hierarchy_level = 0
+        for column, key in columns.items():
+            level = None
+            if key not in PHYSICAL_ATTRIBUTE_KEYS and key != OVERSIZE_CAPABLE_KEY:
+                hierarchy_level += 1
+                level = min(hierarchy_level, 2)
+            if key in catalog:
+                if catalog[key].hierarchy_level is None and level is not None:
+                    catalog[key] = replace(
+                        catalog[key], hierarchy_level=level
+                    )
+                continue
+            raw_values = [
+                str(row.get(column, "")).strip()
+                for row in rows
+                if str(row.get(column, "")).strip()
+            ]
+            catalog[key] = self.infer_attribute_definition(
+                key, raw_values, level
+            )
+
+        sku_ids = [str(row.get("sku", "")).strip() for row in rows]
+        if any(not sku for sku in sku_ids):
+            raise ValueError("SKU attributes CSV contains a blank SKU")
+        if len(set(sku_ids)) != len(sku_ids):
+            raise ValueError("SKU attributes CSV contains duplicate SKU values")
+        summary_attributes = {}
+        parsed_rows: list[dict] = [dict() for _row in rows]
+        for column, key in columns.items():
+            definition = catalog[key]
+            parsed_values = []
+            for row_number, row in enumerate(rows, start=2):
+                raw = row.get(column)
+                if raw is None or str(raw).strip() == "":
+                    continue
+                try:
+                    parsed = self.attributes.parse_value(definition, raw)
+                    parsed_values.append(parsed)
+                    parsed_rows[row_number - 2][key] = parsed
+                except ValueError as exc:
+                    raise ValueError(
+                        f"SKU attributes CSV row {row_number}: {exc}"
+                    ) from exc
+            unique_values = sorted({str(value) for value in parsed_values})
+            summary_attributes[key] = {
+                "label": definition.label,
+                "value_type": definition.value_type,
+                "match_rule": definition.match_rule,
+                "hierarchy_level": definition.hierarchy_level,
+                "values": unique_values[:20],
+                "distinct_count": len(unique_values),
+                "populated_count": len(parsed_values),
+            }
+            if definition.value_type == "number" and parsed_values:
+                numeric = [float(value) for value in parsed_values]
+                summary_attributes[key]["minimum"] = min(numeric)
+                summary_attributes[key]["maximum"] = max(numeric)
+
+        available_boolean_keys = sorted(
+            (
+                key for key in columns.values()
+                if key != OVERSIZE_CAPABLE_KEY
+                and catalog[key].value_type == "boolean"
+            ),
+            key=lambda key: (
+                catalog[key].hierarchy_level is None,
+                catalog[key].hierarchy_level or 10**9,
+                list(columns.values()).index(key),
+            ),
+        )
+        if combination_attribute_keys is None:
+            boolean_keys = available_boolean_keys
+        else:
+            requested = list(dict.fromkeys(combination_attribute_keys))
+            unavailable = sorted(set(requested) - set(available_boolean_keys))
+            if unavailable:
+                raise ValueError(
+                    "overlay grouping attributes are unavailable or not Boolean: "
+                    + ", ".join(unavailable)
+                )
+            requested_set = set(requested)
+            boolean_keys = [
+                key for key in available_boolean_keys if key in requested_set
+            ]
+        physical_enabled = self.attributes.has_physical_catalog(catalog)
+        combinations = Counter()
+        for requirements in parsed_rows:
+            storage_type = planned_storage_type(
+                self.attributes.physical_profile(requirements),
+                physical_enabled,
+            )
+            signature = tuple(requirements.get(key) for key in boolean_keys)
+            combinations[(storage_type, signature)] += 1
+        combination_summary = []
+        for (storage_type, signature), count in sorted(
+            combinations.items(),
+            key=lambda item: (item[0][0], tuple(str(value) for value in item[0][1])),
+        ):
+            combination_summary.append({
+                "storage_type": storage_type,
+                "attributes": dict(zip(boolean_keys, signature)),
+                "sku_count": count,
+            })
+        return catalog, {
+            "sku_count": len(rows),
+            "attributes": summary_attributes,
+            "available_combination_attributes": available_boolean_keys,
+            "combination_attributes": boolean_keys,
+            "attribute_combinations": combination_summary,
+        }
+
+    def load_sku_attribute_requirements(
+        self, path: Path, known_skus: set[str], attribute_catalog=None
+    ) -> dict[str, dict]:
+        catalog, _summary = self.inspect_sku_attribute_csv(
+            path, attribute_catalog
+        )
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        columns = {
+            column: self.sku_attribute_key(column)
+            for column in rows[0]
+            if column and str(column).strip().lower() != "sku"
+        }
+        values: dict[str, dict] = {}
+        for row_number, row in enumerate(rows, start=2):
+            sku = str(row.get("sku", "")).strip()
+            if sku not in known_skus:
+                raise ValueError(f"SKU attributes CSV references unknown SKU: {sku}")
+            requirements = {}
+            for column, key in columns.items():
+                raw = row.get(column)
+                if raw is None or str(raw).strip() == "":
+                    continue
+                try:
+                    requirements[key] = self.attributes.parse_value(
+                        catalog[key], raw
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"SKU attributes CSV row {row_number}: {exc}"
+                    ) from exc
+            values[sku] = requirements
+        return values
+
     def load_chilled_requirements(
         self, path: Path, known_skus: set[str]
     ) -> dict[str, bool]:
-        with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            rows = list(csv.DictReader(stream))
-        required = {"sku", "chilled_required"}
-        if not rows or not required.issubset(rows[0]):
-            raise ValueError(
-                "chilled SKU CSV must contain: sku, chilled_required"
-            )
-        chilled_definition = self.attributes.starter_catalog()["chilled"]
-        values: dict[str, bool] = {}
-        for row_number, row in enumerate(rows, start=2):
-            sku = str(row.get("sku", "")).strip()
-            if not sku:
-                raise ValueError(f"chilled SKU CSV row {row_number}: SKU is blank")
-            if sku in values:
-                raise ValueError(f"chilled SKU CSV contains duplicate SKU: {sku}")
-            if sku not in known_skus:
-                raise ValueError(f"chilled SKU CSV references unknown SKU: {sku}")
-            try:
-                values[sku] = self.attributes.parse_value(
-                    chilled_definition, row.get("chilled_required")
-                )
-            except ValueError as exc:
-                raise ValueError(f"chilled SKU CSV row {row_number}: {exc}") from exc
-        return values
+        """Backward-compatible reader for the former chilled-only CSV."""
+        values = self.load_sku_attribute_requirements(
+            path, known_skus, None
+        )
+        return {
+            sku: requirements["chilled"]
+            for sku, requirements in values.items()
+            if "chilled" in requirements
+        }
 
     def load_velocity(
         self,
@@ -132,22 +339,52 @@ class SlottingService:
         if not rows or not required.issubset(rows[0]):
             raise ValueError(f"SKU CSV must contain: {', '.join(sorted(required))}")
         catalog = self.attributes.normalize_catalog(attribute_catalog)
-        unknown_columns = sorted(
-            column
-            for column in rows[0]
-            if column.startswith("req_") and column[4:] not in catalog
+        requirement_columns = [
+            column for column in rows[0] if column.startswith("req_")
+        ]
+        hierarchy_level = max(
+            (
+                definition.hierarchy_level or 0
+                for definition in catalog.values()
+            ),
+            default=0,
         )
-        if unknown_columns:
-            raise ValueError(
-                "unknown SKU requirement column(s): " + ", ".join(unknown_columns)
+        for column in requirement_columns:
+            key = self.sku_attribute_key(column)
+            level = None
+            if key not in PHYSICAL_ATTRIBUTE_KEYS and key != OVERSIZE_CAPABLE_KEY:
+                hierarchy_level += 1
+                level = hierarchy_level
+            if key in catalog:
+                if catalog[key].hierarchy_level is None and level is not None:
+                    catalog[key] = replace(
+                        catalog[key], hierarchy_level=level
+                    )
+                continue
+            raw_values = [
+                str(row.get(column, "")).strip()
+                for row in rows
+                if str(row.get(column, "")).strip()
+            ]
+            catalog[key] = self.infer_attribute_definition(
+                key, raw_values, level
             )
+        if chilled_path is not None:
+            catalog, _attribute_summary = self.inspect_sku_attribute_csv(
+                chilled_path, catalog
+            )
+        if isinstance(attribute_catalog, dict) and catalog is not attribute_catalog:
+            attribute_catalog.clear()
+            attribute_catalog.update(catalog)
         sku_ids = [str(row.get("sku", "")).strip() for row in rows]
         if any(not sku for sku in sku_ids):
             raise ValueError("SKU CSV contains a blank SKU")
         if len(set(sku_ids)) != len(sku_ids):
             raise ValueError("SKU CSV contains duplicate SKU values")
-        chilled_values = (
-            self.load_chilled_requirements(chilled_path, set(sku_ids))
+        attribute_values = (
+            self.load_sku_attribute_requirements(
+                chilled_path, set(sku_ids), catalog
+            )
             if chilled_path is not None
             else None
         )
@@ -166,29 +403,17 @@ class SlottingService:
                             )
                             + " when provided"
                         )
-                if "chilled" in catalog:
-                    raw_chilled = row.get("req_chilled")
-                    velocity_has_chilled = (
-                        raw_chilled is not None and str(raw_chilled).strip() != ""
-                    )
-                    file_value = (
-                        chilled_values.get(sku_ids[row_number - 2], False)
-                        if chilled_values is not None
-                        else None
-                    )
-                    if (
-                        file_value is not None
-                        and velocity_has_chilled
-                        and requirements.get("chilled") != file_value
-                    ):
+                external = (
+                    attribute_values.get(sku_ids[row_number - 2], {})
+                    if attribute_values is not None else {}
+                )
+                for key, file_value in external.items():
+                    if key in requirements and requirements[key] != file_value:
                         raise ValueError(
-                            "conflicting chilled requirement between velocity and "
-                            "chilled CSV"
+                            f"conflicting {key} requirement between velocity and "
+                            "SKU attributes CSV"
                         )
-                    if file_value is not None:
-                        requirements["chilled"] = file_value
-                    elif not velocity_has_chilled:
-                        requirements["chilled"] = False
+                    requirements[key] = file_value
                 row["sku_requirements"] = requirements
                 if self.attributes.has_physical_catalog(catalog):
                     profile = self.attributes.physical_profile(requirements)
@@ -365,7 +590,9 @@ class SlottingService:
         strict_compatibility: bool = False,
         storage_layout=None,
         ergonomic_weight_heuristic: bool = True,
-        auto_plan_oversize: bool = True,
+        auto_plan_oversize: bool = False,
+        ctbsa_target_racks: dict[str, str] | None = None,
+        ctbsa_rank_by_sku: dict[str, int] | None = None,
     ) -> tuple[list[dict], dict]:
         parameters = locals()
         service = parameters.pop("self")
@@ -392,7 +619,7 @@ class SlottingService:
         strict_compatibility: bool = False,
         storage_layout=None,
         ergonomic_weight_heuristic: bool = True,
-        auto_plan_oversize: bool = True,
+        auto_plan_oversize: bool = False,
     ) -> tuple[list[dict], dict]:
         parameters = locals()
         service = parameters.pop("self")

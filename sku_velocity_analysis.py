@@ -137,7 +137,7 @@ def classify_physical(requirements: dict[str, float | None]) -> tuple[str, str]:
     usable = {
         key: value for key, value in requirements.items() if value is not None
     }
-    profile = StorageAttributeService.physical_profile(
+    profile = StorageAttributeService().physical_profile(
         usable, STANDARD_STORAGE_DEFAULTS
     )
     return profile["data_status"], profile["storage_class"]

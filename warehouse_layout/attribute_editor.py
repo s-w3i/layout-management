@@ -9,9 +9,9 @@ from tkinter import messagebox, ttk
 from .attributes import (
     AttributeDefinition,
     CORE_ATTRIBUTE_KEYS,
-    MATCH_RULES,
+    OVERSIZE_CAPABLE_KEY,
+    PHYSICAL_ATTRIBUTE_KEYS,
     StorageAttributeService,
-    VALUE_TYPES,
 )
 
 
@@ -45,6 +45,7 @@ class HierarchyAttributeEditor(tk.Toplevel):
         self.attribute_match = tk.StringVar(value="exact")
         self.attribute_unit = tk.StringVar()
         self.attribute_choices = tk.StringVar()
+        self.attribute_hierarchy = tk.StringVar()
         self.assignment_attribute = tk.StringVar()
         self.assignment_value = tk.StringVar()
         self.selection_status = tk.StringVar(
@@ -96,7 +97,7 @@ class HierarchyAttributeEditor(tk.Toplevel):
         catalog_frame.rowconfigure(0, weight=1)
         self.catalog_tree = ttk.Treeview(
             catalog_frame,
-            columns=("key", "label", "type", "match", "unit"),
+            columns=("key", "label", "type", "match", "unit", "hierarchy"),
             show="headings",
             height=5,
         )
@@ -106,6 +107,7 @@ class HierarchyAttributeEditor(tk.Toplevel):
             "type": "Type",
             "match": "Matching",
             "unit": "Unit",
+            "hierarchy": "Hierarchy level",
         }
         for column in headings:
             self.catalog_tree.heading(column, text=headings[column])
@@ -117,7 +119,6 @@ class HierarchyAttributeEditor(tk.Toplevel):
             ("Key", self.attribute_key),
             ("Label", self.attribute_label),
             ("Unit", self.attribute_unit),
-            ("Choices (comma-separated)", self.attribute_choices),
         )
         for index, (label, variable) in enumerate(fields):
             column = (index % 2) * 3
@@ -134,8 +135,8 @@ class HierarchyAttributeEditor(tk.Toplevel):
         ttk.Combobox(
             catalog_frame,
             textvariable=self.attribute_type,
-            values=VALUE_TYPES,
-            state="readonly",
+            values=("boolean", "number"),
+            state="disabled",
             width=13,
         ).grid(row=3, column=1, sticky="w", pady=3)
         ttk.Label(catalog_frame, text="Matching rule").grid(
@@ -144,19 +145,34 @@ class HierarchyAttributeEditor(tk.Toplevel):
         ttk.Combobox(
             catalog_frame,
             textvariable=self.attribute_match,
-            values=MATCH_RULES,
-            state="readonly",
+            values=("exact", "capacity"),
+            state="disabled",
             width=13,
         ).grid(row=3, column=4, sticky="w", pady=3)
+        ttk.Label(catalog_frame, text="Zone hierarchy level").grid(
+            row=4, column=0, sticky="w", pady=3
+        )
+        ttk.Spinbox(
+            catalog_frame,
+            textvariable=self.attribute_hierarchy,
+            from_=1,
+            to=99,
+            width=8,
+        ).grid(row=4, column=1, sticky="w", pady=3)
+        ttk.Label(
+            catalog_frame,
+            text="Boolean attributes split zones in ascending level order.",
+            foreground="#4d646d",
+        ).grid(row=4, column=2, columnspan=4, sticky="w", padx=(6, 0))
         ttk.Button(
             catalog_frame, text="Add / update", command=self.save_definition
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(7, 2))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(7, 2))
         ttk.Button(
             catalog_frame, text="New", command=self.clear_definition_form
-        ).grid(row=4, column=2, sticky="w", pady=(7, 2))
+        ).grid(row=5, column=2, sticky="w", pady=(7, 2))
         ttk.Button(
             catalog_frame, text="Delete", command=self.delete_definition
-        ).grid(row=4, column=3, sticky="w", pady=(7, 2))
+        ).grid(row=5, column=3, sticky="w", pady=(7, 2))
 
         assignment_frame = ttk.LabelFrame(
             right, text="Local value for selected nodes", padding=8
@@ -237,7 +253,15 @@ class HierarchyAttributeEditor(tk.Toplevel):
 
     def _refresh_catalog(self) -> None:
         self.catalog_tree.delete(*self.catalog_tree.get_children())
-        for key in sorted(self.catalog):
+        ordered_keys = sorted(
+            self.catalog,
+            key=lambda key: (
+                self.catalog[key].hierarchy_level is None,
+                self.catalog[key].hierarchy_level or 10**9,
+                key,
+            ),
+        )
+        for key in ordered_keys:
             definition = self.catalog[key]
             self.catalog_tree.insert(
                 "", "end", iid=key,
@@ -247,6 +271,7 @@ class HierarchyAttributeEditor(tk.Toplevel):
                     definition.value_type,
                     definition.match_rule,
                     definition.unit,
+                    definition.hierarchy_level or "Physical / system",
                 ),
             )
         keys = sorted(self.catalog)
@@ -262,6 +287,7 @@ class HierarchyAttributeEditor(tk.Toplevel):
         self.attribute_match.set("exact")
         self.attribute_unit.set("")
         self.attribute_choices.set("")
+        self.attribute_hierarchy.set("")
 
     def _catalog_selected(self, _event=None) -> None:
         selection = self.catalog_tree.selection()
@@ -274,21 +300,44 @@ class HierarchyAttributeEditor(tk.Toplevel):
         self.attribute_match.set(definition.match_rule)
         self.attribute_unit.set(definition.unit)
         self.attribute_choices.set(", ".join(definition.choices))
+        self.attribute_hierarchy.set(
+            "" if definition.hierarchy_level is None
+            else str(definition.hierarchy_level)
+        )
         self.assignment_attribute.set(definition.key)
 
     def save_definition(self) -> None:
         try:
+            key = self.attribute_key.get().strip()
+            hierarchy_raw = self.attribute_hierarchy.get().strip()
+            if key in PHYSICAL_ATTRIBUTE_KEYS:
+                value_type = "number"
+                match_rule = "capacity"
+                hierarchy_level = None
+            elif key == OVERSIZE_CAPABLE_KEY:
+                value_type = "boolean"
+                match_rule = "exact"
+                hierarchy_level = None
+            else:
+                value_type = "boolean"
+                match_rule = "exact"
+                hierarchy_level = (
+                    int(hierarchy_raw)
+                    if hierarchy_raw else 1 + max(
+                        (
+                            definition.hierarchy_level or 0
+                            for definition in self.catalog.values()
+                        ),
+                        default=0,
+                    )
+                )
             definition = AttributeDefinition(
-                key=self.attribute_key.get().strip(),
+                key=key,
                 label=self.attribute_label.get().strip(),
-                value_type=self.attribute_type.get(),
-                match_rule=self.attribute_match.get(),
+                value_type=value_type,
+                match_rule=match_rule,
                 unit=self.attribute_unit.get().strip(),
-                choices=tuple(
-                    value.strip()
-                    for value in self.attribute_choices.get().split(",")
-                    if value.strip()
-                ),
+                hierarchy_level=hierarchy_level,
             )
             definition.validate()
             old = self.catalog.get(definition.key)

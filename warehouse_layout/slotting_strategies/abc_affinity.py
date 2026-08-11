@@ -169,9 +169,12 @@ class AbcAffinitySlottingStrategy:
                 ergonomic_weight_heuristic=ergonomic_weight_heuristic,
                 auto_plan_oversize=auto_plan_oversize,
             )
+            # Both strategies already use the same shared hard-rule allocator.
+            # Preserve Basic's assignment coverage at every affinity weight;
+            # soft ordering may still select a different feasible SKU when
+            # total capacity is insufficient for the complete input set.
             if (
-                affinity_weight < 1.0
-                and trial_summary["unassigned_count"]
+                trial_summary["unassigned_count"]
                 > baseline_summary["unassigned_count"]
             ):
                 continue
@@ -201,7 +204,8 @@ class AbcAffinitySlottingStrategy:
             })
         if not trials:
             raise ValueError(
-                "no affinity parameter candidate preserved the ABC baseline assignment count"
+                "no affinity parameter candidate preserved the Basic "
+                "hard-rule assignment coverage"
             )
         pair_values = [row["weighted_pair_distance_m"] for row in trials]
         service_values = [row["weighted_service_distance_m"] for row in trials]

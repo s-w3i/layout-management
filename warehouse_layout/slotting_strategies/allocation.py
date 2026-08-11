@@ -13,12 +13,12 @@ from ..attributes import (
     PHYSICAL_DIMENSION_KEYS,
     PHYSICAL_WEIGHT_KEY,
     STANDARD_STORAGE_DEFAULTS,
+    requires_oversize_capable,
 )
 from ..storage_planning import (
     build_dynamic_address,
     combined_occupied_dynamic_address,
     derive_zone_storage_types,
-    plan_storage_zones,
 )
 from ..slotting_rules import (
     allocation_candidate_key,
@@ -33,6 +33,19 @@ from .affinity_support import (
     affinity_placement_order,
     build_affinity_neighbors,
     build_order_membership_masks,
+)
+
+
+SHARED_HARD_RULE_PROFILE = "map_authoritative_warehouse_feasibility/v4"
+SHARED_HARD_RULES = (
+    "configured_handling_unit_and_buffer_capacity",
+    "unique_storage_position_occupancy",
+    "configured_map_attribute_compatibility",
+    "known_oversize_contiguous_footprint",
+    "known_overweight_required_level",
+    "oversize_zone_weight_capacity_from_compatible_sku_data",
+    "warehouse_wide_constrained_inventory_footprint_reservation",
+    "no_automatic_zone_split_or_non_weight_attribute_mutation",
 )
 
 
@@ -59,11 +72,13 @@ def allocate(
     strict_compatibility: bool = False,
     storage_layout=None,
     ergonomic_weight_heuristic: bool = True,
-    auto_plan_oversize: bool = True,
+    auto_plan_oversize: bool = False,
+    ctbsa_target_racks: dict[str, str] | None = None,
+    ctbsa_rank_by_sku: dict[str, int] | None = None,
 ) -> tuple[list[dict], dict]:
     if levels_per_rack < 1 or slots_per_level < 1:
         raise ValueError("levels and slots per level must be at least 1")
-    if strategy not in {"basic", "abc_affinity"}:
+    if strategy not in {"basic", "abc_affinity", "ctbsa"}:
         raise ValueError(f"unsupported slotting strategy: {strategy}")
     if not 0.0 <= affinity_weight <= 1.0:
         raise ValueError("affinity weight must be between 0 and 1")
@@ -118,15 +133,80 @@ def allocate(
     zone_id = zone_id.strip()
     if not zone_id:
         raise ValueError("zone ID cannot be blank")
-    zone_assignments = zone_assignments or {}
+    zone_assignments = dict(zone_assignments or {})
     service.apply_zone_local_aisles(building, racks, zone_assignments, zone_id)
     catalog = service.attributes.normalize_catalog(attribute_catalog)
+    # Map-authoritative mode: zone profiles come only from the saved map.
+    # SKU requirements never create grouping keys or generated subzones.
+    exact_grouping_keys = ()
     valid_paths = service.attributes.hierarchy_paths(
         racks, levels_per_rack, slots_per_level
     )
     local_attributes = service.attributes.validate_location_attributes(
         location_attributes, catalog, valid_paths
     )
+    configured_map_attribute_keys: set[str] = set()
+    configured_zones = {str(rack["zone_id"]) for rack in racks}
+    for configured_zone in configured_zones:
+        effective_zone, _sources = service.attributes.effective_attributes(
+            configured_zone, local_attributes
+        )
+        configured_map_attribute_keys.update(effective_zone)
+
+    auto_adjusted_oversize_zone_weight_capacities: dict[str, dict] = {}
+    if PHYSICAL_WEIGHT_KEY in configured_map_attribute_keys:
+        normalized_sku_requirements = []
+        for sku in sku_rows:
+            requirements = sku.get("sku_requirements")
+            if not isinstance(requirements, dict):
+                requirements = service.attributes.requirements_from_row(
+                    sku, catalog
+                )
+            else:
+                requirements = service.attributes.validate_requirements(
+                    requirements, catalog
+                )
+            normalized_sku_requirements.append(requirements)
+        for configured_zone in sorted(configured_zones):
+            effective_zone, _sources = service.attributes.effective_attributes(
+                configured_zone, local_attributes
+            )
+            if effective_zone.get(OVERSIZE_CAPABLE_KEY) is not True:
+                continue
+            compatible_weights = []
+            for requirements in normalized_sku_requirements:
+                zone_requirements = {
+                    key: value
+                    for key, value in requirements.items()
+                    if key in configured_map_attribute_keys
+                    and key not in PHYSICAL_ATTRIBUTE_KEYS
+                    and key != OVERSIZE_CAPABLE_KEY
+                }
+                if service.attributes.compatibility_issues(
+                    zone_requirements, effective_zone, catalog
+                ):
+                    continue
+                try:
+                    weight = float(requirements.get(PHYSICAL_WEIGHT_KEY, 0))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(weight) and weight > 0:
+                    compatible_weights.append(weight)
+            if not compatible_weights:
+                continue
+            required_weight = max(compatible_weights)
+            current_weight = service.attributes.physical_capacity(
+                effective_zone, PHYSICAL_WEIGHT_KEY
+            )
+            if required_weight <= current_weight:
+                continue
+            local_attributes.setdefault(configured_zone, {})[
+                PHYSICAL_WEIGHT_KEY
+            ] = required_weight
+            auto_adjusted_oversize_zone_weight_capacities[configured_zone] = {
+                "previous_max_item_weight": current_weight,
+                "updated_max_item_weight": required_weight,
+            }
 
     asrs_buffer_coordinates = {
         (
@@ -205,28 +285,19 @@ def allocate(
                 })
 
     physical_enabled = service.attributes.has_physical_catalog(catalog)
-    if auto_plan_oversize and physical_enabled:
-        plan_storage_zones(
-            positions,
-            sku_rows,
-            catalog,
-            service.attributes,
-            levels_per_rack,
-            local_attributes,
+    auto_plan_oversize = False
+    for position in positions:
+        storage_type = (
+            "OVERSIZE"
+            if service.attributes.is_oversize_location(
+                position["effective_location_attributes"]
+            )
+            else "STANDARD"
         )
-    else:
-        for position in positions:
-            storage_type = (
-                "OVERSIZE"
-                if service.attributes.is_oversize_location(
-                    position["effective_location_attributes"]
-                )
-                else "STANDARD"
-            )
-            position["planned_storage_type"] = storage_type
-            position["planned_zone_id"] = (
-                f"{position['zone_id']}_{storage_type}"
-            )
+        position["planned_storage_type"] = storage_type
+        position["planned_zone_id"] = position["zone_id"]
+    for position in positions:
+        position["planned_zone_base_id"] = position["planned_zone_id"]
     # The legacy strict compatibility mode models oversize as a contiguous
     # occupancy requirement instead of a separately planned placement class.
     physical_grouping_enabled = physical_enabled and not strict_compatibility
@@ -241,15 +312,26 @@ def allocate(
         return int(profile["storage_class"] != "STANDARD")
 
     class_rank = {"A": 0, "B": 1, "C": 2}
-    base_sorted_skus = sorted(
-        sku_rows,
-        key=lambda row: (
-            class_rank.get(str(row.get("velocity_class", "")).upper(), 9),
-            physical_group_rank(row),
-            -float(row.get("pick_frequency") or 0),
-            str(row.get("sku", "")),
-        ),
-    )
+    ctbsa_target_racks = dict(ctbsa_target_racks or {})
+    ctbsa_rank_by_sku = dict(ctbsa_rank_by_sku or {})
+    if strategy == "ctbsa":
+        base_sorted_skus = sorted(
+            sku_rows,
+            key=lambda row: (
+                ctbsa_rank_by_sku.get(str(row.get("sku", "")), 10**12),
+                str(row.get("sku", "")),
+            ),
+        )
+    else:
+        base_sorted_skus = sorted(
+            sku_rows,
+            key=lambda row: (
+                class_rank.get(str(row.get("velocity_class", "")).upper(), 9),
+                physical_group_rank(row),
+                -float(row.get("pick_frequency") or 0),
+                str(row.get("sku", "")),
+            ),
+        )
     abc_rank_by_id = {
         id(row): rank for rank, row in enumerate(base_sorted_skus, start=1)
     }
@@ -307,19 +389,252 @@ def allocate(
     if strict_compatibility:
         sorted_skus = sorted(logical_sorted_skus, key=strict_packing_priority)
     elif auto_plan_oversize and physical_enabled:
+        def physical_invariant_order(row):
+            requirements = row.get("sku_requirements")
+            if not isinstance(requirements, dict):
+                requirements = service.attributes.requirements_from_row(
+                    row, catalog
+                )
+            is_exception = (
+                service.attributes.physical_profile(requirements)[
+                    "storage_class"
+                ] != "STANDARD"
+            )
+            # Soft affinity ordering applies only to standard inventory.
+            # Exceptions keep the shared deterministic ABC/physical ordering
+            # used by Basic and by Traffic's feasibility seed.
+            rank = (
+                abc_rank_by_id[id(row)]
+                if is_exception else affinity_rank_by_id[id(row)]
+            )
+            return (is_exception, rank)
+
         sorted_skus = sorted(
             logical_sorted_skus,
-            key=lambda row: (
-                service.attributes.physical_profile(
-                    row.get("sku_requirements")
-                    if isinstance(row.get("sku_requirements"), dict)
-                    else service.attributes.requirements_from_row(row, catalog)
-                )["storage_class"] != "STANDARD",
-                affinity_rank_by_id[id(row)],
-            ),
+            key=physical_invariant_order,
         )
     else:
         sorted_skus = logical_sorted_skus
+
+    def position_key(position: dict) -> tuple[str, int, int]:
+        return (
+            str(position["rack_id"]),
+            int(position["level"]),
+            int(position["slot"]),
+        )
+
+    # Reserve physically constrained inventory before strategy placement.  The
+    # strategy still controls the order and preferred location of ordinary
+    # one-slot SKUs, but cannot consume cells required by an oversize,
+    # overweight, or physically unverified SKU.  This avoids a greedy early
+    # placement making a feasible warehouse layout appear infeasible.
+    position_by_key = {position_key(item): item for item in positions}
+    constrained_records = []
+    for strategy_rank, sku in enumerate(sorted_skus, start=1):
+        requirements = sku.get("sku_requirements")
+        if not isinstance(requirements, dict):
+            requirements = service.attributes.requirements_from_row(sku, catalog)
+        else:
+            requirements = service.attributes.validate_requirements(
+                requirements, catalog
+            )
+        profile = (
+            service.attributes.physical_profile(requirements)
+            if physical_enabled else None
+        )
+        if not profile or not requires_oversize_capable(profile):
+            continue
+        physical_class = str(profile.get("storage_class", "")).upper()
+        overweight = physical_class in {
+            "OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"
+        }
+        known_volumetric_oversize = bool(
+            all(key in profile.get("values", {}) for key in PHYSICAL_DIMENSION_KEYS)
+            and service.attributes.is_volumetric_oversize(profile)
+        )
+        placements = []
+        seen_footprints = set()
+        for candidate in positions:
+            target_rack = ctbsa_target_racks.get(str(sku.get("sku", "")))
+            if target_rack and str(candidate.get("rack_id", "")) != target_rack:
+                continue
+            effective = candidate["effective_location_attributes"]
+            if effective.get(OVERSIZE_CAPABLE_KEY) is not True:
+                continue
+            if (
+                overweight
+                and not profile.get("weight_heuristic_disabled", False)
+                and int(candidate["level"])
+                != overweight_storage_level(levels_per_rack)
+            ):
+                continue
+            scoped_requirements = {
+                key: value for key, value in requirements.items()
+                if key in configured_map_attribute_keys
+            }
+            if service.attributes.hard_compatibility_issues(
+                scoped_requirements, effective, catalog
+            ):
+                continue
+            if PHYSICAL_WEIGHT_KEY in configured_map_attribute_keys:
+                raw_weight = requirements.get(PHYSICAL_WEIGHT_KEY)
+                if raw_weight not in (None, ""):
+                    try:
+                        if float(raw_weight) > service.attributes.physical_capacity(
+                            effective, PHYSICAL_WEIGHT_KEY
+                        ):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+            missing_physical = [
+                key for key in PHYSICAL_ATTRIBUTE_KEYS
+                if key in requirements
+                and key in configured_map_attribute_keys
+                and key not in effective
+            ]
+            if missing_physical:
+                continue
+            footprint = (1, 1)
+            if known_volumetric_oversize and all(
+                key in effective for key in PHYSICAL_DIMENSION_KEYS
+            ):
+                footprint = required_slot_footprint(
+                    requirements,
+                    effective,
+                    levels_per_rack - int(candidate["level"]) + 1,
+                    slots_per_level - int(candidate["slot"]) + 1,
+                )
+                if footprint is None:
+                    continue
+            level_span, slot_span = footprint
+            footprint_keys = tuple(
+                (
+                    str(candidate["rack_id"]),
+                    level_number,
+                    slot_number,
+                )
+                for level_number in range(
+                    int(candidate["level"]),
+                    int(candidate["level"]) + level_span,
+                )
+                for slot_number in range(
+                    int(candidate["slot"]),
+                    int(candidate["slot"]) + slot_span,
+                )
+            )
+            if footprint_keys in seen_footprints or any(
+                key not in position_by_key for key in footprint_keys
+            ):
+                continue
+            occupied = [position_by_key[key] for key in footprint_keys]
+            if any(
+                service.attributes.hard_compatibility_issues(
+                    scoped_requirements,
+                    item["effective_location_attributes"],
+                    catalog,
+                )
+                for item in occupied
+            ):
+                continue
+            if any(
+                service.attributes.physical_capacity(
+                    item["effective_location_attributes"], key
+                )
+                < service.attributes.physical_capacity(effective, key)
+                for item in occupied
+                for key in PHYSICAL_DIMENSION_KEYS
+            ):
+                continue
+            seen_footprints.add(footprint_keys)
+            placements.append(footprint_keys)
+        placements.sort(key=lambda footprint_keys: (
+            float(position_by_key[footprint_keys[0]]["distance_m"]),
+            int(position_by_key[footprint_keys[0]]["rack_rank"]),
+            int(position_by_key[footprint_keys[0]]["level"]),
+            int(position_by_key[footprint_keys[0]]["slot"]),
+        ))
+        constrained_records.append({
+            "row_id": id(sku),
+            "strategy_rank": strategy_rank,
+            "placements": placements,
+            "largest_footprint": max(
+                (len(value) for value in placements), default=0
+            ),
+        })
+
+    plannable_records = [
+        record for record in constrained_records if record["placements"]
+    ]
+    reserved_footprints_by_row_id: dict[int, tuple] = {}
+    occupied_reservations: set[tuple[str, int, int]] = set()
+    search_nodes = 0
+    search_node_limit = 250_000
+
+    def reserve_all(remaining: tuple[dict, ...]) -> bool:
+        nonlocal search_nodes
+        search_nodes += 1
+        if search_nodes > search_node_limit:
+            return False
+        if not remaining:
+            return True
+        viable_by_record = []
+        for record in remaining:
+            viable = [
+                footprint for footprint in record["placements"]
+                if not occupied_reservations.intersection(footprint)
+            ]
+            if not viable:
+                return False
+            viable_by_record.append((len(viable), record, viable))
+        _count, selected, viable = min(
+            viable_by_record,
+            key=lambda value: (
+                value[0],
+                -value[1]["largest_footprint"],
+                value[1]["strategy_rank"],
+            ),
+        )
+        next_remaining = tuple(
+            record for record in remaining if record is not selected
+        )
+        for footprint in viable:
+            occupied_reservations.update(footprint)
+            reserved_footprints_by_row_id[selected["row_id"]] = footprint
+            if reserve_all(next_remaining):
+                return True
+            reserved_footprints_by_row_id.pop(selected["row_id"], None)
+            occupied_reservations.difference_update(footprint)
+        return False
+
+    complete_constrained_plan = reserve_all(tuple(plannable_records))
+    if not complete_constrained_plan:
+        # Deterministic best-effort fallback for genuinely insufficient maps or
+        # unusually large searches: reserve the hardest feasible items first.
+        reserved_footprints_by_row_id.clear()
+        occupied_reservations.clear()
+        fallback_order = sorted(
+            plannable_records,
+            key=lambda record: (
+                len(record["placements"]),
+                -record["largest_footprint"],
+                record["strategy_rank"],
+            ),
+        )
+        for record in fallback_order:
+            footprint = next((
+                value for value in record["placements"]
+                if not occupied_reservations.intersection(value)
+            ), None)
+            if footprint is None:
+                continue
+            reserved_footprints_by_row_id[record["row_id"]] = footprint
+            occupied_reservations.update(footprint)
+    reserved_owner_by_position = {
+        key: row_id
+        for row_id, footprint in reserved_footprints_by_row_id.items()
+        for key in footprint
+    }
+    generated_attribute_zones = {}
     finite_service_distances = [
         float(rack["distance_m"])
         for rack in racks
@@ -349,6 +664,7 @@ def allocate(
         "average_workstation_distance_m", "routing_status",
         "storage_area_type",
         "planned_zone_id", "planned_storage_type",
+        "generated_attribute_zone_id",
         "rack_frequency_rank", "rack_pick_frequency",
         "rack_frequency_share", "rack_cumulative_frequency_share",
         "rack_velocity_class",
@@ -357,6 +673,9 @@ def allocate(
     rack_state: dict[str, dict] = {}
     assigned_affinity_positions: dict[str, dict] = {}
     for placement_rank, sku in enumerate(sorted_skus, start=1):
+        planned_footprint = reserved_footprints_by_row_id.get(id(sku))
+        planned_footprint_set = set(planned_footprint or ())
+        planned_anchor = planned_footprint[0] if planned_footprint else None
         abc_frequency_rank = abc_rank_by_id.get(id(sku), placement_rank)
         affinity_placement_rank = affinity_rank_by_id.get(
             id(sku), placement_rank
@@ -436,6 +755,18 @@ def allocate(
             hard_candidates = []
             hard_issues: list[str] = []
             for index, candidate in enumerate(available_positions):
+                candidate_position_key = position_key(candidate)
+                reservation_owner = reserved_owner_by_position.get(
+                    candidate_position_key
+                )
+                if reservation_owner not in (None, id(sku)):
+                    continue
+                if planned_anchor and candidate_position_key != planned_anchor:
+                    continue
+                effective = dict(candidate["effective_location_attributes"])
+                target_rack = ctbsa_target_racks.get(current_sku)
+                if target_rack and str(candidate.get("rack_id", "")) != target_rack:
+                    continue
                 physical_class = str(profile.get("storage_class", "")).upper()
                 overweight = physical_class in {
                     "OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"
@@ -465,6 +796,19 @@ def allocate(
                     != overweight_storage_level(levels_per_rack)
                 ):
                     continue
+                if (
+                    requires_oversize_capable(profile)
+                    and candidate["effective_location_attributes"].get(
+                        OVERSIZE_CAPABLE_KEY
+                    ) is not True
+                ):
+                    issue = (
+                        "oversize or overweight inventory requires an "
+                        "oversize-capable zone"
+                    )
+                    if issue not in hard_issues:
+                        hard_issues.append(issue)
+                    continue
                 occupied_positions = [candidate]
                 if (
                     auto_plan_oversize
@@ -484,7 +828,13 @@ def allocate(
                         strict_compatibility
                         and profile["data_status"] == "COMPLETE"
                     )
-                    or known_volumetric_oversize
+                    or (
+                        known_volumetric_oversize
+                        and all(
+                            key in candidate["effective_location_attributes"]
+                            for key in PHYSICAL_DIMENSION_KEYS
+                        )
+                    )
                 )
                 if footprint_required:
                     issues = []
@@ -580,13 +930,21 @@ def allocate(
                                     "footprint are smaller than the selected "
                                     "anchor slot"
                                 )
+                            missing_overrides = {}
                             for occupied in occupied_positions:
+                                effective = dict(
+                                    occupied["effective_location_attributes"]
+                                )
+                                scoped_requirements = {
+                                    key: value
+                                    for key, value in requirements.items()
+                                    if key in configured_map_attribute_keys
+                                }
                                 issues.extend(
                                     service.attributes.hard_compatibility_issues(
-                                        requirements,
-                                        occupied[
-                                            "effective_location_attributes"
-                                        ],
+                                        scoped_requirements,
+                                        effective,
+                                        catalog,
                                     )
                                 )
                             if strict_compatibility:
@@ -600,49 +958,101 @@ def allocate(
                                     )
                                 }
                                 for occupied in occupied_positions:
+                                    effective = dict(
+                                        occupied["effective_location_attributes"]
+                                    )
+                                    occupied_requirements = {
+                                        key: value
+                                        for key, value in generic_requirements.items()
+                                        if key in configured_map_attribute_keys
+                                    }
                                     issues.extend(
                                         service.attributes.compatibility_issues(
-                                            generic_requirements,
-                                            occupied[
-                                                "effective_location_attributes"
-                                            ],
+                                            occupied_requirements,
+                                            effective,
                                             catalog,
                                         )
                                     )
                 elif strict_compatibility:
+                    missing_overrides = {}
+                    effective = dict(candidate["effective_location_attributes"])
                     generic_requirements = {
                         key: value for key, value in requirements.items()
                         if key not in PHYSICAL_ATTRIBUTE_KEYS
+                        and key in configured_map_attribute_keys
                     }
                     issues = service.attributes.compatibility_issues(
                         generic_requirements,
-                        candidate["effective_location_attributes"],
+                        effective,
                         catalog,
                     )
                 else:
+                    missing_overrides = {}
+                    effective = dict(candidate["effective_location_attributes"])
+                    scoped_requirements = {
+                        key: value
+                        for key, value in requirements.items()
+                        if key in configured_map_attribute_keys
+                    }
                     issues = service.attributes.hard_compatibility_issues(
-                        requirements, candidate["effective_location_attributes"]
+                        scoped_requirements,
+                        effective,
+                        catalog,
+                    )
+                occupied_position_keys = {
+                    position_key(item) for item in occupied_positions
+                    if item is not None
+                }
+                if any(
+                    reserved_owner_by_position.get(key) not in (None, id(sku))
+                    for key in occupied_position_keys
+                ):
+                    continue
+                if planned_footprint_set and (
+                    occupied_position_keys != planned_footprint_set
+                ):
+                    continue
+                if (
+                    PHYSICAL_WEIGHT_KEY in requirements
+                    and PHYSICAL_WEIGHT_KEY in configured_map_attribute_keys
+                    and PHYSICAL_WEIGHT_KEY in effective
+                    and effective.get(PHYSICAL_WEIGHT_KEY) not in (None, "")
+                ):
+                    try:
+                        weight_exceeds_capacity = (
+                            float(requirements[PHYSICAL_WEIGHT_KEY])
+                            > float(effective[PHYSICAL_WEIGHT_KEY])
+                        )
+                    except (TypeError, ValueError):
+                        weight_exceeds_capacity = True
+                    if weight_exceeds_capacity:
+                        issues.append(
+                            "Maximum item weight exceeds the configured zone capacity"
+                        )
+                missing_physical = [
+                    key for key in PHYSICAL_ATTRIBUTE_KEYS
+                    if key in requirements
+                    and key in configured_map_attribute_keys
+                    and key not in effective
+                ]
+                if missing_physical:
+                    issues.extend(
+                        f"{catalog[key].label}: location value is not defined"
+                        for key in missing_physical
                     )
                 if issues:
                     for issue in issues:
                         if issue not in hard_issues:
                             hard_issues.append(issue)
                     continue
-                overrides = (
-                    {}
-                    if strict_compatibility
-                    else service.attributes.required_local_overrides(
-                        requirements,
-                        candidate["effective_location_attributes"],
-                        catalog,
-                    )
-                )
+                overrides = dict(missing_overrides)
                 if known_volumetric_oversize:
                     # The contiguous footprint satisfies the dimension
                     # requirement. Do not disguise that occupancy by enlarging
                     # a single slot's configured dimensions.
                     for key in PHYSICAL_DIMENSION_KEYS:
                         overrides.pop(key, None)
+                missing_override_keys = set(missing_overrides) & set(overrides)
                 if auto_plan_oversize and exception_inventory:
                     if candidate["effective_location_attributes"].get(
                         OVERSIZE_CAPABLE_KEY
@@ -670,7 +1080,13 @@ def allocate(
                     ergonomic_weight_heuristic,
                     auto_plan_oversize,
                 )
-                if affinity_enabled and affinity_weight >= 1.0:
+                exception_inventory = (
+                    profile["storage_class"] != "STANDARD"
+                )
+                soft_affinity_enabled = (
+                    affinity_enabled and not exception_inventory
+                )
+                if soft_affinity_enabled and affinity_weight >= 1.0:
                     # At the pure-affinity endpoint ABC class must not affect
                     # placement, even for isolated SKUs or affinity ties.
                     candidate_key = (
@@ -682,6 +1098,7 @@ def allocate(
                     candidate,
                     overrides,
                     occupied_positions,
+                    missing_override_keys,
                 ))
             if hard_candidates:
                 baseline_candidate = min(
@@ -695,7 +1112,7 @@ def allocate(
                     if related_sku in assigned_affinity_positions
                 ]
                 if (
-                    affinity_enabled
+                    soft_affinity_enabled
                     and affinity_weight > 0
                     and current_order_mask
                 ):
@@ -722,7 +1139,10 @@ def allocate(
                     )
                     eligible = []
                     for candidate_record in hard_candidates:
-                        key, _index, candidate, _overrides, _occupied = candidate_record
+                        (
+                            key, _index, candidate, _overrides, _occupied,
+                            _missing_override_keys,
+                        ) = candidate_record
                         candidate_service = float(candidate["distance_m"])
                         if (
                             affinity_physical_signature(key)
@@ -851,20 +1271,132 @@ def allocate(
                         affinity_same_bay_fraction = float(
                             same_bay_fractions[selected_number]
                         )
-                _key, selected_index, position, auto_overrides, occupied_positions = (
-                    selected_candidate
-                )
+                (
+                    _key, selected_index, position, auto_overrides,
+                    occupied_positions, missing_override_keys,
+                ) = selected_candidate
                 occupied_ids = {id(item) for item in occupied_positions}
                 available_positions = [
                     item for item in available_positions
                     if id(item) not in occupied_ids
                 ]
                 if auto_overrides:
+                    rack_group_overrides = {
+                        key: value for key, value in auto_overrides.items()
+                        if key in missing_override_keys
+                        and key in exact_grouping_keys
+                    }
+                    if rack_group_overrides:
+                        rack_path = "/".join(
+                            position["storage_location_address"].split("/")[:3]
+                        )
+                        local_attributes.setdefault(rack_path, {}).update(
+                            rack_group_overrides
+                        )
+                        rack_positions = [
+                            item for item in positions
+                            if item["rack_id"] == position["rack_id"]
+                        ]
+                        for rack_position in rack_positions:
+                            address = rack_position[
+                                "storage_location_address"
+                            ]
+                            rack_position[
+                                "effective_location_attributes"
+                            ] = service.attributes.effective_attributes(
+                                address, local_attributes
+                            )[0]
+                        profile_values = {
+                            key: position[
+                                "effective_location_attributes"
+                            ][key]
+                            for key in sorted(exact_grouping_keys)
+                            if key in position[
+                                "effective_location_attributes"
+                            ]
+                        }
+                        parent_zone = str(position["zone_id"])
+                        generated_zone_id = next((
+                            zone_key
+                            for zone_key, definition
+                            in generated_attribute_zones.items()
+                            if definition["parent_zone_id"] == parent_zone
+                            and definition["attributes"] == profile_values
+                        ), "")
+                        if not generated_zone_id:
+                            generated_zone_id = parent_zone + "".join(
+                                f"__L{(catalog[key].hierarchy_level or index):02d}"
+                                f"_{key}_"
+                                + (
+                                    "T" if value is True
+                                    else "F" if value is False else "U"
+                                )
+                                for index, (key, value) in enumerate(
+                                    profile_values.items(), start=1
+                                )
+                            )
+                            generated_attribute_zones[generated_zone_id] = {
+                                "parent_zone_id": parent_zone,
+                                "attributes": dict(profile_values),
+                                "rack_ids": [],
+                                "hierarchy_path": [
+                                    {
+                                        "level": catalog[key].hierarchy_level or index,
+                                        "attribute": key,
+                                        "value": value,
+                                        "zone_id": generated_zone_id,
+                                    }
+                                    for index, (key, value) in enumerate(
+                                        profile_values.items(), start=1
+                                    )
+                                ],
+                            }
+                        generated_racks = generated_attribute_zones[
+                            generated_zone_id
+                        ]["rack_ids"]
+                        if position["rack_id"] not in generated_racks:
+                            generated_racks.append(position["rack_id"])
+                        subzone_suffix = (
+                            generated_zone_id.split(parent_zone, 1)[1]
+                            if generated_zone_id != parent_zone else ""
+                        )
+                        for rack_position in rack_positions:
+                            base_zone = rack_position["planned_zone_base_id"]
+                            rack_position["planned_zone_id"] = (
+                                f"{base_zone}{subzone_suffix}"
+                                if subzone_suffix else base_zone
+                            )
+                            rack_position["generated_attribute_zone_id"] = (
+                                generated_zone_id
+                            )
+                            rack_position["parent_zone_id"] = parent_zone
+                        for assigned_row in output:
+                            if assigned_row.get("rack_id") != position["rack_id"]:
+                                continue
+                            assigned_row["planned_zone_id"] = position[
+                                "planned_zone_id"
+                            ]
+                            assigned_row[
+                                "effective_location_attributes"
+                            ] = service.attributes.effective_attributes(
+                                assigned_row["storage_location_address"],
+                                local_attributes,
+                            )[0]
                     for occupied in occupied_positions:
                         override_path = occupied["storage_location_address"]
-                        local_attributes.setdefault(
-                            override_path, {}
-                        ).update(auto_overrides)
+                        effective_before = occupied[
+                            "effective_location_attributes"
+                        ]
+                        safe_overrides = {
+                            key: value
+                            for key, value in auto_overrides.items()
+                            if key not in rack_group_overrides
+                            if key not in missing_override_keys
+                            or key not in effective_before
+                        }
+                        local_attributes.setdefault(override_path, {}).update(
+                            safe_overrides
+                        )
                         occupied["effective_location_attributes"] = (
                             service.attributes.effective_attributes(
                                 override_path, local_attributes
@@ -976,6 +1508,7 @@ def allocate(
             "physical_missing_data_type": profile.get("missing_data_type", ""),
             "physical_storage_class": profile["storage_class"],
             "physical_missing_fields": profile["missing_fields"],
+            "constrained_feasibility_reserved": bool(planned_footprint),
             "ergonomic_weight_heuristic": ergonomic_preference_enabled,
             "ergonomic_preferred_level": (
                 ergonomic_preferred_level
@@ -1063,6 +1596,9 @@ def allocate(
                 "storage_area_type": position["storage_area_type"],
                 "planned_zone_id": position["planned_zone_id"],
                 "planned_storage_type": position["planned_storage_type"],
+                "generated_attribute_zone_id": position.get(
+                    "generated_attribute_zone_id", position["zone_id"]
+                ),
                 "effective_location_attributes": position[
                     "effective_location_attributes"
                 ],
@@ -1087,6 +1623,73 @@ def allocate(
         )
         output.append(row)
 
+    # Preserve the map's zone IDs and boundaries exactly. Slotting may assign
+    # inventory, but it does not materialize new attribute/storage zones.
+    generated_attribute_zones = {}
+    old_aisle_by_waypoint = {
+        str(position["waypoint"]): str(position["aisle_id"])
+        for position in positions
+    }
+    service.apply_zone_local_aisles(
+        building, racks, zone_assignments, zone_id
+    )
+    aisle_by_waypoint = {
+        str(rack["waypoint"]): str(rack["aisle_id"])
+        for rack in racks
+    }
+    rack_prefix_changes = {}
+    for position in positions:
+        waypoint = str(position["waypoint"])
+        old_aisle = old_aisle_by_waypoint[waypoint]
+        new_aisle = aisle_by_waypoint[waypoint]
+        if old_aisle == new_aisle:
+            continue
+        old_prefix = (
+            f"{position['zone_id']}/{old_aisle}/{position['static_bay_id']}"
+        )
+        new_prefix = (
+            f"{position['zone_id']}/{new_aisle}/{position['static_bay_id']}"
+        )
+        rack_prefix_changes[old_prefix] = new_prefix
+        position["aisle_id"] = new_aisle
+        for field in ("static_address", "storage_location_address"):
+            value = str(position.get(field, ""))
+            if value == old_prefix or value.startswith(old_prefix + "/"):
+                position[field] = new_prefix + value[len(old_prefix):]
+    for old_prefix, new_prefix in rack_prefix_changes.items():
+        for path, values in list(local_attributes.items()):
+            if path == old_prefix or path.startswith(old_prefix + "/"):
+                new_path = new_prefix + path[len(old_prefix):]
+                local_attributes[new_path] = local_attributes.pop(path)
+    for row in output:
+        waypoint = str(row.get("rack_waypoint", ""))
+        if not waypoint or waypoint not in aisle_by_waypoint:
+            continue
+        old_aisle = str(row.get("aisle_id", ""))
+        new_aisle = aisle_by_waypoint[waypoint]
+        if old_aisle == new_aisle:
+            continue
+        old_prefix = f"{row['zone_id']}/{old_aisle}/{row['static_bay_id']}"
+        new_prefix = f"{row['zone_id']}/{new_aisle}/{row['static_bay_id']}"
+
+        def rename_aisle(value):
+            if isinstance(value, str) and (
+                value == old_prefix or value.startswith(old_prefix + "/")
+            ):
+                return new_prefix + value[len(old_prefix):]
+            return value
+
+        row["aisle_id"] = new_aisle
+        for field in ("static_address", "storage_location_address"):
+            row[field] = rename_aisle(row.get(field, ""))
+        for field in (
+            "occupied_static_addresses", "occupied_storage_location_addresses"
+        ):
+            row[field] = [rename_aisle(value) for value in row.get(field, [])]
+        for unit in row.get("occupied_handling_units", []):
+            for field in ("static_address", "storage_location_address"):
+                if field in unit:
+                    unit[field] = rename_aisle(unit[field])
     output.sort(key=lambda row: int(row.get("sku_rank") or 10**9))
     rack_frequency_ranking = apply_rack_frequency_ranks(output)
 
@@ -1129,6 +1732,8 @@ def allocate(
     )
     summary = {
         "strategy": strategy,
+        "hard_rule_profile": SHARED_HARD_RULE_PROFILE,
+        "hard_rules": list(SHARED_HARD_RULES),
         "sku_count": len(sorted_skus),
         "assigned_count": sum(
             row["assignment_status"] == "ASSIGNED" for row in output
@@ -1159,6 +1764,25 @@ def allocate(
         "auto_overridden_slot_count": sum(
             bool(row["auto_attribute_overrides"]) for row in output
         ),
+        "auto_adjusted_oversize_zone_weight_capacity_count": len(
+            auto_adjusted_oversize_zone_weight_capacities
+        ),
+        "auto_adjusted_oversize_zone_weight_capacities": (
+            auto_adjusted_oversize_zone_weight_capacities
+        ),
+        "constrained_inventory_count": len(constrained_records),
+        "reserved_constrained_inventory_count": len(
+            reserved_footprints_by_row_id
+        ),
+        "reserved_constrained_slot_count": len(reserved_owner_by_position),
+        "unreservable_constrained_inventory_count": (
+            len(constrained_records) - len(reserved_footprints_by_row_id)
+        ),
+        "constrained_feasibility_plan_complete": bool(
+            complete_constrained_plan
+            and len(plannable_records) == len(constrained_records)
+        ),
+        "constrained_feasibility_search_nodes": search_nodes,
         "auto_planned_oversize_segment_count": sum(
             storage_type == "OVERSIZE"
             for storage_type in planned_zone_types.values()
@@ -1177,6 +1801,15 @@ def allocate(
         "level_name": level_name,
         "zone_count": len({position["planned_zone_id"] for position in positions}),
         "zone_storage_types": zone_storage_types,
+        "generated_attribute_zones": generated_attribute_zones,
+        "zone_assignments": dict(zone_assignments),
+        "attribute_hierarchy": [
+            {
+                "level": catalog[key].hierarchy_level or index,
+                "attribute": key,
+            }
+            for index, key in enumerate(exact_grouping_keys, start=1)
+        ],
         "ergonomic_weight_heuristic": ergonomic_weight_heuristic,
         "rack_frequency_ranking": rack_frequency_ranking,
     }

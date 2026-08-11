@@ -16,6 +16,7 @@ from .attributes import (
     OVERSIZE_CAPABLE_KEY,
     PHYSICAL_DIMENSION_KEYS,
     PHYSICAL_WEIGHT_KEY,
+    requires_oversize_capable,
 )
 from .traffic import (
     MovementNetwork,
@@ -90,6 +91,18 @@ class _CancellationCallback(cp_model.CpSolverSolutionCallback if cp_model else o
 class GlobalTrafficSlottingService:
     """Globally assign complete units while balancing network and spatial load."""
 
+    LOCATION_FIELDS = (
+        "static_address", "storage_location_address", "buffer_id", "buffer_level",
+        "rmf_grid_address", "zone_id", "aisle_id", "static_bay_id", "rack_id",
+        "rack_waypoint", "pickup_dispenser_id", "rack_vertex_index", "rack_rank",
+        "workstations_evaluated", "average_workstation_distance_m", "routing_status",
+        "storage_area_type", "planned_zone_id", "planned_storage_type",
+        "zone_storage_type", "effective_location_attributes",
+        "auto_attribute_overrides", "occupied_static_addresses",
+        "occupied_storage_location_addresses", "occupied_buffer_ids",
+        "occupied_handling_units",
+    )
+
     def __init__(
         self,
         traffic: TrafficAwareSlottingService | None = None,
@@ -157,24 +170,13 @@ class GlobalTrafficSlottingService:
         if source_shapes != sorted(target_by_shape):
             return False, "AMR shelves have different internal slot shapes"
         catalog = payload.get("attribute_catalog", [])
+        configured_map_attribute_keys = (
+            self.traffic.attributes.configured_zone_attribute_keys(
+                payload.get("location_attributes", {})
+            )
+        )
         for source in source_rows:
             target = target_by_shape[self._shape(source)]
-            source_type = str(
-                source.get("planned_storage_type")
-                or source.get("zone_storage_type")
-                or source.get("storage_area_type")
-                or ""
-            ).upper()
-            target_type = str(
-                target.get("planned_storage_type")
-                or target.get("zone_storage_type")
-                or target.get("storage_area_type")
-                or ""
-            ).upper()
-            if source_type and target_type and source_type != target_type:
-                return False, (
-                    f"AMR shelf segment mismatch: {source_type} to {target_type}"
-                )
             requirements = dict(source.get("sku_requirements") or {})
             generic = {
                 key: value for key, value in requirements.items()
@@ -184,6 +186,19 @@ class GlobalTrafficSlottingService:
                 }
             }
             effective = target.get("effective_location_attributes") or {}
+            profile = self.traffic.attributes.physical_profile(requirements)
+            if (
+                requires_oversize_capable(profile)
+                and effective.get("oversize_capable") is not True
+            ):
+                return False, (
+                    f"SKU {source.get('sku', '')}: oversize or overweight "
+                    "inventory requires an oversize-capable zone"
+                )
+            generic = {
+                key: value for key, value in generic.items()
+                if key in configured_map_attribute_keys
+            }
             issues = self.traffic.attributes.compatibility_issues(
                 generic, effective, catalog
             )
@@ -789,7 +804,7 @@ class GlobalTrafficSlottingService:
                 )
                 row.update({
                     field: copy.deepcopy(target_row.get(field))
-                    for field in self.traffic.LOCATION_FIELDS
+                    for field in self.LOCATION_FIELDS
                 })
                 target_units = row.get("occupied_handling_units") or []
                 relocated_units = []

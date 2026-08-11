@@ -749,7 +749,6 @@ class GlobalTrafficOptimizerTab:
                     ) = full_inputs
                     catalog = self.app.attributes.normalize_catalog(
                         project.attribute_catalog
-                        or self.app.attributes.starter_catalog()
                     )
                     sku_rows = self.app.slotting.load_velocity(
                         velocity_path, catalog, chilled_path

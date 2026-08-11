@@ -17,6 +17,9 @@ DEFAULT_AFFINITY_CACHE = PROJECT_ROOT / ".cache/rmf_grid_map_editor/affinity"
 DEFAULT_AFFINITY_OUTPUT = PROJECT_ROOT / "resources/data/sku_affinity"
 DEFAULT_VELOCITY_INPUT = PROJECT_ROOT / "resources/data/sku_velocity_output/sku_velocity_summary.csv"
 DEFAULT_CHILLED_INPUT = PROJECT_ROOT / "resources/data/demo_chilled_requirements.csv"
+DEFAULT_SKU_ATTRIBUTES_INPUT = (
+    PROJECT_ROOT / "resources/data/medicine_sku_attributes.csv"
+)
 DEFAULT_SLOTTING_OUTPUT = PROJECT_ROOT / "resources/data/basic_slotting_layout.slotting.json"
 DEFAULT_TRAFFIC_INPUT = DEFAULT_AFFINITY_INPUT
 DEFAULT_TRAFFIC_CACHE = PROJECT_ROOT / ".cache/rmf_grid_map_editor/traffic"

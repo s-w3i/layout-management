@@ -19,6 +19,12 @@ PHYSICAL_DIMENSION_KEYS = (
 PHYSICAL_WEIGHT_KEY = "max_item_weight"
 PHYSICAL_ATTRIBUTE_KEYS = (*PHYSICAL_DIMENSION_KEYS, PHYSICAL_WEIGHT_KEY)
 OVERSIZE_CAPABLE_KEY = "oversize_capable"
+OVERSIZE_STORAGE_CLASSES = frozenset({
+    "OVERSIZE",
+    "OVERWEIGHT",
+    "OVERSIZE_AND_OVERWEIGHT",
+    "NON_VOLUMETRIC_DATA",
+})
 CORE_ATTRIBUTE_KEYS = ("chilled", OVERSIZE_CAPABLE_KEY, *PHYSICAL_ATTRIBUTE_KEYS)
 STANDARD_STORAGE_DEFAULTS = {
     "max_item_length": 25.0,
@@ -34,6 +40,11 @@ OVERSIZE_STORAGE_DEFAULTS = {
 }
 
 
+def requires_oversize_capable(profile: dict) -> bool:
+    """Return whether a physical profile needs an exception-storage zone."""
+    return str(profile.get("storage_class", "")).upper() in OVERSIZE_STORAGE_CLASSES
+
+
 @dataclass(frozen=True)
 class AttributeDefinition:
     """Definition shared by locations and SKU requirement columns."""
@@ -44,6 +55,7 @@ class AttributeDefinition:
     match_rule: str = "exact"
     unit: str = ""
     choices: tuple[str, ...] = ()
+    hierarchy_level: int | None = None
 
     def validate(self) -> None:
         if not ATTRIBUTE_KEY_PATTERN.fullmatch(self.key):
@@ -68,6 +80,26 @@ class AttributeDefinition:
             )
         if self.value_type == "choice" and not self.choices:
             raise ValueError(f"choice attribute '{self.key}' must define choices")
+        if self.key in PHYSICAL_ATTRIBUTE_KEYS:
+            if self.value_type != "number" or self.match_rule != "capacity":
+                raise ValueError(
+                    f"physical attribute '{self.key}' must be numeric with "
+                    "capacity matching"
+                )
+            if self.hierarchy_level is not None:
+                raise ValueError(
+                    f"physical attribute '{self.key}' cannot have a zone "
+                    "hierarchy level"
+                )
+        elif self.value_type != "boolean" or self.match_rule != "exact":
+            raise ValueError(
+                f"attribute '{self.key}' must be Boolean with exact matching; "
+                "only length, width, height, and weight may be numeric"
+            )
+        if self.hierarchy_level is not None and self.hierarchy_level < 1:
+            raise ValueError(
+                f"attribute '{self.key}' hierarchy level must be at least 1"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +109,7 @@ class AttributeDefinition:
             "match_rule": self.match_rule,
             "unit": self.unit,
             "choices": list(self.choices),
+            "hierarchy_level": self.hierarchy_level,
         }
 
     @classmethod
@@ -92,6 +125,10 @@ class AttributeDefinition:
                 for choice in value.get("choices", [])
                 if str(choice).strip()
             ),
+            hierarchy_level=(
+                int(value["hierarchy_level"])
+                if value.get("hierarchy_level") not in (None, "") else None
+            ),
         )
         definition.validate()
         return definition
@@ -99,6 +136,27 @@ class AttributeDefinition:
 
 class StorageAttributeService:
     """Build hierarchy paths, resolve inheritance, and match SKU requirements."""
+
+    def __init__(self, standard_storage_defaults: dict[str, Any] | None = None):
+        self.set_standard_storage_defaults(
+            standard_storage_defaults or STANDARD_STORAGE_DEFAULTS
+        )
+
+    def set_standard_storage_defaults(self, values: dict[str, Any]) -> None:
+        if not isinstance(values, dict) or set(values) != set(PHYSICAL_ATTRIBUTE_KEYS):
+            raise ValueError(
+                "standard storage defaults must define length, width, height, and weight"
+            )
+        normalized = {}
+        for key in PHYSICAL_ATTRIBUTE_KEYS:
+            try:
+                value = float(values[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"standard storage {key} must be numeric") from exc
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"standard storage {key} must be greater than zero")
+            normalized[key] = int(value) if value.is_integer() else value
+        self.standard_storage_defaults = normalized
 
     @staticmethod
     def starter_catalog() -> dict[str, AttributeDefinition]:
@@ -134,14 +192,14 @@ class StorageAttributeService:
         definitions = StorageAttributeService.normalize_catalog(catalog)
         return all(key in definitions for key in PHYSICAL_ATTRIBUTE_KEYS)
 
-    @staticmethod
     def physical_profile(
+        self,
         requirements: dict[str, Any] | None,
         standard_defaults: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         """Classify one-unit physical requirements against standard storage."""
         requirements = requirements or {}
-        defaults = standard_defaults or STANDARD_STORAGE_DEFAULTS
+        defaults = standard_defaults or self.standard_storage_defaults
         raw_weight = requirements.get(PHYSICAL_WEIGHT_KEY)
         try:
             weight_heuristic_disabled = (
@@ -333,20 +391,30 @@ class StorageAttributeService:
             )
         return not issues, issues, "COMPATIBLE" if not issues else "INCOMPATIBLE"
 
-    @staticmethod
     def hard_compatibility_issues(
-        requirements: dict[str, Any] | None, effective: dict[str, Any]
+        self,
+        requirements: dict[str, Any] | None,
+        effective: dict[str, Any],
+        catalog=None,
     ) -> list[str]:
-        """Only chilled/ambient separation is a non-overridable allocation rule."""
+        """Enforce every declared non-physical requirement from JSON/CSV."""
         requirements = requirements or {}
+        if catalog is not None:
+            generic_requirements = {
+                key: value for key, value in requirements.items()
+                if key not in PHYSICAL_ATTRIBUTE_KEYS
+            }
+            return self.compatibility_issues(
+                generic_requirements, effective, catalog
+            )
+        # Compatibility fallback for older callers without a catalog.
         if "chilled" not in requirements:
             return []
-        if "chilled" not in effective:
-            return ["Chilled: location value is not defined"]
-        if effective["chilled"] is not requirements["chilled"]:
+        actual_chilled = effective.get("chilled", False)
+        if actual_chilled is not requirements["chilled"]:
             return [
                 f"Chilled: requires {requirements['chilled']}, "
-                f"location is {effective['chilled']}"
+                f"location is {actual_chilled}"
             ]
         return []
 
@@ -397,7 +465,11 @@ class StorageAttributeService:
             definition = definitions.get(key)
             if definition is None:
                 continue
-            actual = effective.get(key)
+            actual = (
+                effective.get(key, False)
+                if definition.value_type == "boolean"
+                else effective.get(key)
+            )
             if key in PHYSICAL_ATTRIBUTE_KEYS and actual in (None, ""):
                 continue
             if definition.match_rule == "capacity":
@@ -410,6 +482,30 @@ class StorageAttributeService:
             if not satisfied:
                 overrides[key] = required
         return overrides
+
+    def missing_location_overrides(
+        self,
+        requirements: dict[str, Any] | None,
+        effective: dict[str, Any],
+        catalog,
+    ) -> dict[str, Any]:
+        """Generate values only for declared requirements that are undefined.
+
+        Existing effective values are hard constraints.  This method therefore
+        never replaces an inherited or local value, even when it is
+        incompatible; the normal compatibility check reports that mismatch.
+        """
+        definitions = self.normalize_catalog(catalog)
+        return {
+            key: required
+            for key, required in (requirements or {}).items()
+            if key in definitions
+            and key not in effective
+            and not (
+                definitions[key].value_type == "boolean"
+                and required is False
+            )
+        }
 
     @staticmethod
     def normalize_catalog(
@@ -438,7 +534,16 @@ class StorageAttributeService:
     @classmethod
     def serialize_catalog(cls, catalog) -> list[dict[str, Any]]:
         normalized = cls.normalize_catalog(catalog)
-        return [normalized[key].to_dict() for key in sorted(normalized)]
+        return [
+            definition.to_dict()
+            for definition in sorted(
+                normalized.values(),
+                key=lambda definition: (
+                    definition.hierarchy_level is None,
+                    definition.hierarchy_level or 10**9,
+                ),
+            )
+        ]
 
     @staticmethod
     def hierarchy_paths(
@@ -483,6 +588,18 @@ class StorageAttributeService:
                 effective[key] = value
                 sources[key] = ancestor
         return effective, sources
+
+    @staticmethod
+    def configured_zone_attribute_keys(
+        location_attributes: dict[str, dict[str, Any]] | None,
+    ) -> set[str]:
+        """Return attributes explicitly configured on at least one zone root."""
+        return {
+            str(key)
+            for path, values in (location_attributes or {}).items()
+            if "/" not in str(path)
+            for key in values
+        }
 
     @staticmethod
     def parse_value(definition: AttributeDefinition, raw: Any) -> Any:
@@ -578,9 +695,15 @@ class StorageAttributeService:
                 issues.append(f"unknown requirement '{key}'")
                 continue
             if key not in effective:
-                issues.append(f"{definition.label}: location value is not defined")
-                continue
-            actual = effective[key]
+                if definition.value_type == "boolean":
+                    actual = False
+                else:
+                    issues.append(
+                        f"{definition.label}: location value is not defined"
+                    )
+                    continue
+            else:
+                actual = effective[key]
             if key in PHYSICAL_ATTRIBUTE_KEYS and actual in (None, ""):
                 continue
             if definition.match_rule == "capacity":
@@ -615,7 +738,12 @@ class StorageAttributeService:
             if definition is None:
                 issues.append(f"Unknown requirement: {key}")
                 continue
-            values = [location[key] for location in locations if key in location]
+            if definition.value_type == "boolean":
+                values = [location.get(key, False) for location in locations]
+            else:
+                values = [
+                    location[key] for location in locations if key in location
+                ]
             missing = len(locations) - len(values)
             unit = f" {definition.unit}" if definition.unit else ""
             if definition.match_rule == "capacity" and values:

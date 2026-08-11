@@ -14,22 +14,23 @@ from typing import Callable
 
 import numpy as np
 
-from .affinity import AffinityAnalysis, AffinityDataset
+from .affinity import AffinityAnalysis, AffinityDataset, AffinityService
 from .attributes import (
     PHYSICAL_ATTRIBUTE_KEYS,
     PHYSICAL_DIMENSION_KEYS,
     STANDARD_STORAGE_DEFAULTS,
     StorageAttributeService,
+    requires_oversize_capable,
 )
 from .config import (
     LEGACY_PROJECT_SCHEMA,
     PROJECT_SCHEMA,
     SLOTTING_SCHEMA,
 )
-from .domain import GridProject
+from .ctbsa import CtbsaParameters, CtbsaPlacementPlanner
+from .domain import GridProject, StorageLayout
 from .slotting import SlottingService
-from .slotting_rules import overweight_storage_level, planned_storage_type
-from .storage_planning import combined_occupied_dynamic_address
+from .slotting_rules import overweight_storage_level
 
 
 NETWORK_SCHEMA = "warehouse_movement_network/v1"
@@ -37,6 +38,7 @@ TRAFFIC_EXPORT_SCHEMA = "traffic_aware_slotting_analysis/v1"
 
 ProgressCallback = Callable[[int, int, str], None]
 CancelCallback = Callable[[], bool]
+AssignmentCallback = Callable[[dict], None]
 
 
 class TrafficCancelledError(RuntimeError):
@@ -182,27 +184,17 @@ class TrafficPipelineResult:
 
 
 class TrafficAwareSlottingService:
-    """Analyze expected traffic and reposition complete handling units."""
-
-    LOCATION_FIELDS = (
-        "static_address", "storage_location_address", "buffer_id", "buffer_level",
-        "rmf_grid_address", "zone_id", "aisle_id", "static_bay_id", "rack_id",
-        "rack_waypoint", "pickup_dispenser_id", "rack_vertex_index", "rack_rank",
-        "workstations_evaluated", "average_workstation_distance_m", "routing_status",
-        "storage_area_type", "planned_zone_id", "planned_storage_type",
-        "zone_storage_type", "effective_location_attributes",
-        "auto_attribute_overrides", "occupied_static_addresses",
-        "occupied_storage_location_addresses", "occupied_buffer_ids",
-        "occupied_handling_units",
-    )
+    """Run C&TBSA SKU clustering and static expected-flow analysis."""
 
     def __init__(
         self,
         attributes: StorageAttributeService | None = None,
         slotting: SlottingService | None = None,
+        ctbsa_parameters: CtbsaParameters | None = None,
     ):
         self.attributes = attributes or StorageAttributeService()
         self.slotting = slotting or SlottingService(attributes=self.attributes)
+        self.default_ctbsa_parameters = ctbsa_parameters or CtbsaParameters()
 
     @staticmethod
     def _typed(value, default=None):
@@ -642,6 +634,9 @@ class TrafficAwareSlottingService:
             return False, "handling units have different slot capacities or shapes"
         catalog = payload.get("attribute_catalog", [])
         local = payload.get("location_attributes", {})
+        configured_map_attribute_keys = (
+            self.attributes.configured_zone_attribute_keys(local)
+        )
         if not self.attributes.has_physical_catalog(catalog):
             return False, "physical capacity definitions are unavailable"
         for row in source_rows:
@@ -649,6 +644,7 @@ class TrafficAwareSlottingService:
             missing = [key for key in PHYSICAL_ATTRIBUTE_KEYS if key not in requirements]
             if missing:
                 return False, f"SKU {row.get('sku', '')} has incomplete physical requirements"
+            profile = self.attributes.physical_profile(requirements)
             shape = (
                 int(row.get("storage_level") or 1),
                 int(row.get("storage_slot") or 1),
@@ -662,22 +658,6 @@ class TrafficAwareSlottingService:
             ]
             if len(target_addresses) != shape[2]:
                 return False, "target multi-slot reservation is incomplete"
-            profile = self.attributes.physical_profile(requirements)
-            required_storage_type = planned_storage_type(profile)
-            target_storage_type = str(
-                target.get("planned_storage_type")
-                or target.get("zone_storage_type")
-                or target.get("storage_area_type")
-                or ""
-            ).upper()
-            if (
-                target_storage_type
-                and target_storage_type != required_storage_type
-            ):
-                return False, (
-                    f"SKU {row.get('sku', '')}: {required_storage_type} inventory "
-                    f"cannot move into a {target_storage_type} segment"
-                )
             for target_address in target_addresses:
                 effective, _sources = self.attributes.effective_attributes(
                     str(
@@ -689,10 +669,19 @@ class TrafficAwareSlottingService:
                 generic_requirements = {
                     key: value for key, value in requirements.items()
                     if key not in PHYSICAL_DIMENSION_KEYS
+                    and key in configured_map_attribute_keys
                 }
                 issues = self.attributes.compatibility_issues(
                     generic_requirements, effective, catalog
                 )
+                if (
+                    requires_oversize_capable(profile)
+                    and effective.get("oversize_capable") is not True
+                ):
+                    issues.append(
+                        "oversize or overweight inventory requires an "
+                        "oversize-capable zone"
+                    )
                 target_level_span = int(
                     target.get("occupied_level_span") or shape[3]
                 )
@@ -721,502 +710,270 @@ class TrafficAwareSlottingService:
                     )
         return True, ""
 
-    @staticmethod
-    def _objective(analysis: TrafficAnalysis) -> tuple[float, float, float]:
-        return (
-            float(analysis.metrics["peak_load"]),
-            float(analysis.metrics["p95_load"]),
-            float(analysis.metrics["expected_travel"]),
-        )
 
-    @staticmethod
-    def _load_objective(
-        raw_loads: np.ndarray,
-        capacities: np.ndarray,
-        travel: float,
-        relative_reference: float,
-    ) -> tuple[float, float, float]:
-        normalized = np.divide(
-            raw_loads,
-            capacities,
-            out=raw_loads / max(float(relative_reference), 1e-12),
-            where=np.isfinite(capacities),
-        )
-        return (
-            float(normalized.max()) if len(normalized) else 0.0,
-            float(np.percentile(normalized, 95)) if len(normalized) else 0.0,
-            float(travel),
-        )
-
-    @staticmethod
-    def _unit_contribution(
-        unit: str,
-        node: str,
-        visits: int,
+    def optimize_ctbsa(
+        self,
+        payload: dict,
+        analysis: AffinityAnalysis,
         network: MovementNetwork,
-        route_cache,
-        resource_indices: dict[str, int],
-        cache: dict,
-    ) -> tuple[np.ndarray, float] | None:
-        key = (unit, node)
-        if key in cache:
-            return cache[key]
-        reachable = [
-            endpoint for endpoint in network.endpoints
-            if (node, endpoint.node_id) in route_cache
+        *,
+        parameters: CtbsaParameters | None = None,
+        progress: ProgressCallback | None = None,
+        cancelled: CancelCallback | None = None,
+    ) -> TrafficOptimizationResult:
+        """Run the paper's two-stage C&TBSA method."""
+        baseline_rows = copy.deepcopy(payload.get("assignments") or [])
+        if str(payload.get("handling_unit_type", "")) != "AMR shelf":
+            raise ValueError(
+                "paper-replication C&TBSA currently requires AMR shelf storage"
+            )
+        rack_capacity = payload.get("rack_capacity") or {}
+        levels = int(rack_capacity.get("levels") or 1)
+        slots = int(rack_capacity.get("slots_per_level") or 1)
+        parameters = parameters or self.default_ctbsa_parameters
+        planner = CtbsaPlacementPlanner(self.slotting)
+        plan = planner.build(
+            baseline_rows,
+            payload["building"],
+            analysis,
+            levels_per_rack=levels,
+            slots_per_level=slots,
+            zone_assignments=payload.get("zone_assignments") or {},
+            location_attributes=payload.get("location_attributes") or {},
+            attribute_catalog=payload.get("attribute_catalog"),
+            parameters=parameters,
+            progress=progress,
+            cancelled=cancelled,
+        )
+        optimized_skus = set(plan.optimized_skus)
+        source_rows = [
+            copy.deepcopy(row) for row in baseline_rows
+            if (
+                row.get("assignment_status") == "ASSIGNED"
+                and str(row.get("sku", "")) in optimized_skus
+            )
         ]
-        if not reachable:
-            cache[key] = None
-            return None
-        total_weight = sum(endpoint.weight for endpoint in reachable)
-        loads = np.zeros(len(resource_indices), dtype=float)
-        travel = 0.0
-        for endpoint in reachable:
-            share = endpoint.weight / total_weight
-            distance, _links, resources = route_cache[(node, endpoint.node_id)]
-            flow = visits * share
-            travel += flow * distance
-            for resource in resources:
-                loads[resource_indices[resource]] += flow
-        cache[key] = (loads, travel)
-        return loads, travel
-
-    def _apply_unit_swap(self, rows: list[dict], first: str, second: str, payload: dict) -> None:
-        grouped = {
-            unit: {
-                (int(row.get("storage_level") or 1), int(row.get("storage_slot") or 1)): row
-                for row in rows if str(row.get("handling_unit_id", "")) == unit
-            }
-            for unit in (first, second)
+        storage_layout = (
+            StorageLayout.from_dict(payload["storage_layout"])
+            if payload.get("storage_layout") else None
+        )
+        regenerated, regenerated_summary = self.slotting.generate_basic(
+            copy.deepcopy(payload["building"]),
+            source_rows,
+            levels,
+            slots,
+            "AMR shelf",
+            zone_assignments=payload.get("zone_assignments") or {},
+            attribute_catalog=payload.get("attribute_catalog"),
+            location_attributes=copy.deepcopy(
+                payload.get("location_attributes") or {}
+            ),
+            strategy="ctbsa",
+            strict_compatibility=False,
+            storage_layout=storage_layout,
+            # Paper Stage 2 randomly orders SKUs within the selected area;
+            # ergonomic level preferences would alter that assignment rule.
+            ergonomic_weight_heuristic=False,
+            auto_plan_oversize=True,
+            ctbsa_target_racks=plan.target_racks,
+            ctbsa_rank_by_sku=plan.rank_by_sku,
+        )
+        failed = [
+            row for row in regenerated
+            if row.get("assignment_status") != "ASSIGNED"
+        ]
+        if failed:
+            sample = ", ".join(str(row.get("sku", "")) for row in failed[:5])
+            raise ValueError(
+                f"C&TBSA Stage 2 could not place {len(failed)} SKU(s) in their "
+                f"assigned storage areas: {sample}"
+            )
+        retained_fixed = [
+            copy.deepcopy(row) for row in baseline_rows
+            if (
+                row.get("assignment_status") != "ASSIGNED"
+                or str(row.get("sku", "")) not in optimized_skus
+            )
+        ]
+        result_rows = regenerated + retained_fixed
+        optimized_units = {
+            str(row.get("handling_unit_id", ""))
+            for row in regenerated
+            if row.get("assignment_status") == "ASSIGNED"
         }
-        snapshots = {
-            unit: {
-                shape: {field: row.get(field) for field in self.LOCATION_FIELDS}
-                for shape, row in group.items()
-            }
-            for unit, group in grouped.items()
+        self.validate_result(
+            baseline_rows, result_rows, payload, optimized_units
+        )
+        # Audit the complete final layout, including physical-exception shelves
+        # that C&TBSA deliberately keeps fixed.  Previously only movable units
+        # passed through the post-optimization compatibility check.
+        validation_payload = copy.deepcopy(payload)
+        validation_payload["assignments"] = result_rows
+        final_hard_rule_validation = self.validate_traffic_baseline(
+            validation_payload
+        )
+        for row in result_rows:
+            physical_class = str(
+                row.get("physical_storage_class") or "NOT_EVALUATED"
+            ).upper()
+            missing_data = str(
+                row.get("physical_missing_data_type") or ""
+            ).upper()
+            labels = []
+            if (row.get("sku_requirements") or {}).get("chilled") is True:
+                labels.append("CHILLED")
+            labels.append(missing_data or physical_class)
+            if (
+                physical_class in {"OVERSIZE", "OVERSIZE_AND_OVERWEIGHT"}
+                or int(row.get("occupied_slot_count") or 1) > 1
+            ):
+                labels.append("CONTIGUOUS_FOOTPRINT")
+            if physical_class in {"OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"}:
+                labels.append(
+                    f"REQUIRED_LEVEL_{overweight_storage_level(levels)}"
+                )
+            row["hard_rule_labels"] = list(dict.fromkeys(labels))
+            row["hard_rule_status"] = (
+                "PASSED" if row.get("assignment_status") == "ASSIGNED"
+                else "EXCLUDED_UNASSIGNED"
+            )
+        before_demand = self.build_demand(analysis.dataset, baseline_rows,
+                                          analysis.start_date, analysis.end_date)
+        after_demand = self.build_demand(analysis.dataset, result_rows,
+                                         analysis.start_date, analysis.end_date)
+        route_cache = self._shortest_routes(network)
+        before = self.analyze(
+            baseline_rows, network, before_demand, route_cache=route_cache
+        )
+        after = self.analyze(
+            result_rows,
+            network,
+            after_demand,
+            route_cache=route_cache,
+            relative_reference=float(before.metrics["relative_reference"]),
+        )
+        old_by_sku = {
+            str(row.get("sku", "")): row for row in baseline_rows
+            if row.get("assignment_status") == "ASSIGNED"
         }
-        for source, target in ((first, second), (second, first)):
-            for shape, row in grouped[source].items():
-                row.update(snapshots[target][shape])
-                level, slot = shape
-                source_units = (
-                    snapshots[source][shape].get("occupied_handling_units") or []
-                )
-                target_units = (
-                    snapshots[target][shape].get("occupied_handling_units") or []
-                )
-                relocated_units = []
-                for index, target_location in enumerate(target_units):
-                    location = dict(target_location)
-                    source_unit_id = (
-                        source_units[index].get("handling_unit_id")
-                        if index < len(source_units)
-                        else source
-                    )
-                    location["handling_unit_id"] = source_unit_id
-                    relocated_units.append(location)
-                row["occupied_handling_units"] = relocated_units or [{
-                    "handling_unit_id": source,
-                    "rack_id": row.get("rack_id", ""),
-                    "storage_level": level,
-                    "storage_slot": slot,
-                }]
-                row["dynamic_address"], row["dynamic_address_level"] = self.slotting.build_dynamic_address(
-                    str(row["zone_id"]), str(row["aisle_id"]), str(row["static_bay_id"]),
-                    level, slot, str(row.get("handling_unit_type", "")), source,
-                    buffer_model=bool(payload.get("storage_layout")),
-                )
-                row["occupied_dynamic_address"] = (
-                    combined_occupied_dynamic_address(row)
-                )
-                row["compatibility_status"] = "COMPATIBLE"
-                row["compatibility_issues"] = []
-
-    def _candidate_pairs(
-        self, analysis: TrafficAnalysis, units: list[str], percentile: float
-    ) -> list[tuple[str, str]]:
-        if len(units) < 2:
-            return []
-        threshold = float(np.percentile(
-            [row["normalized_load"] for row in analysis.resources], percentile
-        )) if analysis.resources else 0.0
-        hot_scores = {unit: 0.0 for unit in units}
-        for resource in analysis.resources:
-            if resource["normalized_load"] + 1e-12 < threshold:
+        new_by_sku = {
+            str(row.get("sku", "")): row for row in result_rows
+            if row.get("assignment_status") == "ASSIGNED"
+        }
+        relocations = []
+        for sku in sorted(set(old_by_sku) & set(new_by_sku)):
+            old, new = old_by_sku[sku], new_by_sku[sku]
+            if (
+                str(old.get("rack_id", "")) == str(new.get("rack_id", ""))
+                and int(old.get("storage_level") or 1)
+                == int(new.get("storage_level") or 1)
+                and int(old.get("storage_slot") or 1)
+                == int(new.get("storage_slot") or 1)
+            ):
                 continue
-            for contributor in resource["contributors"]:
-                unit = contributor["handling_unit_id"]
-                if unit in hot_scores:
-                    hot_scores[unit] += contributor["flow"] * resource["normalized_load"]
-        hot = sorted(units, key=lambda unit: (-hot_scores[unit], unit))
-        sample_size = min(len(units), max(2, int(math.ceil(math.sqrt(len(units)) * 4))))
-        hot = hot[:sample_size]
-        pairs = {
-            tuple(sorted((first, second)))
-            for first in hot for second in units if first != second
+            relocations.append({
+                "sku": sku,
+                "handling_unit_id": str(new.get("handling_unit_id", "")),
+                "from_rack": str(old.get("rack_id", "")),
+                "to_rack": str(new.get("rack_id", "")),
+                "from": str(old.get("storage_location_address") or old.get("static_address", "")),
+                "to": str(new.get("storage_location_address") or new.get("static_address", "")),
+            })
+        result_parameters = {
+            **plan.parameters,
+            "optimized_sku_count": len(plan.optimized_skus),
+            "fixed_sku_count": len(plan.fixed_skus),
+            "hard_rule_profile": regenerated_summary.get(
+                "hard_rule_profile", "shared_warehouse_feasibility/v1"
+            ),
+            "hard_rules": regenerated_summary.get("hard_rules", []),
+            "hard_rule_validation": final_hard_rule_validation,
+            "paper_reference": "10.1016/j.cie.2019.106129",
+            "validation_mode": "static_expected_flow_only",
+            "regenerated_summary": regenerated_summary,
+            "clusters": plan.cluster_rows,
         }
-        return sorted(pairs)
-
-    def _feasible_pairs(
-        self,
-        payload: dict,
-        demand: TrafficDemand,
-        candidate_pairs: list[tuple[str, str]] | None = None,
-    ) -> tuple[list[tuple[str, str]], list[dict]]:
-        groups: dict[str, list[dict]] = {}
-        for row in payload["assignments"]:
-            if row.get("assignment_status") == "ASSIGNED" and row.get("handling_unit_id"):
-                groups.setdefault(str(row["handling_unit_id"]), []).append(row)
-        active = sorted(unit for unit in demand.unit_visits if unit in groups)
-        feasible, rejected, eligible = [], [], []
-        for unit in active:
-            incomplete = any(
-                self.attributes.physical_profile(row.get("sku_requirements") or {})[
-                    "data_status"
-                ] != "COMPLETE"
-                for row in groups[unit]
-            )
-            if incomplete:
-                rejected.append({
-                    "handling_unit_id": unit,
-                    "reason": "incomplete physical requirements",
-                })
+        baseline_by_sku = {
+            str(row.get("sku", "")): row for row in baseline_rows
+        }
+        rejected = []
+        for sku in plan.fixed_skus:
+            source = baseline_by_sku.get(str(sku), {})
+            physical_class = str(
+                source.get("physical_storage_class") or "NOT_EVALUATED"
+            ).upper()
+            missing_data = str(
+                source.get("physical_missing_data_type") or ""
+            ).upper()
+            status = str(source.get("assignment_status") or "UNKNOWN")
+            occupied = int(source.get("occupied_slot_count") or 1)
+            if missing_data:
+                display_class = missing_data
+                reason = (
+                    f"{missing_data} · incomplete physical data; fixed outside "
+                    "C&TBSA movement"
+                )
+            elif physical_class == "OVERSIZE":
+                display_class = "OVERSIZE"
+                reason = (
+                    f"OVERSIZE · fixed contiguous footprint ({occupied} slots)"
+                )
+            elif physical_class == "OVERWEIGHT":
+                display_class = "OVERWEIGHT"
+                reason = "OVERWEIGHT · fixed at its hard-rule storage level"
+            elif physical_class == "OVERSIZE_AND_OVERWEIGHT":
+                display_class = "OVERSIZE + OVERWEIGHT"
+                reason = (
+                    f"OVERSIZE + OVERWEIGHT · fixed footprint ({occupied} slots) "
+                    "and required level"
+                )
             else:
-                eligible.append(unit)
-        eligible_set = set(eligible)
-        pairs = (
-            [pair for pair in candidate_pairs or [] if set(pair) <= eligible_set]
-            if candidate_pairs is not None
-            else [
-                (first, second)
-                for index, first in enumerate(eligible)
-                for second in eligible[index + 1:]
-            ]
-        )
-        for first, second in pairs:
-                forward, reason = self._strict_unit_compatibility(groups[first], groups[second], payload)
-                if not forward:
-                    continue
-                reverse, _reason = self._strict_unit_compatibility(groups[second], groups[first], payload)
-                if reverse:
-                    feasible.append((first, second))
-        return feasible, rejected
-
-    @staticmethod
-    def _suggest_hotspot_percentile(resource_values: list[float]) -> float:
-        """Find the empirical knee separating ordinary and high resource load."""
-        values = np.array(sorted(value for value in resource_values if value > 0), dtype=float)
-        if len(values) <= 1 or abs(float(values[-1] - values[0])) <= 1e-12:
-            return 0.0
-        gaps = np.diff(values) / max(float(values[-1] - values[0]), 1e-12)
-        index = int(np.argmax(gaps))
-        return 100.0 * (index + 1) / len(values)
-
-    @staticmethod
-    def _pareto_knee(results):
-        """Select the geometric knee of the non-dominated peak/travel frontier."""
-        ordered = sorted(
-            results,
-            key=lambda result: (
-                result[3]["travel_change_fraction"],
-                result[3]["peak_load"],
-                result[3]["p95_load"],
-                result[3]["relocation_count"],
-            ),
-        )
-        frontier = []
-        best_peak = math.inf
-        for result in ordered:
-            peak = float(result[3]["peak_load"])
-            if peak < best_peak - 1e-12:
-                frontier.append(result)
-                best_peak = peak
-        if len(frontier) <= 2:
-            return min(
-                frontier or ordered,
-                key=lambda result: (
-                    result[3]["peak_load"], result[3]["p95_load"],
-                    result[3]["travel_change_fraction"], result[3]["relocation_count"],
-                ),
+                display_class = physical_class
+                reason = "fixed because its shelf contains a physical exception"
+            if status != "ASSIGNED":
+                reason = f"{reason} · {status}"
+            occupied_address = str(
+                source.get("occupied_dynamic_address")
+                or source.get("storage_location_address")
+                or source.get("static_address")
+                or ""
             )
-        travels = np.array([row[3]["travel_change_fraction"] for row in frontier], dtype=float)
-        peaks = np.array([row[3]["peak_load"] for row in frontier], dtype=float)
-        x = (travels - travels.min()) / max(float(np.ptp(travels)), 1e-12)
-        y = (peaks - peaks.min()) / max(float(np.ptp(peaks)), 1e-12)
-        start = np.array([x[0], y[0]])
-        end = np.array([x[-1], y[-1]])
-        vector = end - start
-        denominator = max(float(np.linalg.norm(vector)), 1e-12)
-        distances = [
-            abs(float(np.cross(vector, np.array([x[index], y[index]]) - start))) / denominator
-            for index in range(len(frontier))
-        ]
-        maximum = max(distances)
-        candidates = [
-            frontier[index] for index, distance in enumerate(distances)
-            if abs(distance - maximum) <= 1e-12
-        ]
-        return min(
-            candidates,
-            key=lambda result: (
-                result[3]["peak_load"], result[3]["p95_load"],
-                result[3]["travel_change_fraction"], result[3]["relocation_count"],
-            ),
+            rejected.append({
+                # Keep this compatibility field as the SKU because older
+                # exported traffic reports used it as their row identifier.
+                "handling_unit_id": str(sku),
+                "sku": str(sku),
+                "shelf_id": str(source.get("handling_unit_id") or ""),
+                "physical_storage_class": display_class,
+                "physical_missing_data_type": missing_data,
+                "assignment_status": status,
+                "location": occupied_address,
+                "reason": reason,
+            })
+        return TrafficOptimizationResult(
+            result_rows, before, after, relocations, rejected,
+            result_parameters, plan.pareto_rows,
         )
-
-    def _optimize_for_cap(
-        self,
-        payload: dict,
-        network: MovementNetwork,
-        demand: TrafficDemand,
-        baseline: TrafficAnalysis,
-        feasible_pairs: list[tuple[str, str]],
-        travel_cap: float,
-        hotspot_percentile: float,
-        route_cache,
-        contribution_cache,
-        cancelled: CancelCallback | None,
-    ) -> tuple[list[dict], TrafficAnalysis, list[dict]]:
-        rows = copy.deepcopy(payload["assignments"])
-        placements = dict(baseline.placements)
-        relative_reference = float(baseline.metrics["relative_reference"])
-        current = self.analyze(
-            rows, network, demand, placements=placements,
-            route_cache=route_cache, relative_reference=relative_reference,
-        )
-        moves: list[dict] = []
-        baseline_travel = float(baseline.metrics["expected_travel"])
-        limit = baseline_travel * (1.0 + max(0.0, travel_cap))
-        units = sorted(demand.unit_visits)
-        resources = network.resources
-        resource_indices = {resource: index for index, resource in enumerate(resources)}
-        capacities = np.array([
-            network.resource_capacities.get(resource, math.nan)
-            for resource in resources
-        ], dtype=float)
-        current_raw = np.array([
-            next(
-                row["load"] for row in current.resources
-                if row["resource_id"] == resource
-            )
-            for resource in resources
-        ], dtype=float)
-        current_travel = float(current.metrics["expected_travel"])
-        for _iteration in range(max(1, int(math.ceil(math.sqrt(len(units)))))):
-            if cancelled and cancelled():
-                raise TrafficCancelledError("Traffic optimization was cancelled")
-            candidate_scope = set(self._candidate_pairs(current, units, hotspot_percentile))
-            best = None
-            for first, second in feasible_pairs:
-                if (first, second) not in candidate_scope:
-                    continue
-                candidate_placements = dict(placements)
-                candidate_placements[first], candidate_placements[second] = (
-                    candidate_placements.get(second), candidate_placements.get(first)
-                )
-                if candidate_placements[first] is None or candidate_placements[second] is None:
-                    continue
-                first_old = self._unit_contribution(
-                    first, placements[first], demand.unit_visits[first], network,
-                    route_cache, resource_indices, contribution_cache,
-                )
-                second_old = self._unit_contribution(
-                    second, placements[second], demand.unit_visits[second], network,
-                    route_cache, resource_indices, contribution_cache,
-                )
-                first_new = self._unit_contribution(
-                    first, candidate_placements[first], demand.unit_visits[first], network,
-                    route_cache, resource_indices, contribution_cache,
-                )
-                second_new = self._unit_contribution(
-                    second, candidate_placements[second], demand.unit_visits[second], network,
-                    route_cache, resource_indices, contribution_cache,
-                )
-                if any(
-                    value is None
-                    for value in (first_old, second_old, first_new, second_new)
-                ):
-                    continue
-                candidate_raw = (
-                    current_raw - first_old[0] - second_old[0]
-                    + first_new[0] + second_new[0]
-                )
-                candidate_travel = (
-                    current_travel - first_old[1] - second_old[1]
-                    + first_new[1] + second_new[1]
-                )
-                if candidate_travel > limit + 1e-9:
-                    continue
-                objective = self._load_objective(
-                    candidate_raw, capacities, candidate_travel,
-                    relative_reference,
-                )
-                if objective >= self._load_objective(
-                    current_raw, capacities, current_travel,
-                    relative_reference,
-                ):
-                    continue
-                key = (*objective, first, second)
-                if best is None or key < best[0]:
-                    best = (
-                        key, first, second, candidate_placements,
-                        candidate_raw, candidate_travel,
-                    )
-            if best is None:
-                break
-            _key, first, second, placements, current_raw, current_travel = best
-            first_rows = [row for row in rows if str(row.get("handling_unit_id", "")) == first]
-            second_rows = [row for row in rows if str(row.get("handling_unit_id", "")) == second]
-            old_first = str(first_rows[0].get("static_bay_id", first_rows[0].get("static_address", "")))
-            old_second = str(second_rows[0].get("static_bay_id", second_rows[0].get("static_address", "")))
-            self._apply_unit_swap(rows, first, second, payload)
-            current = self.analyze(
-                rows, network, demand, placements=placements,
-                route_cache=route_cache, relative_reference=relative_reference,
-            )
-            moves.extend((
-                {"handling_unit_id": first, "from": old_first, "to": old_second, "swap_with": second},
-                {"handling_unit_id": second, "from": old_second, "to": old_first, "swap_with": first},
-            ))
-        final = self.analyze(
-            rows, network, demand, placements=placements,
-            route_cache=route_cache, relative_reference=relative_reference,
-        )
-        return rows, final, moves
 
     def optimize(
         self,
         payload: dict,
+        analysis: AffinityAnalysis,
         network: MovementNetwork,
-        demand: TrafficDemand,
         *,
-        maximum_travel_increase: float | None = None,
-        hotspot_percentile: float | None = None,
+        parameters: CtbsaParameters | None = None,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TrafficOptimizationResult:
-        """Select a deterministic traffic/travel Pareto solution."""
-        route_cache = self._shortest_routes(network)
-        contribution_cache: dict = {}
-        baseline = self.analyze(
-            payload["assignments"], network, demand, route_cache=route_cache
+        """Run the replacement paper-replication C&TBSA optimizer."""
+        return self.optimize_ctbsa(
+            payload,
+            analysis,
+            network,
+            parameters=parameters,
+            progress=progress,
+            cancelled=cancelled,
         )
-        resource_values = [row["normalized_load"] for row in baseline.resources]
-        suggested_percentile = self._suggest_hotspot_percentile(resource_values)
-        selected_percentile = float(
-            suggested_percentile if hotspot_percentile is None else hotspot_percentile
-        )
-        if not 0 <= selected_percentile <= 100:
-            raise ValueError("hotspot percentile must be between 0 and 100")
-        active_units = sorted(demand.unit_visits)
-        # Exhaustive compatibility remains practical for smaller layouts. For
-        # large bin/tote systems, validate the data-derived hotspot candidate
-        # set to avoid quadratic setup time.
-        candidate_pairs = None
-        if len(active_units) > 256:
-            candidate_pairs = self._candidate_pairs(
-                baseline, active_units, selected_percentile
-            )
-        feasible, rejected = self._feasible_pairs(
-            payload, demand, candidate_pairs
-        )
-        if progress:
-            progress(1, 3, f"Validated {len(feasible):,} feasible unit swaps")
-        baseline_travel = float(baseline.metrics["expected_travel"])
-        empirical_deltas = []
-        resources = network.resources
-        resource_indices = {resource: index for index, resource in enumerate(resources)}
-        for first, second in feasible:
-            placements = dict(baseline.placements)
-            if first not in placements or second not in placements:
-                continue
-            first_old = self._unit_contribution(
-                first, placements[first], demand.unit_visits[first], network,
-                route_cache, resource_indices, contribution_cache,
-            )
-            second_old = self._unit_contribution(
-                second, placements[second], demand.unit_visits[second], network,
-                route_cache, resource_indices, contribution_cache,
-            )
-            first_new = self._unit_contribution(
-                first, placements[second], demand.unit_visits[first], network,
-                route_cache, resource_indices, contribution_cache,
-            )
-            second_new = self._unit_contribution(
-                second, placements[first], demand.unit_visits[second], network,
-                route_cache, resource_indices, contribution_cache,
-            )
-            if any(
-                value is None
-                for value in (first_old, second_old, first_new, second_new)
-            ):
-                continue
-            candidate_travel = (
-                baseline_travel - first_old[1] - second_old[1]
-                + first_new[1] + second_new[1]
-            )
-            empirical_deltas.append(max(
-                0.0,
-                (candidate_travel - baseline_travel) / max(baseline_travel, 1e-9),
-            ))
-        if maximum_travel_increase is None:
-            positive = sorted(set(round(value, 8) for value in empirical_deltas if value > 1e-12))
-            if positive:
-                caps = sorted(set(
-                    [0.0] + [float(np.percentile(positive, q)) for q in (25, 50, 75)]
-                ))
-            else:
-                caps = [0.0]
-            parameter_status = "AUTO_SUGGESTED"
-        else:
-            if maximum_travel_increase < 0:
-                raise ValueError("maximum travel increase cannot be negative")
-            caps = [float(maximum_travel_increase)]
-            parameter_status = "USER_ADJUSTED"
-        trials = []
-        results = []
-        for index, cap in enumerate(caps, start=1):
-            if cancelled and cancelled():
-                raise TrafficCancelledError("Traffic optimization was cancelled")
-            rows, analysis, moves = self._optimize_for_cap(
-                payload, network, demand, baseline, feasible, cap,
-                selected_percentile, route_cache, contribution_cache, cancelled,
-            )
-            peak_reduction = baseline.metrics["peak_load"] - analysis.metrics["peak_load"]
-            travel_change = (
-                (analysis.metrics["expected_travel"] - baseline_travel)
-                / max(baseline_travel, 1e-9)
-            )
-            trial = {
-                "maximum_travel_increase": cap,
-                "peak_load": analysis.metrics["peak_load"],
-                "p95_load": analysis.metrics["p95_load"],
-                "travel_change_fraction": travel_change,
-                "peak_reduction": peak_reduction,
-                "relocation_count": len({move["handling_unit_id"] for move in moves}),
-            }
-            trials.append(trial)
-            results.append((rows, analysis, moves, trial))
-            if progress:
-                progress(1 + index, 2 + len(caps), f"Evaluated traffic/travel candidate {index}/{len(caps)}")
-        chosen = self._pareto_knee(results)
-        rows, after, moves, selected_trial = chosen
-        moved_units = {move["handling_unit_id"] for move in moves}
-        self.validate_result(payload["assignments"], rows, payload, moved_units)
-        threshold = float(np.percentile(resource_values, selected_percentile)) if resource_values else 0.0
-        parameters = {
-            "parameter_status": parameter_status,
-            "maximum_travel_increase": selected_trial["maximum_travel_increase"],
-            "hotspot_percentile": selected_percentile,
-            "hotspot_threshold": threshold,
-            "baseline_peak_load": baseline.metrics["peak_load"],
-            "feasible_swap_count": len(feasible),
-            "empirical_candidate_count": len(caps),
-        }
-        if progress:
-            progress(2 + len(caps), 2 + len(caps), "Traffic-aware layout validated")
-        return TrafficOptimizationResult(rows, baseline, after, moves, rejected, parameters, trials)
 
     def validate_result(
         self,
@@ -1227,9 +984,9 @@ class TrafficAwareSlottingService:
     ) -> None:
         if len(original) != len(result):
             raise ValueError("traffic result changed the assignment row count")
-        identity = lambda row: (str(row.get("sku", "")), str(row.get("handling_unit_id", "")))
+        identity = lambda row: str(row.get("sku", ""))
         if sorted(map(identity, original)) != sorted(map(identity, result)):
-            raise ValueError("traffic result changed SKU or handling-unit membership")
+            raise ValueError("C&TBSA result changed the SKU membership")
         addresses = [
             str(address)
             for row in result if row.get("assignment_status") == "ASSIGNED"
@@ -1299,27 +1056,16 @@ class TrafficAwareSlottingService:
             payload.get("attribute_catalog")
         )
         locations = payload.get("location_attributes", {})
+        configured_map_attribute_keys = (
+            self.attributes.configured_zone_attribute_keys(locations)
+        )
         invalid = []
         unverified = 0
         for row in assigned:
             requirements = row.get("sku_requirements") or {}
             profile = self.attributes.physical_profile(requirements)
-            required_storage_type = planned_storage_type(profile)
-            actual_storage_type = str(
-                row.get("planned_storage_type")
-                or row.get("zone_storage_type")
-                or row.get("storage_area_type")
-                or ""
-            ).upper()
-            if actual_storage_type and actual_storage_type != required_storage_type:
-                invalid.append(
-                    f"{row.get('sku', '')}: {required_storage_type} inventory "
-                    f"cannot use a {actual_storage_type} segment"
-                )
-                continue
             if profile["data_status"] != "COMPLETE":
                 unverified += 1
-                continue
             occupied_addresses = row.get("occupied_static_addresses") or [
                 str(row.get("static_address", ""))
             ]
@@ -1335,17 +1081,35 @@ class TrafficAwareSlottingService:
                     locations,
                 )
                 primary_effective = primary_effective or effective
+                configured_requirements = {
+                    key: value for key, value in generic_requirements.items()
+                    if key in configured_map_attribute_keys
+                }
                 issues.extend(self.attributes.compatibility_issues(
-                    generic_requirements, effective, catalog
+                    configured_requirements, effective, catalog
                 ))
+                if (
+                    requires_oversize_capable(profile)
+                    and effective.get("oversize_capable") is not True
+                ):
+                    issues.append(
+                        "oversize or overweight inventory requires an "
+                        "oversize-capable zone"
+                    )
             level_span = int(row.get("occupied_level_span") or 1)
             slot_span = int(
                 row.get("occupied_horizontal_slot_span")
                 or len(occupied_addresses)
             )
-            if self.slotting.required_slot_footprint(
-                requirements, primary_effective or {}, level_span, slot_span
-            ) is None:
+            if (
+                profile["data_status"] == "COMPLETE"
+                and self.slotting.required_slot_footprint(
+                    requirements,
+                    primary_effective or {},
+                    level_span,
+                    slot_span,
+                ) is None
+            ):
                 issues.append(
                     f"requires more than the reserved {level_span} × {slot_span} "
                     "level/slot footprint"
@@ -1448,15 +1212,13 @@ class TrafficAwareSlottingService:
     def _complete_traffic_workflow(
         self,
         payload: dict,
-        dataset: AffinityDataset,
+        affinity_source: AffinityAnalysis | AffinityDataset,
         network: MovementNetwork,
         *,
         workflow_mode: str,
         initial_strategy: str,
         start_date=None,
         end_date=None,
-        maximum_travel_increase: float | None = None,
-        hotspot_percentile: float | None = None,
         baseline_path: str = "",
         source_orders: str = "",
         progress: ProgressCallback | None = None,
@@ -1465,6 +1227,7 @@ class TrafficAwareSlottingService:
         progress_total: int = 5,
         generation_summary: dict | None = None,
         optimize_traffic: bool = True,
+        ctbsa_parameters: CtbsaParameters | None = None,
     ) -> TrafficPipelineResult:
         def stage(current: int, message: str) -> None:
             if cancelled and cancelled():
@@ -1472,6 +1235,14 @@ class TrafficAwareSlottingService:
             if progress:
                 progress(progress_offset + current, progress_total, message)
 
+        analysis_source = (
+            affinity_source
+            if isinstance(affinity_source, AffinityAnalysis)
+            else AffinityService.analyze(
+                affinity_source, start_date, end_date
+            )
+        )
+        dataset = analysis_source.dataset
         stage(1, "Validating hard storage compatibility")
         validation = self.validate_traffic_baseline(payload)
         stage(2, "Calculating Store ID + Date handling-unit visits")
@@ -1493,12 +1264,11 @@ class TrafficAwareSlottingService:
         )
         optimization = output_payload = None
         if optimize_traffic:
-            stage(4, "Optimizing complete handling-unit placement")
-            optimization = self.optimize(
-                payload, network, demand,
-                maximum_travel_increase=maximum_travel_increase,
-                hotspot_percentile=hotspot_percentile,
-                progress=None,
+            stage(4, "Running paper-replication C&TBSA clustering and assignment")
+            optimization = self.optimize_ctbsa(
+                payload, analysis_source, network,
+                parameters=ctbsa_parameters,
+                progress=progress,
                 cancelled=cancelled,
             )
             output_payload = self.result_payload(
@@ -1513,25 +1283,36 @@ class TrafficAwareSlottingService:
                 "workflow_mode": workflow_mode,
                 "initial_strategy": initial_strategy,
                 "stages": [
-                    "initial_layout_generation"
-                    if workflow_mode == "full_pipeline"
-                    else "existing_layout_load",
+                    (
+                        "physical_feasibility_seed"
+                        if initial_strategy == "physical_feasibility"
+                        else "initial_layout_generation"
+                        if workflow_mode == "full_pipeline"
+                        else "existing_layout_load"
+                    ),
                     "hard_constraint_validation",
                     "handling_unit_visit_calculation",
                     "movement_resource_routing",
-                    "traffic_aware_handling_unit_placement",
+                    "ctbsa_nsga2_sku_clustering",
+                    "ctbsa_demand_ranked_storage_area_assignment",
                     "final_validation_and_comparison",
                 ],
                 "grouping_metrics": grouping_metrics,
                 "generation_summary": generation_summary or {},
             }
         stage(5, "Final traffic validation and comparison complete")
-        basic_rows = payload["assignments"] if initial_strategy == "basic" else []
+        basic_rows = (
+            payload["assignments"]
+            if initial_strategy in {"basic", "physical_feasibility"} else []
+        )
         affinity_rows = (
             payload["assignments"]
             if initial_strategy == "abc_affinity" else []
         )
-        basic_summary = payload["summary"] if initial_strategy == "basic" else {}
+        basic_summary = (
+            payload["summary"]
+            if initial_strategy in {"basic", "physical_feasibility"} else {}
+        )
         affinity_summary = (
             payload["summary"] if initial_strategy == "abc_affinity" else {}
         )
@@ -1549,8 +1330,7 @@ class TrafficAwareSlottingService:
         *,
         start_date=None,
         end_date=None,
-        maximum_travel_increase: float | None = None,
-        hotspot_percentile: float | None = None,
+        ctbsa_parameters: CtbsaParameters | None = None,
         baseline_path: str = "",
         source_orders: str = "",
         progress: ProgressCallback | None = None,
@@ -1570,13 +1350,12 @@ class TrafficAwareSlottingService:
             initial_strategy=strategy,
             start_date=start_date,
             end_date=end_date,
-            maximum_travel_increase=maximum_travel_increase,
-            hotspot_percentile=hotspot_percentile,
             baseline_path=baseline_path,
             source_orders=source_orders,
             progress=progress,
             cancelled=cancelled,
             progress_total=5,
+            ctbsa_parameters=ctbsa_parameters,
         )
 
     def run_full_pipeline(
@@ -1599,18 +1378,24 @@ class TrafficAwareSlottingService:
         start_date=None,
         end_date=None,
         optimize_traffic: bool = True,
-        maximum_travel_increase: float | None = None,
-        hotspot_percentile: float | None = None,
+        ctbsa_parameters: CtbsaParameters | None = None,
         source_grid_project: str = "",
         source_velocity: str = "",
         source_chilled: str = "",
         source_orders: str = "",
+        workflow_mode: str = "full_pipeline",
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
+        assignment_progress: AssignmentCallback | None = None,
     ) -> TrafficPipelineResult:
-        """Generate the selected initial layout, then optimize its traffic."""
-        if initial_strategy not in {"basic", "abc_affinity"}:
-            raise ValueError("initial strategy must be basic or abc_affinity")
+        """Build a feasibility seed, then run the paper C&TBSA method."""
+        if initial_strategy not in {
+            "physical_feasibility", "basic", "abc_affinity"
+        }:
+            raise ValueError(
+                "initial strategy must be physical_feasibility, basic, or "
+                "abc_affinity"
+            )
         affinity_analysis = (
             affinity_source
             if isinstance(affinity_source, AffinityAnalysis) else None
@@ -1626,23 +1411,20 @@ class TrafficAwareSlottingService:
         if progress:
             progress(1, 7, "Loading warehouse configuration")
 
-        catalog = attribute_catalog or self.attributes.starter_catalog()
+        catalog = self.attributes.normalize_catalog(attribute_catalog)
         zones = dict(zone_assignments or {})
         configured_locations = copy.deepcopy(location_attributes or {})
-        if not configured_locations:
-            configured_locations[zone_id] = {
-                "chilled": False,
-                **STANDARD_STORAGE_DEFAULTS,
-            }
         if progress:
             progress(
                 2, 7,
-                "Generating ABC layout"
+                "Building physical-feasibility seed"
+                if initial_strategy == "physical_feasibility"
+                else "Generating ABC layout"
                 if initial_strategy == "basic"
                 else "Generating ABC + affinity layout",
             )
         baseline_locations = copy.deepcopy(configured_locations)
-        if initial_strategy == "basic":
+        if initial_strategy in {"physical_feasibility", "basic"}:
             rows, summary = self.slotting.generate_basic(
                 copy.deepcopy(building), copy.deepcopy(sku_rows),
                 levels_per_rack, slots_per_level, handling_unit_type,
@@ -1665,6 +1447,9 @@ class TrafficAwareSlottingService:
                 auto_plan_oversize=True,
             )
             affinity_configuration = summary.get("affinity_tuning", {})
+        zones = dict(summary.get("zone_assignments", zones))
+        if assignment_progress:
+            assignment_progress(copy.deepcopy(summary))
         storage_layout_payload = (
             storage_layout.to_dict() if storage_layout is not None else {}
         )
@@ -1681,11 +1466,11 @@ class TrafficAwareSlottingService:
                 "grid_project_json": source_grid_project,
                 "sku_velocity_csv": source_velocity,
                 "chilled_requirements_csv": source_chilled,
-                "affinity_order_workbook": (
-                    source_orders if initial_strategy == "abc_affinity" else ""
-                ),
+                "sku_attributes_csv": source_chilled,
+                "ctbsa_order_workbook": source_orders,
             },
             "affinity_configuration": affinity_configuration,
+            "feasibility_seed_only": initial_strategy == "physical_feasibility",
             "storage_defaults": {"standard": STANDARD_STORAGE_DEFAULTS},
             "zone_assignments": zones,
             "storage_layout": storage_layout_payload,
@@ -1700,13 +1485,15 @@ class TrafficAwareSlottingService:
         payload["buffers"] = self._buffer_records(payload, rows)
         return self._complete_traffic_workflow(
             payload, dataset, network,
-            workflow_mode="full_pipeline",
+            workflow_mode=workflow_mode,
             initial_strategy=initial_strategy,
             start_date=start_date,
             end_date=end_date,
-            maximum_travel_increase=maximum_travel_increase,
-            hotspot_percentile=hotspot_percentile,
-            baseline_path="generated_in_full_pipeline",
+            baseline_path=(
+                "generated_physical_feasibility_seed"
+                if initial_strategy == "physical_feasibility"
+                else "generated_in_full_pipeline"
+            ),
             source_orders=source_orders,
             progress=progress,
             cancelled=cancelled,
@@ -1714,6 +1501,7 @@ class TrafficAwareSlottingService:
             progress_total=7,
             generation_summary=summary,
             optimize_traffic=optimize_traffic,
+            ctbsa_parameters=ctbsa_parameters,
         )
 
     @staticmethod
@@ -1729,7 +1517,24 @@ class TrafficAwareSlottingService:
     ) -> dict:
         payload = copy.deepcopy(baseline_payload)
         payload["generated_at"] = datetime.now(timezone.utc).isoformat()
+        payload["strategy"] = "ctbsa"
         payload["assignments"] = result.assignments
+        final_summary = copy.deepcopy(payload.get("summary") or {})
+        final_summary.update({
+            "strategy": "ctbsa",
+            "hard_rule_profile": result.parameters.get(
+                "hard_rule_profile", "shared_warehouse_feasibility/v1"
+            ),
+            "hard_rules": result.parameters.get("hard_rules", []),
+            "hard_rule_validation": result.parameters.get(
+                "hard_rule_validation", {}
+            ),
+            "optimized_sku_count": result.parameters.get(
+                "optimized_sku_count", 0
+            ),
+            "fixed_sku_count": result.parameters.get("fixed_sku_count", 0),
+        })
+        payload["summary"] = final_summary
         payload.setdefault("sources", {})["traffic_baseline_layout"] = baseline_path
         payload["sources"]["traffic_order_workbook"] = order_path
         payload["sources"]["traffic_network"] = network.source_path or "embedded_rmf"
@@ -1737,6 +1542,7 @@ class TrafficAwareSlottingService:
             **result.parameters,
             "workflow_mode": workflow_mode,
             "initial_strategy": initial_strategy,
+            "optimization_strategy": "ctbsa",
             "network_type": network.source_type,
             "demand_model": "unique_handling_unit_per_store_day",
             "start_date": result.before.demand.start_date,
@@ -1748,6 +1554,8 @@ class TrafficAwareSlottingService:
             "fulfillment_groups": result.before.demand.fulfillment_groups,
             "handling_unit_visits": result.before.demand.handling_unit_visits,
             "unit_visits": dict(sorted(result.before.demand.unit_visits.items())),
+            "after_handling_unit_visits": result.after.demand.handling_unit_visits,
+            "after_unit_visits": dict(sorted(result.after.demand.unit_visits.items())),
             "mapped_units": len(result.before.mapped_units),
             "unreachable_units": list(result.before.unreachable_units),
             "unmapped_units": list(result.before.unmapped_units),
@@ -1757,7 +1565,7 @@ class TrafficAwareSlottingService:
         }
         payload.setdefault("operation_log", []).append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "operation": "traffic_aware_slotting",
+            "operation": "ctbsa_slotting",
             "relocation_count": len({row["handling_unit_id"] for row in result.relocations}),
         })
         payload["buffers"] = TrafficAwareSlottingService._buffer_records(
@@ -1816,7 +1624,14 @@ class TrafficAwareSlottingService:
                     "after_normalized_load": second.get("normalized_load", 0),
                 })
         with relocation_path.open("w", encoding="utf-8-sig", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=("handling_unit_id", "from", "to", "swap_with"))
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=(
+                    "sku", "handling_unit_id", "from_rack", "to_rack",
+                    "from", "to",
+                ),
+                extrasaction="ignore",
+            )
             writer.writeheader()
             writer.writerows(result.relocations)
         return json_path, resource_path, relocation_path

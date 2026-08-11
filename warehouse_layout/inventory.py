@@ -207,8 +207,15 @@ class InventoryService:
             target_address, location_attributes
         )
         requirements = row.get("sku_requirements", {})
+        configured_keys = self.attributes.configured_zone_attribute_keys(
+            location_attributes
+        )
+        active_requirements = {
+            key: value for key, value in requirements.items()
+            if key in configured_keys
+        }
         hard_issues = self.attributes.hard_compatibility_issues(
-            requirements, effective
+            active_requirements, effective, attribute_catalog
         )
         if hard_issues:
             raise ValueError(
