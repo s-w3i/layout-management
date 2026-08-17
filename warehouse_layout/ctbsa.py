@@ -366,6 +366,8 @@ class CtbsaPlacementPlanner:
         zone_assignments: dict[str, str] | None = None,
         location_attributes: dict[str, dict] | None = None,
         attribute_catalog=None,
+        zone_workload_enabled: bool = False,
+        rack_traffic_costs: dict[str, dict[str, float]] | None = None,
         parameters: CtbsaParameters | None = None,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
@@ -375,6 +377,7 @@ class CtbsaPlacementPlanner:
         if levels_per_rack < 1 or slots_per_level < 1:
             raise ValueError("C&TBSA rack capacity must be positive")
         capacity = levels_per_rack * slots_per_level
+        rack_traffic_costs = rack_traffic_costs or {}
         _level, racks, _workstations, _unreachable = self.slotting.rack_distances(
             building
         )
@@ -630,9 +633,85 @@ class CtbsaPlacementPlanner:
                 cluster_demand = int(demands[items].sum(dtype=np.int64)) if items else 0
                 cluster_records.append((cluster_demand, index, items))
             cluster_records.sort(key=lambda value: (-value[0], value[1]))
+            rack_targets = list(group_racks)
+            if zone_workload_enabled and len(group_racks) > 1:
+                zone_capacities: dict[str, int] = {}
+                for rack in group_racks:
+                    zone = str(rack.get("zone_id") or "Z01")
+                    zone_capacities[zone] = zone_capacities.get(zone, 0) + capacity
+
+                def assignment_objective(pairs):
+                    demand_by_zone = {zone: 0.0 for zone in zone_capacities}
+                    traffic_by_zone = {zone: 0.0 for zone in zone_capacities}
+                    travel = 0.0
+                    for (cluster_demand, _source, _items), rack in pairs:
+                        zone = str(rack.get("zone_id") or "Z01")
+                        costs = rack_traffic_costs.get(str(rack["rack_id"]), {})
+                        demand_by_zone[zone] += cluster_demand
+                        traffic_by_zone[zone] += cluster_demand * float(
+                            costs.get("resource_flow_per_visit", 0.0)
+                        )
+                        travel += cluster_demand * float(
+                            costs.get("travel_per_visit", rack.get("distance_m", 0.0))
+                        )
+                    demand_values = np.array([
+                        demand_by_zone[zone] / zone_capacities[zone]
+                        for zone in sorted(zone_capacities)
+                    ])
+                    traffic_values = np.array([
+                        traffic_by_zone[zone] / zone_capacities[zone]
+                        for zone in sorted(zone_capacities)
+                    ])
+                    return (
+                        float(demand_values.max(initial=0.0)),
+                        float(traffic_values.max(initial=0.0)),
+                        float(np.percentile(demand_values, 95)),
+                        float(np.percentile(traffic_values, 95)),
+                        float(travel),
+                    )
+
+                # Greedily spread the highest-demand complete shelf clusters,
+                # then improve that deterministic seed with compatible rack swaps.
+                selected_pairs = []
+                remaining = list(group_racks)
+                for record in cluster_records:
+                    rack = min(
+                        remaining,
+                        key=lambda candidate: (
+                            assignment_objective(
+                                selected_pairs + [(record, candidate)]
+                            ),
+                            str(candidate["rack_id"]),
+                        ),
+                    )
+                    selected_pairs.append((record, rack))
+                    remaining.remove(rack)
+                current = assignment_objective(selected_pairs)
+                for _pass in range(5):
+                    improved = False
+                    for first in range(len(selected_pairs)):
+                        for second in range(first + 1, len(selected_pairs)):
+                            if (
+                                str(selected_pairs[first][1].get("zone_id") or "Z01")
+                                == str(selected_pairs[second][1].get("zone_id") or "Z01")
+                            ):
+                                continue
+                            candidate = list(selected_pairs)
+                            first_record, first_rack = candidate[first]
+                            second_record, second_rack = candidate[second]
+                            candidate[first] = (first_record, second_rack)
+                            candidate[second] = (second_record, first_rack)
+                            value = assignment_objective(candidate)
+                            if value < current:
+                                selected_pairs, current = candidate, value
+                                improved = True
+                    if not improved:
+                        break
+                cluster_records = [record for record, _rack in selected_pairs]
+                rack_targets = [rack for _record, rack in selected_pairs]
             rng = np.random.default_rng(parameters.random_seed + group_number)
             for accessible_rank, ((cluster_demand, source_cluster, items), rack) in enumerate(
-                zip(cluster_records, group_racks), start=1
+                zip(cluster_records, rack_targets), start=1
             ):
                 ordered_items = list(rng.permutation(items)) if items else []
                 load_ids = [group_loads[int(item)] for item in ordered_items]
@@ -696,5 +775,16 @@ class CtbsaPlacementPlanner:
                     "incomplete-data racks fixed"
                 ),
                 "simulation_validation": False,
+                "zone_workload_enabled": bool(zone_workload_enabled),
+                "zone_workload_objective_order": (
+                    "peak_normalized_zone_demand, peak_normalized_zone_traffic, "
+                    "p95_normalized_zone_demand, p95_normalized_zone_traffic, "
+                    "expected_travel, stable_rack_id"
+                ),
+                "zone_workload_normalization": "compatible_usable_rack_slot_capacity",
+                "zone_traffic_attribution": "destination_rack_zone",
+                "zone_optimization_status": (
+                    "ENABLED" if zone_workload_enabled else "DISABLED_COMPATIBILITY_PATH"
+                ),
             },
         )

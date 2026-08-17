@@ -2339,6 +2339,8 @@ class GridMapEditorApp:
         self.traffic_ctbsa_generations = tk.StringVar(value="50000")
         self.traffic_ctbsa_solution = tk.StringVar(value="3")
         self.traffic_ctbsa_seed = tk.StringVar(value="0")
+        self.traffic_zone_workload_enabled = tk.BooleanVar(value=False)
+        self.traffic_zone_overlay = tk.StringVar(value="Off")
         self.traffic_parameter_status = tk.StringVar(
             value="Paper defaults: NSGA-II P=100, G=50,000, Pc=0.9, Pm=0.1."
         )
@@ -2563,6 +2565,11 @@ class GridMapEditorApp:
         ttk.Spinbox(parameters, from_=1, to=5, textvariable=self.traffic_ctbsa_solution, width=3).pack(side="left")
         ttk.Label(parameters, text="Seed").pack(side="left", padx=(8, 3))
         ttk.Entry(parameters, textvariable=self.traffic_ctbsa_seed, width=5).pack(side="left")
+        ttk.Checkbutton(
+            parameters,
+            text="Balance workload across zones",
+            variable=self.traffic_zone_workload_enabled,
+        ).pack(side="left", padx=(10, 0))
 
         ttk.Label(traffic_settings, text="Optimized layout output").grid(
             row=5, column=0, sticky="w", pady=3
@@ -2647,7 +2654,22 @@ class GridMapEditorApp:
             values=("Feasibility seed", "C&TBSA result"), width=17,
         )
         view_box.pack(side="left", padx=(6, 0))
-        view_box.bind("<<ComboboxSelected>>", lambda _event: self.draw_traffic_map())
+        view_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: (self.populate_traffic_results(), self.draw_traffic_map()),
+        )
+        ttk.Label(view_actions, text="Zone overlay").pack(side="left", padx=(10, 3))
+        zone_overlay = ttk.Combobox(
+            view_actions,
+            textvariable=self.traffic_zone_overlay,
+            state="readonly",
+            values=("Off", "Normalized demand", "Normalized traffic"),
+            width=18,
+        )
+        zone_overlay.pack(side="left")
+        zone_overlay.bind(
+            "<<ComboboxSelected>>", lambda _event: self.draw_traffic_map()
+        )
         ttk.Label(
             view_actions,
             text="Lane colour = route load · rack colour = handling-unit visits · purple = reassigned · ◇ endpoint",
@@ -2677,10 +2699,12 @@ class GridMapEditorApp:
         details.rowconfigure(0, weight=1)
         tabs = ttk.Notebook(details)
         tabs.grid(row=0, column=0, sticky="nsew")
-        resource_tab, relocation_tab, rejected_tab, parameter_tab = (
-            ttk.Frame(tabs), ttk.Frame(tabs), ttk.Frame(tabs), ttk.Frame(tabs)
+        resource_tab, zone_tab, relocation_tab, rejected_tab, parameter_tab = (
+            ttk.Frame(tabs), ttk.Frame(tabs), ttk.Frame(tabs), ttk.Frame(tabs),
+            ttk.Frame(tabs),
         )
         tabs.add(resource_tab, text="Congested Resources")
+        tabs.add(zone_tab, text="Zone Workload")
         tabs.add(relocation_tab, text="Relocations")
         tabs.add(rejected_tab, text="Fixed / Rejected")
         tabs.add(parameter_tab, text="Parameters")
@@ -2689,6 +2713,14 @@ class GridMapEditorApp:
             (("resource", "Resource", 135), ("before", "Seed", 75),
              ("after", "C&TBSA", 75), ("change", "Change", 75),
              ("capacity", "Capacity", 75)),
+        )
+        self.traffic_zone_tree = self._traffic_tree(
+            zone_tab,
+            (("zone", "Zone", 80), ("capacity", "Usable slots", 90),
+             ("demand", "Demand", 85), ("demand_norm", "Demand / cap", 95),
+             ("traffic", "Traffic", 85), ("traffic_norm", "Traffic / cap", 95),
+             ("racks", "Occupied racks", 95), ("skus", "SKUs", 65),
+             ("quantity", "Quantity EA", 90)),
         )
         self.traffic_relocation_tree = self._traffic_tree(
             relocation_tab,
@@ -2943,6 +2975,9 @@ class GridMapEditorApp:
                     start_date=start,
                     end_date=end,
                     ctbsa_parameters=ctbsa_parameters,
+                    zone_workload_enabled=bool(
+                        self.traffic_zone_workload_enabled.get()
+                    ),
                     source_grid_project=str(grid_project_path),
                     source_velocity=str(velocity_path),
                     source_chilled=str(chilled_path or ""),
@@ -3086,7 +3121,8 @@ class GridMapEditorApp:
             self.traffic_ctbsa_solution.set(str(params["selected_solution"]))
             self.traffic_ctbsa_seed.set(str(params["random_seed"]))
             self.traffic_parameter_status.set(
-                "Paper C&TBSA completed; lane load is static validation only."
+                "Paper C&TBSA completed; zone balancing "
+                + ("enabled." if params.get("zone_workload_enabled") else "disabled.")
             )
             self.traffic_view_mode.set("C&TBSA result")
         else:
@@ -3101,7 +3137,8 @@ class GridMapEditorApp:
 
     def populate_traffic_results(self):
         for tree in (
-            self.traffic_resource_tree, self.traffic_relocation_tree,
+            self.traffic_resource_tree, self.traffic_zone_tree,
+            self.traffic_relocation_tree,
             self.traffic_rejected_tree, self.traffic_parameter_tree,
         ):
             tree.delete(*tree.get_children())
@@ -3194,6 +3231,8 @@ class GridMapEditorApp:
             f"OVERWEIGHT {overweight_count:,} · INCOMPLETE DATA {incomplete_count:,} · "
             "fixed outside C&TBSA movement"
         )
+        zone_before = before.zone_analysis.get("metrics", {})
+        zone_after = after.zone_analysis.get("metrics", {})
         self.traffic_kpis.set(
             f"Groups {before.demand.fulfillment_groups:,}  · "
             f"Input unit visits {baseline_visits:,}  · "
@@ -3201,6 +3240,14 @@ class GridMapEditorApp:
             f"Raw peak {before.metrics['raw_peak_load']:.1f} → {after.metrics['raw_peak_load']:.1f}  · "
             f"Raw P95 {before.metrics['raw_p95_load']:.1f} → {after.metrics['raw_p95_load']:.1f}  · "
             f"Travel {before.metrics['expected_travel']:.1f} → {after.metrics['expected_travel']:.1f}  · "
+            f"Zone demand peak {zone_before.get('peak_normalized_zone_demand', 0):.3f} → "
+            f"{zone_after.get('peak_normalized_zone_demand', 0):.3f} "
+            f"(P95 {zone_before.get('p95_normalized_zone_demand', 0):.3f} → "
+            f"{zone_after.get('p95_normalized_zone_demand', 0):.3f})  · "
+            f"Zone traffic peak {zone_before.get('peak_normalized_zone_traffic', 0):.3f} → "
+            f"{zone_after.get('peak_normalized_zone_traffic', 0):.3f} "
+            f"(P95 {zone_before.get('p95_normalized_zone_traffic', 0):.3f} → "
+            f"{zone_after.get('p95_normalized_zone_traffic', 0):.3f})  · "
             f"Relocated {relocated:,}  · "
             f"Excluded unassigned {int(grouping.get('excluded_unassigned_sku_count', 0)):,}"
         )
@@ -3229,6 +3276,21 @@ class GridMapEditorApp:
                 resource, f"{first_value:.3f}", f"{second_value:.3f}",
                 f"{second_value - first_value:+.3f}", first.get("capacity") or "relative",
             ), tags=(f"resource:{resource}",))
+        displayed_zone_analysis = (
+            after.zone_analysis
+            if self.traffic_result and self.traffic_view_mode.get() == "C&TBSA result"
+            else before.zone_analysis
+        )
+        for row in displayed_zone_analysis.get("zones", []):
+            self.traffic_zone_tree.insert("", "end", values=(
+                row["zone_id"], f"{int(row['usable_slots']):,}",
+                f"{row['expected_visits']:.1f}",
+                f"{row['normalized_demand_workload']:.3f}",
+                f"{row['attributed_resource_flow']:.1f}",
+                f"{row['normalized_traffic_workload']:.3f}",
+                f"{int(row['occupied_rack_count']):,}",
+                f"{int(row['sku_count']):,}", f"{row['quantity_ea']:g}",
+            ))
         if self.traffic_result:
             for row in self.traffic_result.relocations:
                 self.traffic_relocation_tree.insert("", "end", values=(
@@ -3260,6 +3322,11 @@ class GridMapEditorApp:
                 "crossover_probability": "PMX crossover probability",
                 "mutation_probability": "2-opt mutation probability",
                 "selected_solution": "Selected C&TBSA solution",
+                "zone_workload_enabled": "Zone workload objective",
+                "zone_workload_objective_order": "Zone objective order",
+                "zone_workload_normalization": "Zone normalization",
+                "zone_traffic_attribution": "Zone traffic attribution",
+                "zone_optimization_status": "Zone optimization status",
                 "optimized_sku_count": "Optimized SKUs",
                 "fixed_sku_count": "Fixed physical-exception SKUs",
                 "hard_rule_profile": "Hard-rule profile",
@@ -3275,7 +3342,10 @@ class GridMapEditorApp:
                 ):
                     self.traffic_parameter_tree.insert("", "end", values=(label, value))
             for key, value in self.traffic_result.parameters.items():
-                if key in {"clusters", "regenerated_summary"}:
+                if key in {
+                    "clusters", "regenerated_summary", "zone_analysis_before",
+                    "zone_analysis_after",
+                }:
                     continue
                 if key == "hard_rules":
                     value = " · ".join(str(item) for item in value)
@@ -3345,6 +3415,11 @@ class GridMapEditorApp:
                 "node_id": node_id,
                 "bay": bay,
                 "label": str(row.get("rack_id") or bay),
+                "zone_id": str(
+                    (self.traffic_zone_assignments or {}).get(
+                        str(row.get("rack_id") or bay), "Z01"
+                    )
+                ),
                 "units": set(),
                 "occupied": 0,
             })
@@ -3363,6 +3438,9 @@ class GridMapEditorApp:
             label = min(labels, key=lambda value: (len(value), value)) if labels else node_id
             racks[node_id] = {
                 "node_id": node_id, "bay": label, "label": label,
+                "zone_id": str(
+                    (self.traffic_zone_assignments or {}).get(label, "Z01")
+                ),
                 "units": set(), "occupied": 0,
             }
         unit_visits = self.traffic_demand.unit_visits if self.traffic_demand else {}
@@ -3506,6 +3584,24 @@ class GridMapEditorApp:
             float(np.percentile(positive_rack_visits, 95))
             if positive_rack_visits else 1.0
         )
+        zone_overlay = self.traffic_zone_overlay.get()
+        zone_metric = (
+            "normalized_demand_workload"
+            if zone_overlay == "Normalized demand"
+            else "normalized_traffic_workload"
+        )
+        zone_rows = {
+            row["zone_id"]: row
+            for row in analysis.zone_analysis.get("zones", [])
+        }
+        positive_zone_values = [
+            float(row.get(zone_metric, 0.0)) for row in zone_rows.values()
+            if float(row.get(zone_metric, 0.0)) > 0
+        ]
+        zone_heat_maximum = (
+            float(np.percentile(positive_zone_values, 95))
+            if positive_zone_values else 1.0
+        )
         show_all_labels = len(racks) <= 60
         for node_id, rack in sorted(racks.items(), key=lambda item: item[1]["label"]):
             node = self.traffic_network.nodes[node_id]
@@ -3515,10 +3611,22 @@ class GridMapEditorApp:
             selected_destination = bay in selected_to
             reassigned = bay in reassigned_bays
             visit_ratio = min(1.0, rack["visits"] / rack_heat_maximum)
-            fill = (
-                self._traffic_heat_colour(visit_ratio)
-                if rack["visits"] > 0 else "#f2f5f6"
-            )
+            if zone_overlay != "Off":
+                zone_value = float(
+                    zone_rows.get(rack.get("zone_id", "Z01"), {}).get(
+                        zone_metric, 0.0
+                    )
+                )
+                fill = (
+                    self._traffic_heat_colour(
+                        min(1.0, zone_value / zone_heat_maximum)
+                    ) if zone_value > 0 else "#f2f5f6"
+                )
+            else:
+                fill = (
+                    self._traffic_heat_colour(visit_ratio)
+                    if rack["visits"] > 0 else "#f2f5f6"
+                )
             outline = "#e07a1f" if selected_source else "#258b55" if selected_destination else "#7b2cbf" if reassigned else "#344f5c"
             width = 4 if selected_source or selected_destination else 3 if reassigned else 1
             size = 8 if selected_source or selected_destination else 6
@@ -3553,6 +3661,15 @@ class GridMapEditorApp:
                 x, y - 13, text=endpoint_labels[node_id], fill="#224f88",
                 font=("TkDefaultFont", 8, "bold"),
             )
+        legend_mode = (
+            "rack visits" if zone_overlay == "Off"
+            else f"zone {zone_overlay.lower()} (P95 colour scale)"
+        )
+        self.traffic_canvas.create_text(
+            12, 12, text=f"Rack colour: {legend_mode}", anchor="nw",
+            fill="#314d59", font=("TkDefaultFont", 8, "bold"),
+            tags=("traffic_legend",),
+        )
         self.apply_canvas_viewport(self.traffic_canvas)
 
     def traffic_resource_click(self, _event=None):

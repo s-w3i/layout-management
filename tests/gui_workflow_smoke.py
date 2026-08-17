@@ -576,6 +576,8 @@ def main() -> None:
         app.traffic_slots.set("12")
         app.traffic_ctbsa_population.set("10")
         app.traffic_ctbsa_generations.set("5")
+        assert app.traffic_zone_workload_enabled.get() is False
+        app.traffic_zone_workload_enabled.set(True)
         app.traffic_output_path.set(str(temp / "workflow-traffic.slotting.json"))
         assert app.load_traffic_area_map()
         root.update_idletasks()
@@ -610,6 +612,10 @@ def main() -> None:
         assert "Optimized by C&TBSA" in app.traffic_assignment_summary.get()
         assert "Groups" in app.traffic_kpis.get()
         assert app.traffic_resource_tree.get_children()
+        assert app.traffic_zone_tree.get_children()
+        assert "Zone demand peak" in app.traffic_kpis.get()
+        assert app.traffic_result.parameters["zone_workload_enabled"] is True
+        app.traffic_zone_overlay.set("Normalized demand")
         app.draw_traffic_map()
         traffic_links = app.traffic_canvas.find_withtag("traffic_link")
         assert traffic_links
@@ -618,6 +624,7 @@ def main() -> None:
             for item in traffic_links
         )
         assert app.traffic_canvas.find_withtag("traffic_rack")
+        assert app.traffic_canvas.find_withtag("traffic_legend")
         assert app.traffic_pipeline_result.grouping_metrics[
             "hard_validation_status"
         ] == "PASSED"
@@ -656,6 +663,10 @@ def main() -> None:
         assert saved_traffic_layout["traffic_configuration"][
             "initial_strategy"
         ] == "physical_feasibility"
+        assert saved_traffic_layout["traffic_configuration"][
+            "zone_workload_enabled"
+        ] is True
+        assert saved_traffic_layout["traffic_analysis"]["zone_analysis"]["after"]
         assert saved_traffic_layout["sources"]["grid_project_json"] == str(
             project_path.resolve()
         )

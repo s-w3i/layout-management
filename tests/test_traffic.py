@@ -141,6 +141,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
     def run_small_ctbsa(
         self, directory: Path, *, cancelled=None, slots_per_level=2,
         initial_strategy="basic", workflow_mode="full_pipeline",
+        zone_workload_enabled=False, with_zones=None,
     ):
         project = GridProject(
             GridSpec(3, 1, 1, "ctbsa", "L1"),
@@ -170,6 +171,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             },
         ]
         network = self.service.network_from_rmf(building)
+        with_zones = zone_workload_enabled if with_zones is None else with_zones
         pipeline = self.service.run_full_pipeline(
             building,
             skus,
@@ -179,8 +181,16 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             levels_per_rack=1,
             slots_per_level=slots_per_level,
             handling_unit_type="AMR shelf",
+            zone_assignments=(
+                {"G0_0": "Z01", "G1_0": "Z02"}
+                if with_zones else None
+            ),
             attribute_catalog=self.catalog,
-            location_attributes={"Z01": dict(self.capacity)},
+            location_attributes=(
+                {"Z01": dict(self.capacity), "Z02": dict(self.capacity)}
+                if with_zones else {"Z01": dict(self.capacity)}
+            ),
+            zone_workload_enabled=zone_workload_enabled,
             workflow_mode=workflow_mode,
             cancelled=cancelled,
         )
@@ -213,6 +223,68 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertTrue(
             pipeline.optimization.parameters["rack_budget_trials"][-1]["selected"]
         )
+        self.assertFalse(
+            pipeline.optimization.parameters["zone_workload_enabled"]
+        )
+
+    def test_zone_workload_mode_reports_capacity_demand_and_traffic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            baseline, _network, _orders = self.run_small_ctbsa(
+                directory, with_zones=True
+            )
+            pipeline, _network, _orders = self.run_small_ctbsa(
+                directory, zone_workload_enabled=True, with_zones=True
+            )
+            repeated, _network, _orders = self.run_small_ctbsa(
+                directory, zone_workload_enabled=True, with_zones=True
+            )
+        result = pipeline.optimization
+        self.assertTrue(result.parameters["zone_workload_enabled"])
+        self.assertEqual(result.parameters["zone_optimization_status"], "ENABLED")
+        self.assertEqual(
+            {row["zone_id"] for row in result.after.zone_analysis["zones"]},
+            {"Z01", "Z02"},
+        )
+        self.assertTrue(all(
+            row["usable_slots"] > 0
+            for row in result.after.zone_analysis["zones"]
+        ))
+        self.assertIn(
+            "peak_normalized_zone_traffic",
+            result.after.zone_analysis["metrics"],
+        )
+        exported = pipeline.output_payload["traffic_analysis"]["zone_analysis"]
+        self.assertEqual(exported["after"], result.after.zone_analysis)
+        before_clusters = sorted(
+            sorted(row["inventory_load_ids"])
+            for row in baseline.optimization.parameters["clusters"]
+        )
+        after_clusters = sorted(
+            sorted(row["inventory_load_ids"])
+            for row in result.parameters["clusters"]
+        )
+        self.assertEqual(before_clusters, after_clusters)
+        baseline_metrics = baseline.optimization.after.zone_analysis["metrics"]
+        result_metrics = result.after.zone_analysis["metrics"]
+        self.assertLessEqual(
+            (
+                result_metrics["peak_normalized_zone_demand"],
+                result_metrics["peak_normalized_zone_traffic"],
+            ),
+            (
+                baseline_metrics["peak_normalized_zone_demand"],
+                baseline_metrics["peak_normalized_zone_traffic"],
+            ),
+        )
+        positions = lambda value: sorted(
+            (
+                row.get("inventory_load_id"), row.get("rack_id"),
+                row.get("storage_level"), row.get("storage_slot"),
+            )
+            for row in value.optimization.assignments
+        )
+        self.assertEqual(positions(pipeline), positions(repeated))
 
     def test_ctbsa_uses_all_map_active_csv_attribute_profiles(self):
         project = GridProject(

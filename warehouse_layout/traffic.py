@@ -129,6 +129,7 @@ class TrafficAnalysis:
     unreachable_units: tuple[str, ...]
     unmapped_units: tuple[str, ...]
     placements: dict[str, str]
+    zone_analysis: dict = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -691,6 +692,161 @@ class TrafficAwareSlottingService:
             placements=resolved,
         )
 
+    def rack_traffic_costs(
+        self, building: dict, network: MovementNetwork
+    ) -> dict[str, dict[str, float]]:
+        """Return deterministic expected route cost for every mapped rack."""
+        _level, racks, _workstations, _unreachable = self.slotting.rack_distances(
+            building
+        )
+        routes = self._shortest_routes(network)
+        result = {}
+        for rack in racks:
+            rack_id = str(rack["rack_id"])
+            node = self._resolve_node(
+                {"rack_id": rack_id, "static_bay_id": rack_id}, network
+            )
+            reachable = [
+                endpoint for endpoint in network.endpoints
+                if node is not None and (node, endpoint.node_id) in routes
+            ]
+            weight_total = sum(endpoint.weight for endpoint in reachable)
+            if not reachable or weight_total <= 0:
+                result[rack_id] = {
+                    "resource_flow_per_visit": 0.0,
+                    "travel_per_visit": float(rack.get("distance_m", 0.0)),
+                }
+                continue
+            resource_flow = travel = 0.0
+            for endpoint in reachable:
+                share = endpoint.weight / weight_total
+                distance, _links, resources = routes[(node, endpoint.node_id)]
+                resource_flow += share * len(resources)
+                travel += share * distance
+            result[rack_id] = {
+                "resource_flow_per_visit": resource_flow,
+                "travel_per_visit": travel,
+            }
+        return result
+
+    def analyze_zones(
+        self, assignments: list[dict], analysis: TrafficAnalysis, payload: dict
+    ) -> dict:
+        """Aggregate demand and attributed route flow by destination rack zone."""
+        capacity_per_rack = (
+            int((payload.get("rack_capacity") or {}).get("levels") or 1)
+            * int((payload.get("rack_capacity") or {}).get("slots_per_level") or 1)
+        )
+        _level, racks, _workstations, _unreachable = self.slotting.rack_distances(
+            payload["building"]
+        )
+        self.slotting.apply_zone_local_aisles(
+            payload["building"], racks, payload.get("zone_assignments") or {}, "Z01"
+        )
+        rack_zones = {
+            str(rack["rack_id"]): str(rack.get("zone_id") or "Z01")
+            for rack in racks
+        }
+        records: dict[str, dict] = {}
+        for zone in sorted(set(rack_zones.values()) or {"Z01"}):
+            rack_count = sum(value == zone for value in rack_zones.values())
+            records[zone] = {
+                "zone_id": zone,
+                "usable_racks": rack_count,
+                "usable_slots": rack_count * capacity_per_rack,
+                "normalized_capacity": rack_count * capacity_per_rack,
+                "expected_visits": 0.0,
+                "attributed_resource_flow": 0.0,
+                "occupied_racks": set(),
+                "inventory_load_ids": set(),
+                "skus": set(),
+                "quantity_ea": 0.0,
+            }
+        unit_zone: dict[str, str] = {}
+        counted_loads = set()
+        for row in assignments:
+            if row.get("assignment_status") != "ASSIGNED":
+                continue
+            rack_id = str(row.get("rack_id") or row.get("static_bay_id") or "")
+            zone = rack_zones.get(
+                rack_id,
+                str((payload.get("zone_assignments") or {}).get(rack_id) or "Z01"),
+            )
+            record = records.setdefault(zone, {
+                "zone_id": zone, "usable_racks": 0, "usable_slots": 0,
+                "normalized_capacity": 0, "expected_visits": 0.0,
+                "attributed_resource_flow": 0.0, "occupied_racks": set(),
+                "inventory_load_ids": set(), "skus": set(), "quantity_ea": 0.0,
+            })
+            unit = str(row.get("handling_unit_id") or "")
+            if unit:
+                unit_zone[unit] = zone
+            record["occupied_racks"].add(rack_id)
+            load_id = str(row.get("inventory_load_id", row.get("sku", "")))
+            record["inventory_load_ids"].add(load_id)
+            record["skus"].add(str(row.get("sku") or ""))
+            if load_id not in counted_loads:
+                try:
+                    record["quantity_ea"] += float(row.get("quantity_ea") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+                counted_loads.add(load_id)
+        for unit, visits in analysis.demand.unit_visits.items():
+            zone = unit_zone.get(str(unit))
+            if zone in records:
+                records[zone]["expected_visits"] += float(visits)
+        for unit, route in analysis.unit_routes.items():
+            zone = unit_zone.get(str(unit))
+            if zone in records:
+                records[zone]["attributed_resource_flow"] += sum(
+                    float(value) for value in route.get("resource_flows", {}).values()
+                )
+        rows = []
+        for zone in sorted(records):
+            record = records[zone]
+            capacity = float(record["normalized_capacity"])
+            record["normalized_demand_workload"] = (
+                record["expected_visits"] / capacity if capacity > 0 else 0.0
+            )
+            record["normalized_traffic_workload"] = (
+                record["attributed_resource_flow"] / capacity if capacity > 0 else 0.0
+            )
+            for key in ("occupied_racks", "inventory_load_ids", "skus"):
+                values = record[key]
+                record[key.replace("inventory_load_ids", "inventory_load_count").replace("occupied_racks", "occupied_rack_count").replace("skus", "sku_count")] = len(values)
+                del record[key]
+            rows.append(record)
+        demand_values = np.array([
+            row["normalized_demand_workload"] for row in rows
+            if row["normalized_capacity"] > 0
+        ])
+        traffic_values = np.array([
+            row["normalized_traffic_workload"] for row in rows
+            if row["normalized_capacity"] > 0
+        ])
+        most_loaded = max(
+            rows,
+            key=lambda row: (
+                row["normalized_demand_workload"],
+                row["normalized_traffic_workload"],
+                row["zone_id"],
+            ),
+            default={"zone_id": ""},
+        )
+        return {
+            "normalization": "compatible_usable_rack_slot_capacity",
+            "traffic_attribution": "destination_rack_zone",
+            "metrics": {
+                "peak_normalized_zone_demand": float(demand_values.max()) if len(demand_values) else 0.0,
+                "p95_normalized_zone_demand": float(np.percentile(demand_values, 95)) if len(demand_values) else 0.0,
+                "peak_normalized_zone_traffic": float(traffic_values.max()) if len(traffic_values) else 0.0,
+                "p95_normalized_zone_traffic": float(np.percentile(traffic_values, 95)) if len(traffic_values) else 0.0,
+                "expected_travel": float(analysis.metrics.get("expected_travel", 0.0)),
+                "most_loaded_zone": most_loaded.get("zone_id", ""),
+            },
+            "zones": rows,
+        }
+
     def _strict_unit_compatibility(
         self, source_rows: list[dict], target_rows: list[dict], payload: dict
     ) -> tuple[bool, str]:
@@ -802,6 +958,7 @@ class TrafficAwareSlottingService:
         network: MovementNetwork,
         *,
         parameters: CtbsaParameters | None = None,
+        zone_workload_enabled: bool = False,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TrafficOptimizationResult:
@@ -825,6 +982,11 @@ class TrafficAwareSlottingService:
             zone_assignments=payload.get("zone_assignments") or {},
             location_attributes=payload.get("location_attributes") or {},
             attribute_catalog=payload.get("attribute_catalog"),
+            zone_workload_enabled=zone_workload_enabled,
+            rack_traffic_costs=(
+                self.rack_traffic_costs(payload["building"], network)
+                if zone_workload_enabled else None
+            ),
             parameters=parameters,
             progress=progress,
             cancelled=cancelled,
@@ -942,6 +1104,8 @@ class TrafficAwareSlottingService:
             route_cache=route_cache,
             relative_reference=float(before.metrics["relative_reference"]),
         )
+        before.zone_analysis = self.analyze_zones(baseline_rows, before, payload)
+        after.zone_analysis = self.analyze_zones(result_rows, after, payload)
         compact_rack_count = len({
             str(row.get("rack_id", "")) for row in baseline_rows
             if row.get("assignment_status") == "ASSIGNED" and row.get("rack_id")
@@ -1031,6 +1195,9 @@ class TrafficAwareSlottingService:
             "selected_replica_visit_allocation": copy.deepcopy(
                 after.demand.replica_visits
             ),
+            "zone_workload_enabled": bool(zone_workload_enabled),
+            "zone_analysis_before": copy.deepcopy(before.zone_analysis),
+            "zone_analysis_after": copy.deepcopy(after.zone_analysis),
         }
         baseline_by_sku = {
             str(row.get("sku", "")): row for row in baseline_rows
@@ -1101,6 +1268,7 @@ class TrafficAwareSlottingService:
         network: MovementNetwork,
         *,
         parameters: CtbsaParameters | None = None,
+        zone_workload_enabled: bool = False,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TrafficOptimizationResult:
@@ -1110,6 +1278,7 @@ class TrafficAwareSlottingService:
             analysis,
             network,
             parameters=parameters,
+            zone_workload_enabled=zone_workload_enabled,
             progress=progress,
             cancelled=cancelled,
         )
@@ -1369,6 +1538,7 @@ class TrafficAwareSlottingService:
         generation_summary: dict | None = None,
         optimize_traffic: bool = True,
         ctbsa_parameters: CtbsaParameters | None = None,
+        zone_workload_enabled: bool = False,
     ) -> TrafficPipelineResult:
         def stage(current: int, message: str) -> None:
             if cancelled and cancelled():
@@ -1403,12 +1573,16 @@ class TrafficAwareSlottingService:
         pretraffic_analysis = self.analyze(
             payload["assignments"], network, demand
         )
+        pretraffic_analysis.zone_analysis = self.analyze_zones(
+            payload["assignments"], pretraffic_analysis, payload
+        )
         optimization = output_payload = None
         if optimize_traffic:
             stage(4, "Running paper-replication C&TBSA clustering and assignment")
             optimization = self.optimize_ctbsa(
                 payload, analysis_source, network,
                 parameters=ctbsa_parameters,
+                zone_workload_enabled=zone_workload_enabled,
                 progress=progress,
                 cancelled=cancelled,
             )
@@ -1436,6 +1610,11 @@ class TrafficAwareSlottingService:
                     "movement_resource_routing",
                     "ctbsa_nsga2_sku_clustering",
                     "ctbsa_demand_ranked_storage_area_assignment",
+                    (
+                        "ctbsa_zone_workload_rack_assignment"
+                        if zone_workload_enabled
+                        else "ctbsa_zone_workload_disabled"
+                    ),
                     "final_validation_and_comparison",
                 ],
                 "grouping_metrics": grouping_metrics,
@@ -1472,6 +1651,7 @@ class TrafficAwareSlottingService:
         start_date=None,
         end_date=None,
         ctbsa_parameters: CtbsaParameters | None = None,
+        zone_workload_enabled: bool = False,
         baseline_path: str = "",
         source_orders: str = "",
         progress: ProgressCallback | None = None,
@@ -1497,6 +1677,7 @@ class TrafficAwareSlottingService:
             cancelled=cancelled,
             progress_total=5,
             ctbsa_parameters=ctbsa_parameters,
+            zone_workload_enabled=zone_workload_enabled,
         )
 
     def run_full_pipeline(
@@ -1520,6 +1701,7 @@ class TrafficAwareSlottingService:
         end_date=None,
         optimize_traffic: bool = True,
         ctbsa_parameters: CtbsaParameters | None = None,
+        zone_workload_enabled: bool = False,
         source_grid_project: str = "",
         source_velocity: str = "",
         source_chilled: str = "",
@@ -1643,6 +1825,7 @@ class TrafficAwareSlottingService:
             generation_summary=summary,
             optimize_traffic=optimize_traffic,
             ctbsa_parameters=ctbsa_parameters,
+            zone_workload_enabled=zone_workload_enabled,
         )
 
     @staticmethod
@@ -1696,6 +1879,13 @@ class TrafficAwareSlottingService:
         payload["traffic_analysis"] = {
             "before": result.before.metrics,
             "after": result.after.metrics,
+            "zone_workload_enabled": bool(
+                result.parameters.get("zone_workload_enabled", False)
+            ),
+            "zone_analysis": {
+                "before": result.before.zone_analysis,
+                "after": result.after.zone_analysis,
+            },
             "fulfillment_groups": result.before.demand.fulfillment_groups,
             "handling_unit_visits": result.before.demand.handling_unit_visits,
             "unit_visits": dict(sorted(result.before.demand.unit_visits.items())),
@@ -1751,6 +1941,10 @@ class TrafficAwareSlottingService:
             "parameters": result.parameters,
             "before": {"metrics": result.before.metrics, "resources": result.before.resources},
             "after": {"metrics": result.after.metrics, "resources": result.after.resources},
+            "zone_analysis": {
+                "before": result.before.zone_analysis,
+                "after": result.after.zone_analysis,
+            },
             "relocations": result.relocations,
             "rejected_units": result.rejected_units,
             "trials": result.trials,
