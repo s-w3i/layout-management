@@ -36,17 +36,17 @@ class GlobalTrafficSlottingTests(unittest.TestCase):
         )
         self.requirements = {
             "chilled": False,
+            "max_item_length": 0.1,
+            "max_item_width": 0.1,
+            "max_item_height": 0.1,
+            "max_item_weight": 0.1,
+        }
+        self.capacity = {
+            "chilled": False,
             "max_item_length": 1,
             "max_item_width": 1,
             "max_item_height": 1,
             "max_item_weight": 1,
-        }
-        self.capacity = {
-            "chilled": False,
-            "max_item_length": 10,
-            "max_item_width": 10,
-            "max_item_height": 10,
-            "max_item_weight": 10,
         }
 
     def row(self, sku: str, unit: str, bay: str, vertex: int, zone: str):

@@ -61,14 +61,37 @@ def order_rack_touch_metrics(
         order_masks, group_count = build_order_membership_masks(analysis)
     else:
         group_count = analysis.store_day_count
-    rack_masks: dict[str, int] = {}
+    sku_rack_weights: dict[str, dict[str, float]] = {}
     for row in rows:
         if row.get("assignment_status") != "ASSIGNED":
             continue
         rack_id = str(row.get("rack_id", ""))
         sku = str(row.get("sku", ""))
         if rack_id and sku in order_masks:
-            rack_masks[rack_id] = rack_masks.get(rack_id, 0) | order_masks[sku]
+            try:
+                weight = float(row.get("quantity_ea") or 1)
+            except (TypeError, ValueError):
+                weight = 1.0
+            sku_rack_weights.setdefault(sku, {})[rack_id] = (
+                sku_rack_weights.setdefault(sku, {}).get(rack_id, 0.0)
+                + max(0.0, weight)
+            )
+    rack_masks: dict[str, int] = {}
+    for sku, rack_weights in sorted(sku_rack_weights.items()):
+        assigned = {rack_id: 0 for rack_id in rack_weights}
+        remaining = order_masks.get(sku, 0)
+        while remaining:
+            bit = remaining & -remaining
+            rack_id = min(
+                rack_weights,
+                key=lambda value: (
+                    (assigned[value] + 1) / (rack_weights[value] or 1.0),
+                    value,
+                ),
+            )
+            rack_masks[rack_id] = rack_masks.get(rack_id, 0) | bit
+            assigned[rack_id] += 1
+            remaining ^= bit
     touches = np.zeros(group_count, dtype=np.int32)
     for mask in rack_masks.values():
         remaining = mask
@@ -111,10 +134,12 @@ def handling_unit_visit_metrics(
     )
     unit_masks: dict[str, int] = {}
     unit_locations: dict[str, dict] = {}
+    sku_sources: dict[str, dict[str, dict]] = {}
     for row in rows:
         if row.get("assignment_status") != "ASSIGNED":
             continue
-        sku_mask = order_masks.get(str(row.get("sku", "")), 0)
+        sku = str(row.get("sku", ""))
+        sku_mask = order_masks.get(sku, 0)
         if not sku_mask:
             continue
         occupied_units = row.get("occupied_handling_units") or []
@@ -125,12 +150,41 @@ def handling_unit_visit_metrics(
                 "storage_level": row.get("storage_level", ""),
                 "storage_slot": row.get("storage_slot", ""),
             }]
+        physical_units = set()
         for location in occupied_units:
             unit_id = str(location.get("handling_unit_id", "")).strip()
             if not unit_id:
                 continue
-            unit_masks[unit_id] = unit_masks.get(unit_id, 0) | sku_mask
+            physical_units.add(unit_id)
             unit_locations.setdefault(unit_id, dict(location))
+        primary = str(row.get("handling_unit_id", "")).strip()
+        if not primary or not physical_units:
+            continue
+        try:
+            weight = float(row.get("quantity_ea") or 1)
+        except (TypeError, ValueError):
+            weight = 1.0
+        source = sku_sources.setdefault(sku, {}).setdefault(
+            primary, {"units": set(), "weight": 0.0}
+        )
+        source["units"].update(physical_units)
+        source["weight"] += max(0.0, weight)
+    for sku, sources in sorted(sku_sources.items()):
+        assigned = {primary: 0 for primary in sources}
+        remaining = order_masks.get(sku, 0)
+        while remaining:
+            bit = remaining & -remaining
+            primary = min(
+                sources,
+                key=lambda value: (
+                    (assigned[value] + 1) / (sources[value]["weight"] or 1.0),
+                    value,
+                ),
+            )
+            for unit_id in sources[primary]["units"]:
+                unit_masks[unit_id] = unit_masks.get(unit_id, 0) | bit
+            assigned[primary] += 1
+            remaining ^= bit
     ranked = sorted(
         unit_masks,
         key=lambda unit_id: (-unit_masks[unit_id].bit_count(), unit_id),
@@ -222,13 +276,31 @@ def affinity_placement_order(
     """
     if affinity_weight <= 0 or len(base_order) < 2:
         return list(base_order)
-    rows_by_sku = {
-        str(row.get("sku", "")): row for row in base_order
-    }
-    base_position = {
-        str(row.get("sku", "")): position
-        for position, row in enumerate(base_order)
-    }
+    rows_by_sku: dict[str, list[dict]] = {}
+    base_position: dict[str, int] = {}
+    for position, row in enumerate(base_order):
+        sku = str(row.get("sku", ""))
+        rows_by_sku.setdefault(sku, []).append(row)
+        base_position.setdefault(sku, position)
+    representative = {sku: rows[0] for sku, rows in rows_by_sku.items()}
+
+    def expand_load_order(sku_order: list[str]) -> list[dict]:
+        """Preserve every quantity load after ordering logical SKUs."""
+        load_indices = sorted({
+            int(row.get("quantity_load_index") or 1)
+            for rows in rows_by_sku.values() for row in rows
+        })
+        expanded = []
+        for load_index in load_indices:
+            for sku in sku_order:
+                expanded.extend(sorted(
+                    (
+                        row for row in rows_by_sku[sku]
+                        if int(row.get("quantity_load_index") or 1) == load_index
+                    ),
+                    key=lambda row: str(row.get("inventory_load_id", "")),
+                ))
+        return expanded
     class_rank = {"A": 0.0, "B": 0.5, "C": 1.0}
     abc_weight = 1.0 - affinity_weight
     if order_masks:
@@ -263,7 +335,7 @@ def affinity_placement_order(
                 remaining,
                 key=lambda sku: (
                     abc_weight * class_rank.get(
-                        str(rows_by_sku[sku].get("velocity_class", "")).upper(),
+                        str(representative[sku].get("velocity_class", "")).upper(),
                         1.0,
                     )
                     + affinity_weight * affinity_cost[sku],
@@ -273,13 +345,13 @@ def affinity_placement_order(
                 ),
             )
             remaining.remove(selected)
-            ordered.append(rows_by_sku[selected])
+            ordered.append(selected)
             cluster_mask |= order_masks.get(selected, 0)
             cluster_size += 1
             if cluster_size >= capacity:
                 cluster_mask = 0
                 cluster_size = 0
-        return ordered
+        return expand_load_order(ordered)
     strongest_edge = max(
         (
             float(edge[1])
@@ -304,7 +376,7 @@ def affinity_placement_order(
             key=lambda sku: (
                 abc_weight
                 * class_rank.get(
-                    str(rows_by_sku[sku].get("velocity_class", "")).upper(),
+                    str(representative[sku].get("velocity_class", "")).upper(),
                     1.0,
                 )
                 + affinity_weight
@@ -324,7 +396,7 @@ def affinity_placement_order(
             ),
         )
         remaining.remove(selected)
-        ordered.append(rows_by_sku[selected])
+        ordered.append(selected)
         for related_sku, relationship_weight, _score, _shared in (
             affinity_neighbors.get(selected, [])
         ):
@@ -333,7 +405,7 @@ def affinity_placement_order(
                     connection_strength[related_sku],
                     float(relationship_weight),
                 )
-    return ordered
+    return expand_load_order(ordered)
 
 
 def affinity_physical_signature(candidate_key: tuple) -> tuple:

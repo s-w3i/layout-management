@@ -1,0 +1,5 @@
+attribute_combination,sku_count,total_required_ea,required_slots,required_racks,unresolved_skus
+chilled=F · oversize=F,1365,231699,2987,249,0
+chilled=F · oversize=T,7,7,7,1,7
+chilled=T · oversize=F,151,26351,254,22,0
+chilled=T · oversize=T,1,1,1,1,1

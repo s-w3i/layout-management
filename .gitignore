@@ -7,6 +7,16 @@ __pycache__/
 .ruff_cache/
 .cache/
 
+# Local document build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+
 *.tmp
 *.bak
 *~
@@ -17,6 +27,10 @@ resources/data/Sample Data.xlsx
 resources/data/sku_velocity_output/demand_plots/
 resources/data/basic_slotting_layout.csv
 resources/data/*.slotting.json
+resources/data/*.backup-*.xlsx
+resources/data/sku_affinity_cache/
+resources/data/*.slotting_search/
+resources/map/*.slotting_search/
 
 # Local warehouse drawings and non-demo design references
 resources/map/AMR layout-1.png

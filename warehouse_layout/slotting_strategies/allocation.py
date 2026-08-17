@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 
 import numpy as np
 
@@ -40,6 +41,7 @@ SHARED_HARD_RULE_PROFILE = "map_authoritative_warehouse_feasibility/v4"
 SHARED_HARD_RULES = (
     "configured_handling_unit_and_buffer_capacity",
     "unique_storage_position_occupancy",
+    "amr_cumulative_whole_rack_weight_capacity",
     "configured_map_attribute_compatibility",
     "known_oversize_contiguous_footprint",
     "known_overweight_required_level",
@@ -47,6 +49,71 @@ SHARED_HARD_RULES = (
     "warehouse_wide_constrained_inventory_footprint_reservation",
     "no_automatic_zone_split_or_non_weight_attribute_mutation",
 )
+
+
+def expand_quantity_slot_loads(sku_rows: list[dict]) -> tuple[list[dict], dict]:
+    """Expand stock targets into independently placeable slot loads.
+
+    Quantity loads are independent records so they can be spread across racks.
+    ``slots_per_unit`` remains a physical footprint on each load and is not
+    expanded a second time; the allocator still reserves that footprint as one
+    contiguous block.
+    """
+    expanded: list[dict] = []
+    legacy_load_counts: dict[str, int] = defaultdict(int)
+    quantity_enabled_skus = 0
+    zero_required_skus = 0
+    for source in sku_rows:
+        row = dict(source)
+        raw_required_slots = row.get("required_slots")
+        if raw_required_slots in (None, ""):
+            sku = str(row.get("sku", ""))
+            legacy_load_counts[sku] += 1
+            legacy_id = (
+                sku if legacy_load_counts[sku] == 1
+                else f"{sku}#LEGACY{legacy_load_counts[sku]:03d}"
+            )
+            row.setdefault("inventory_load_id", legacy_id)
+            row.setdefault("quantity_load_index", 1)
+            row.setdefault("quantity_load_count", 1)
+            row.setdefault("quantity_ea", row.get("total_required_ea", ""))
+            expanded.append(row)
+            continue
+        try:
+            required_slots = max(0, int(math.ceil(float(raw_required_slots))))
+            slots_per_unit = max(
+                1, int(math.ceil(float(row.get("slots_per_unit") or 1)))
+            )
+            total_required = max(
+                0, int(math.ceil(float(row.get("total_required_ea") or 0)))
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"SKU {row.get('sku', '')} has invalid stock slot quantities"
+            ) from exc
+        if required_slots == 0 or total_required == 0:
+            zero_required_skus += 1
+            continue
+        load_count = max(1, math.ceil(required_slots / slots_per_unit))
+        quantity_enabled_skus += 1
+        base_quantity, remainder = divmod(total_required, load_count)
+        width = max(3, len(str(load_count)))
+        for index in range(1, load_count + 1):
+            load = dict(row)
+            load["inventory_load_id"] = (
+                f"{row.get('sku', '')}#Q{index:0{width}d}"
+            )
+            load["quantity_load_index"] = index
+            load["quantity_load_count"] = load_count
+            load["quantity_ea"] = base_quantity + (index <= remainder)
+            load["required_slot_count"] = required_slots
+            expanded.append(load)
+    return expanded, {
+        "source_sku_count": len(sku_rows),
+        "inventory_load_count": len(expanded),
+        "quantity_enabled_sku_count": quantity_enabled_skus,
+        "zero_required_sku_count": zero_required_skus,
+    }
 
 
 def allocate(
@@ -88,6 +155,7 @@ def allocate(
         raise ValueError("minimum affinity score must be between 0 and 1")
     if maximum_service_distance_increase < 0:
         raise ValueError("maximum service-distance increase cannot be negative")
+    sku_rows, quantity_summary = expand_quantity_slot_loads(sku_rows)
     affinity_enabled = strategy == "abc_affinity"
     if affinity_enabled and affinity_analysis is None:
         raise ValueError("ABC + affinity strategy requires affinity analysis")
@@ -111,6 +179,10 @@ def allocate(
             raise ValueError(
                 "rack capacity must match the buffers generated in the grid project"
             )
+        service.attributes.set_machine_carrying_capacity(
+            getattr(storage_layout, "machine_carrying_capacity", None),
+            handling_unit_type,
+        )
         roots_by_waypoint = {}
         for buffer in storage_layout.buffers:
             waypoint = str(buffer.get("grid_waypoint", ""))
@@ -123,6 +195,10 @@ def allocate(
                     f"rack {rack['waypoint']} has no generated storage buffer"
                 )
             rack["static_bay_id"] = roots_by_waypoint[rack["waypoint"]]
+    else:
+        # Calls without a grid project retain the legacy unbounded machine
+        # envelope and continue to classify against slot capacities only.
+        service.attributes.set_machine_carrying_capacity(None, handling_unit_type)
     unit_prefix = {
         "AMR shelf": "SHELF",
         "Tote": "TOTE",
@@ -318,14 +394,22 @@ def allocate(
         base_sorted_skus = sorted(
             sku_rows,
             key=lambda row: (
-                ctbsa_rank_by_sku.get(str(row.get("sku", "")), 10**12),
+                ctbsa_rank_by_sku.get(
+                    str(row.get("inventory_load_id", "")),
+                    ctbsa_rank_by_sku.get(str(row.get("sku", "")), 10**12),
+                ),
                 str(row.get("sku", "")),
+                str(row.get("inventory_load_id", "")),
             ),
         )
     else:
         base_sorted_skus = sorted(
             sku_rows,
             key=lambda row: (
+                # Place one load of every SKU before replenishment loads. This
+                # discovers the compact system rack pool early enough for hot
+                # quantity loads to spread without opening dedicated racks.
+                int(row.get("quantity_load_index") or 1),
                 class_rank.get(str(row.get("velocity_class", "")).upper(), 9),
                 physical_group_rank(row),
                 -float(row.get("pick_frequency") or 0),
@@ -430,6 +514,7 @@ def allocate(
     # placement making a feasible warehouse layout appear infeasible.
     position_by_key = {position_key(item): item for item in positions}
     constrained_records = []
+    constrained_inventory_total = 0
     for strategy_rank, sku in enumerate(sorted_skus, start=1):
         requirements = sku.get("sku_requirements")
         if not isinstance(requirements, dict):
@@ -444,6 +529,12 @@ def allocate(
         )
         if not profile or not requires_oversize_capable(profile):
             continue
+        constrained_inventory_total += 1
+        if len(constrained_records) >= len(positions):
+            # At most one constrained load can anchor per physical position.
+            # Additional loads are still emitted as unassigned records below,
+            # but duplicating every candidate footprint for them wastes memory.
+            continue
         physical_class = str(profile.get("storage_class", "")).upper()
         overweight = physical_class in {
             "OVERWEIGHT", "OVERSIZE_AND_OVERWEIGHT"
@@ -455,7 +546,10 @@ def allocate(
         placements = []
         seen_footprints = set()
         for candidate in positions:
-            target_rack = ctbsa_target_racks.get(str(sku.get("sku", "")))
+            target_rack = ctbsa_target_racks.get(
+                str(sku.get("inventory_load_id", "")),
+                ctbsa_target_racks.get(str(sku.get("sku", ""))),
+            )
             if target_rack and str(candidate.get("rack_id", "")) != target_rack:
                 continue
             effective = candidate["effective_location_attributes"]
@@ -555,6 +649,8 @@ def allocate(
         ))
         constrained_records.append({
             "row_id": id(sku),
+            "sku": str(sku.get("sku", "")),
+            "spread_quantity": int(sku.get("quantity_load_count") or 1) > 1,
             "strategy_rank": strategy_rank,
             "placements": placements,
             "largest_footprint": max(
@@ -567,8 +663,34 @@ def allocate(
     ]
     reserved_footprints_by_row_id: dict[int, tuple] = {}
     occupied_reservations: set[tuple[str, int, int]] = set()
+    quantity_reservations_by_sku: dict[str, list[tuple]] = defaultdict(list)
     search_nodes = 0
     search_node_limit = 250_000
+
+    def reservation_spread_key(record: dict, footprint: tuple) -> tuple:
+        rack_id = footprint[0][0]
+        opened_racks = {position[0] for position in occupied_reservations}
+        new_rack_penalty = int(rack_id not in opened_racks)
+        if not record["spread_quantity"]:
+            return (new_rack_penalty, 0, 0)
+        sku_footprints = quantity_reservations_by_sku[record["sku"]]
+        rack_count = sum(
+            prior[0][0] == rack_id for prior in sku_footprints if prior
+        )
+        prior_positions = {
+            position
+            for prior in sku_footprints
+            for position in prior
+            if position[0] == rack_id
+        }
+        adjacent = any(
+            existing[0] == position[0]
+            and abs(existing[1] - position[1])
+            + abs(existing[2] - position[2]) == 1
+            for existing in prior_positions
+            for position in footprint
+        )
+        return (new_rack_penalty, rack_count, int(adjacent))
 
     def reserve_all(remaining: tuple[dict, ...]) -> bool:
         nonlocal search_nodes
@@ -597,21 +719,40 @@ def allocate(
         next_remaining = tuple(
             record for record in remaining if record is not selected
         )
-        for footprint in viable:
+        for footprint in sorted(
+            viable, key=lambda value: reservation_spread_key(selected, value)
+        ):
             occupied_reservations.update(footprint)
             reserved_footprints_by_row_id[selected["row_id"]] = footprint
+            if selected["spread_quantity"]:
+                quantity_reservations_by_sku[selected["sku"]].append(footprint)
             if reserve_all(next_remaining):
                 return True
+            if selected["spread_quantity"]:
+                quantity_reservations_by_sku[selected["sku"]].pop()
             reserved_footprints_by_row_id.pop(selected["row_id"], None)
             occupied_reservations.difference_update(footprint)
         return False
 
-    complete_constrained_plan = reserve_all(tuple(plannable_records))
+    minimum_constrained_slots = sum(
+        min(len(footprint) for footprint in record["placements"])
+        for record in plannable_records
+    )
+    provably_insufficient_constrained_capacity = (
+        constrained_inventory_total > len(constrained_records)
+        or minimum_constrained_slots > len(positions)
+    )
+    complete_constrained_plan = (
+        False
+        if provably_insufficient_constrained_capacity
+        else reserve_all(tuple(plannable_records))
+    )
     if not complete_constrained_plan:
         # Deterministic best-effort fallback for genuinely insufficient maps or
         # unusually large searches: reserve the hardest feasible items first.
         reserved_footprints_by_row_id.clear()
         occupied_reservations.clear()
+        quantity_reservations_by_sku.clear()
         fallback_order = sorted(
             plannable_records,
             key=lambda record: (
@@ -621,14 +762,21 @@ def allocate(
             ),
         )
         for record in fallback_order:
-            footprint = next((
+            viable = [
                 value for value in record["placements"]
                 if not occupied_reservations.intersection(value)
-            ), None)
+            ]
+            footprint = min(
+                viable,
+                key=lambda value: reservation_spread_key(record, value),
+                default=None,
+            )
             if footprint is None:
                 continue
             reserved_footprints_by_row_id[record["row_id"]] = footprint
             occupied_reservations.update(footprint)
+            if record["spread_quantity"]:
+                quantity_reservations_by_sku[record["sku"]].append(footprint)
     reserved_owner_by_position = {
         key: row_id
         for row_id, footprint in reserved_footprints_by_row_id.items()
@@ -671,7 +819,33 @@ def allocate(
     )
     available_positions = list(positions)
     rack_state: dict[str, dict] = {}
+    rack_max_weight = None
+    if handling_unit_type == "AMR shelf":
+        raw_rack_weight = (
+            getattr(storage_layout, "machine_carrying_capacity", {}).get(
+                PHYSICAL_WEIGHT_KEY
+            )
+            if storage_layout is not None else None
+        )
+        if raw_rack_weight in (None, ""):
+            raw_rack_weight = service.attributes.machine_carrying_capacity.get(
+                PHYSICAL_WEIGHT_KEY
+            )
+        try:
+            rack_max_weight = float(raw_rack_weight)
+        except (TypeError, ValueError):
+            rack_max_weight = None
+        if rack_max_weight is not None and (
+            not math.isfinite(rack_max_weight) or rack_max_weight <= 0
+        ):
+            rack_max_weight = None
     assigned_affinity_positions: dict[str, dict] = {}
+    quantity_rack_counts: dict[str, dict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
+    quantity_positions_by_sku: dict[str, list[tuple[str, int, int]]] = (
+        defaultdict(list)
+    )
     for placement_rank, sku in enumerate(sorted_skus, start=1):
         planned_footprint = reserved_footprints_by_row_id.get(id(sku))
         planned_footprint_set = set(planned_footprint or ())
@@ -706,6 +880,18 @@ def allocate(
             )
         except (TypeError, ValueError):
             ergonomic_sku_weight = 0.0
+        try:
+            load_quantity = float(sku.get("quantity_ea") or 1)
+        except (TypeError, ValueError):
+            load_quantity = 1.0
+        inventory_load_weight = (
+            ergonomic_sku_weight * load_quantity
+            if math.isfinite(ergonomic_sku_weight)
+            and ergonomic_sku_weight > 0
+            and math.isfinite(load_quantity)
+            and load_quantity > 0
+            else None
+        )
         ergonomic_preference_enabled = bool(
             ergonomic_weight_heuristic
             and ergonomic_sku_weight > 0
@@ -764,8 +950,28 @@ def allocate(
                 if planned_anchor and candidate_position_key != planned_anchor:
                     continue
                 effective = dict(candidate["effective_location_attributes"])
-                target_rack = ctbsa_target_racks.get(current_sku)
+                target_rack = ctbsa_target_racks.get(
+                    str(sku.get("inventory_load_id", "")),
+                    ctbsa_target_racks.get(current_sku),
+                )
                 if target_rack and str(candidate.get("rack_id", "")) != target_rack:
+                    continue
+                candidate_rack_state = rack_state.get(
+                    str(candidate.get("rack_id", "")), {}
+                )
+                if (
+                    rack_max_weight is not None
+                    and inventory_load_weight is not None
+                    and float(candidate_rack_state.get("cumulative_weight_kg", 0.0))
+                    + inventory_load_weight
+                    > rack_max_weight + 1e-9
+                ):
+                    issue = (
+                        "AMR whole-rack cumulative weight would exceed "
+                        f"{rack_max_weight:g} kg"
+                    )
+                    if issue not in hard_issues:
+                        hard_issues.append(issue)
                     continue
                 physical_class = str(profile.get("storage_class", "")).upper()
                 overweight = physical_class in {
@@ -1078,7 +1284,7 @@ def allocate(
                     levels_per_rack,
                     occupied_positions,
                     ergonomic_weight_heuristic,
-                    auto_plan_oversize,
+                    strategy != "ctbsa",
                 )
                 exception_inventory = (
                     profile["storage_class"] != "STANDARD"
@@ -1101,8 +1307,49 @@ def allocate(
                     missing_override_keys,
                 ))
             if hard_candidates:
+                spread_candidates = hard_candidates
+                if int(sku.get("quantity_load_count") or 1) > 1:
+                    # Quantity diversity is a secondary objective. Reuse the
+                    # compatible rack pool already opened by the whole system;
+                    # do not open one rack per load merely to spread a SKU.
+                    opened_candidates = [
+                        record for record in spread_candidates
+                        if str(record[2]["rack_id"]) in rack_state
+                    ]
+                    if opened_candidates:
+                        spread_candidates = opened_candidates
+                    rack_counts = quantity_rack_counts[current_sku]
+                    minimum_rack_count = min(
+                        rack_counts[str(record[2]["rack_id"])]
+                        for record in spread_candidates
+                    )
+                    spread_candidates = [
+                        record for record in spread_candidates
+                        if rack_counts[str(record[2]["rack_id"])]
+                        == minimum_rack_count
+                    ]
+                    prior_positions = quantity_positions_by_sku[current_sku]
+
+                    def adjacent_to_same_sku(record) -> bool:
+                        return any(
+                            prior[0] == str(position["rack_id"])
+                            and abs(prior[1] - int(position["level"]))
+                            + abs(prior[2] - int(position["slot"])) == 1
+                            for prior in prior_positions
+                            for position in record[4]
+                        )
+
+                    minimum_adjacency = min(
+                        int(adjacent_to_same_sku(record))
+                        for record in spread_candidates
+                    )
+                    spread_candidates = [
+                        record for record in spread_candidates
+                        if int(adjacent_to_same_sku(record))
+                        == minimum_adjacency
+                    ]
                 baseline_candidate = min(
-                    hard_candidates, key=lambda item: item[0]
+                    spread_candidates, key=lambda item: item[0]
                 )
                 selected_candidate = baseline_candidate
                 related_assigned = [
@@ -1138,7 +1385,7 @@ def allocate(
                         else math.inf
                     )
                     eligible = []
-                    for candidate_record in hard_candidates:
+                    for candidate_record in spread_candidates:
                         (
                             key, _index, candidate, _overrides, _occupied,
                             _missing_override_keys,
@@ -1416,9 +1663,12 @@ def allocate(
                         "physical_buckets": set(),
                         "has_oversize": False,
                         "order_mask": 0,
+                        "cumulative_weight_kg": 0.0,
                     },
                 )
                 selected_state["order_mask"] |= current_order_mask
+                if inventory_load_weight is not None:
+                    selected_state["cumulative_weight_kg"] += inventory_load_weight
                 selected_state["velocity_classes"].add(
                     str(sku.get("velocity_class", "")).upper()
                 )
@@ -1454,6 +1704,18 @@ def allocate(
                     for key, value in sorted(auto_overrides.items())
                 )
                 assigned_affinity_positions[current_sku] = position
+                if int(sku.get("quantity_load_count") or 1) > 1:
+                    quantity_rack_counts[current_sku][
+                        str(position["rack_id"])
+                    ] += 1
+                    quantity_positions_by_sku[current_sku].extend(
+                        (
+                            str(item["rack_id"]),
+                            int(item["level"]),
+                            int(item["slot"]),
+                        )
+                        for item in occupied_positions
+                    )
             else:
                 mismatch_details = hard_issues
         if position:
@@ -1497,6 +1759,32 @@ def allocate(
                 "STANDARD_FIRST" if not exception_inventory else "OVERSIZE_LAST"
             ),
             "sku": sku.get("sku", ""),
+            "inventory_load_id": sku.get(
+                "inventory_load_id", sku.get("sku", "")
+            ),
+            "quantity_load_index": sku.get("quantity_load_index", 1),
+            "quantity_load_count": sku.get("quantity_load_count", 1),
+            "quantity_ea": sku.get("quantity_ea", ""),
+            "inventory_load_weight_kg": (
+                round(inventory_load_weight, 9)
+                if inventory_load_weight is not None else ""
+            ),
+            "rack_cumulative_weight_kg": (
+                round(
+                    float(rack_state.get(str(position["rack_id"]), {}).get(
+                        "cumulative_weight_kg", 0.0
+                    )),
+                    9,
+                )
+                if position else ""
+            ),
+            "total_required_ea": sku.get("total_required_ea", ""),
+            "units_per_slot": sku.get("units_per_slot", ""),
+            "slots_per_unit": sku.get("slots_per_unit", ""),
+            "required_slot_count": sku.get(
+                "required_slot_count", sku.get("required_slots", "")
+            ),
+            "required_racks": sku.get("required_racks", ""),
             "velocity_class": sku.get("velocity_class", ""),
             "pick_frequency": sku.get("pick_frequency", ""),
             "total_quantity_ea": sku.get("total_quantity_ea", ""),
@@ -1730,20 +2018,78 @@ def allocate(
         if buffer_model
         else len(racks) if handling_unit_type == "AMR shelf" else len(positions)
     )
+    loads_by_sku: dict[str, list[dict]] = defaultdict(list)
+    for row in output:
+        loads_by_sku[str(row.get("sku", ""))].append(row)
+    fully_assigned_sku_count = sum(
+        all(row["assignment_status"] == "ASSIGNED" for row in rows)
+        for rows in loads_by_sku.values()
+    )
+    partially_assigned_sku_count = sum(
+        any(row["assignment_status"] == "ASSIGNED" for row in rows)
+        and any(row["assignment_status"] != "ASSIGNED" for row in rows)
+        for rows in loads_by_sku.values()
+    )
+    unassigned_sku_count = sum(
+        all(row["assignment_status"] != "ASSIGNED" for row in rows)
+        for rows in loads_by_sku.values()
+    )
+    assigned_load_count = sum(
+        row["assignment_status"] == "ASSIGNED" for row in output
+    )
+    unassigned_load_count = len(output) - assigned_load_count
+    occupied_racks = sorted({
+        str(row.get("rack_id", "")) for row in output
+        if row.get("assignment_status") == "ASSIGNED" and row.get("rack_id")
+    })
+
+    def assigned_quantity(rows: list[dict], rack_id: str) -> float:
+        total = 0.0
+        for row in rows:
+            if (
+                row.get("assignment_status") != "ASSIGNED"
+                or str(row.get("rack_id", "")) != rack_id
+            ):
+                continue
+            try:
+                total += float(row.get("quantity_ea") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    sku_rack_distribution = {
+        sku: {
+            rack_id: assigned_quantity(rows, rack_id)
+            for rack_id in sorted({
+                str(row.get("rack_id", "")) for row in rows
+                if row.get("assignment_status") == "ASSIGNED"
+                and row.get("rack_id")
+            })
+        }
+        for sku, rows in sorted(loads_by_sku.items())
+    }
     summary = {
         "strategy": strategy,
         "hard_rule_profile": SHARED_HARD_RULE_PROFILE,
         "hard_rules": list(SHARED_HARD_RULES),
-        "sku_count": len(sorted_skus),
-        "assigned_count": sum(
-            row["assignment_status"] == "ASSIGNED" for row in output
-        ),
+        "sku_count": quantity_summary["source_sku_count"],
+        "inventory_load_count": quantity_summary["inventory_load_count"],
+        "quantity_enabled_sku_count": quantity_summary[
+            "quantity_enabled_sku_count"
+        ],
+        "zero_required_sku_count": quantity_summary[
+            "zero_required_sku_count"
+        ],
+        "fully_assigned_sku_count": fully_assigned_sku_count,
+        "partially_assigned_sku_count": partially_assigned_sku_count,
+        "unassigned_sku_count": unassigned_sku_count,
+        "assigned_load_count": assigned_load_count,
+        "unassigned_load_count": unassigned_load_count,
+        "assigned_count": assigned_load_count,
         "occupied_slot_count": sum(
             int(row.get("occupied_slot_count", 0)) for row in output
         ),
-        "unassigned_count": sum(
-            row["assignment_status"] != "ASSIGNED" for row in output
-        ),
+        "unassigned_count": unassigned_load_count,
         "unassigned_no_capacity_count": status_counts["UNASSIGNED_NO_CAPACITY"],
         "unassigned_no_compatible_location_count": status_counts[
             "UNASSIGNED_NO_COMPATIBLE_LOCATION"
@@ -1770,25 +2116,36 @@ def allocate(
         "auto_adjusted_oversize_zone_weight_capacities": (
             auto_adjusted_oversize_zone_weight_capacities
         ),
-        "constrained_inventory_count": len(constrained_records),
+        "constrained_inventory_count": constrained_inventory_total,
         "reserved_constrained_inventory_count": len(
             reserved_footprints_by_row_id
         ),
         "reserved_constrained_slot_count": len(reserved_owner_by_position),
         "unreservable_constrained_inventory_count": (
-            len(constrained_records) - len(reserved_footprints_by_row_id)
+            constrained_inventory_total - len(reserved_footprints_by_row_id)
         ),
         "constrained_feasibility_plan_complete": bool(
             complete_constrained_plan
             and len(plannable_records) == len(constrained_records)
         ),
         "constrained_feasibility_search_nodes": search_nodes,
+        "provably_insufficient_constrained_capacity": (
+            provably_insufficient_constrained_capacity
+        ),
         "auto_planned_oversize_segment_count": sum(
             storage_type == "OVERSIZE"
             for storage_type in planned_zone_types.values()
         ),
         "rack_count": len(racks),
         "usable_rack_count": len(usable_racks),
+        "compact_rack_count": len(occupied_racks),
+        "final_occupied_rack_count": len(occupied_racks),
+        "occupied_rack_ids": occupied_racks,
+        "sku_rack_distribution": sku_rack_distribution,
+        "consolidation_status": (
+            "COMPACT_POOL_ALLOCATED" if not unassigned_load_count
+            else "PARTIAL_CAPACITY_OR_COMPATIBILITY"
+        ),
         "unreachable_rack_count": unreachable_count,
         "workstation_count": workstation_count,
         "capacity": len(positions),

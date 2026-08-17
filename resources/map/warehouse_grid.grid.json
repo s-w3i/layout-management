@@ -2417,7 +2417,13 @@
         "buffer_level": "grid",
         "status": "EMPTY"
       }
-    ]
+    ],
+    "machine_carrying_capacity": {
+      "max_item_length": null,
+      "max_item_width": null,
+      "max_item_height": null,
+      "max_item_weight": 150.0
+    }
   },
   "zone_assignments": {
     "G0_0": "Z01",
@@ -2586,14 +2592,33 @@
       "value_type": "boolean",
       "match_rule": "exact",
       "unit": "",
-      "choices": []
+      "choices": [],
+      "hierarchy_level": 1
+    },
+    {
+      "key": "tablet",
+      "label": "Tablet",
+      "value_type": "boolean",
+      "match_rule": "exact",
+      "unit": "",
+      "choices": [],
+      "hierarchy_level": 2
+    },
+    {
+      "key": "flammable",
+      "label": "Flammable",
+      "value_type": "boolean",
+      "match_rule": "exact",
+      "unit": "",
+      "choices": [],
+      "hierarchy_level": 2
     },
     {
       "key": "max_item_height",
       "label": "Maximum item height",
       "value_type": "number",
       "match_rule": "capacity",
-      "unit": "source length unit",
+      "unit": "m",
       "choices": []
     },
     {
@@ -2601,7 +2626,7 @@
       "label": "Maximum item length",
       "value_type": "number",
       "match_rule": "capacity",
-      "unit": "source length unit",
+      "unit": "m",
       "choices": []
     },
     {
@@ -2609,7 +2634,7 @@
       "label": "Maximum item weight",
       "value_type": "number",
       "match_rule": "capacity",
-      "unit": "source weight unit",
+      "unit": "kg",
       "choices": []
     },
     {
@@ -2617,7 +2642,7 @@
       "label": "Maximum item width",
       "value_type": "number",
       "match_rule": "capacity",
-      "unit": "source length unit",
+      "unit": "m",
       "choices": []
     },
     {
@@ -2631,92 +2656,104 @@
   ],
   "location_attributes": {
     "Z01": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z02": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": true,
       "oversize_capable": false
     },
     "Z03": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z04": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z05": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z06": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z07": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z08": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z09": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z10": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     },
     "Z11": {
-      "max_item_length": 25,
-      "max_item_width": 19.3,
-      "max_item_height": 19.2,
-      "max_item_weight": 465,
+      "max_item_length": 1.9,
+      "max_item_width": 0.5,
+      "max_item_height": 1.0,
+      "max_item_weight": 12.5,
       "chilled": false,
       "oversize_capable": false
     }
+  },
+  "warehouse_storage_defaults": {
+    "max_item_length": 1.9,
+    "max_item_width": 0.5,
+    "max_item_height": 1.0,
+    "max_item_weight": 12.5
+  },
+  "machine_carrying_capacity": {
+    "max_item_length": null,
+    "max_item_width": null,
+    "max_item_height": null,
+    "max_item_weight": 150.0
   }
 }

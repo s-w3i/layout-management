@@ -139,7 +139,7 @@ Run the full basic-to-global pipeline:
 ```bash
 python3 global_traffic_slotting.py \
   --mode full \
-  --grid-project resources/map/demo.grid.json \
+  --grid-project resources/map/map1.grid.json \
   --velocity resources/data/sku_velocity_output/sku_velocity_summary.csv \
   --orders "resources/data/Sample Data.xlsx" \
   --initial-strategy basic \

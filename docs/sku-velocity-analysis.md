@@ -70,8 +70,10 @@ python3 sku_velocity_analysis.py \
 
 The summary includes `req_max_item_length`, `req_max_item_width`,
 `req_max_item_height`, `req_max_item_weight`, `physical_data_status`, and
-`physical_storage_class`. Against the demo standard limits 25.0 × 19.3 × 19.2 and
-weight 465.0, complete SKUs are classified as standard, oversize, overweight, or
+`physical_storage_class`. Source dimensions are converted from centimetres to
+metres and source weights from grams to kilograms. Against the calibrated demo
+slot limits of 1.9 × 0.5 × 1.0 m and 12.5 kg, complete SKUs are classified as
+standard, oversize, overweight, or
 both. Missing weight is conservatively classified as overweight, missing size
 as oversize, and missing both usable size and weight as oversize plus
 overweight; the data status remains `MISSING`. During inventory slotting,

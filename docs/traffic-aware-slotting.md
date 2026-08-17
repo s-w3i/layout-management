@@ -1,27 +1,18 @@
 # Traffic-Aware Slotting
 
-The **Traffic-Aware Slotting** tab supports two workflows:
+The **Traffic-Aware Slotting** tab runs C&TBSA directly from an editable
+`.grid.json`, SKU demand and physical requirements, and order history. ABC and
+the separate affinity-slotting strategy are optional comparison methods in
+Inventory Slotting; neither is a C&TBSA prerequisite.
 
-1. **Optimize Existing Layout** loads a `.slotting.json`, validates its assigned
-   inventory, and applies traffic-aware complete-unit relocation. Unassigned
-   SKU rows are excluded and retained unchanged. It never regenerates or
-   reorders the baseline with ABC or affinity.
-2. **Generate Layout + Optimize Traffic** starts from an editable `.grid.json`,
-   velocity data, and order history. Select either **ABC** or
-   **ABC + Affinity** as the initial layout strategy, then run hard-rule
-   validation, demand calculation, traffic optimization, and final comparison.
-
-Neither workflow reads a building YAML. The grid project supplies the physical
+The workflow does not read a building YAML. The grid project supplies the physical
 map, generated buffers, rack zones, chilled/capacity settings, attribute
-catalog, and inherited hierarchy values. A saved layout carries the same data
-as a self-contained baseline.
+catalog, and inherited hierarchy values.
 
-The UI separates these inputs into two panels. **Initial ABC / affinity layout
-generation** contains the grid project, velocity/chilled data, initial strategy,
-and affinity weight used only by the full pipeline. **Traffic-aware
-optimization** contains the optional existing layout, order history, movement
-network, date range, congestion/travel parameters, and optimized output used by
-the traffic stage.
+The UI separates inputs into two panels. **Warehouse and SKU constraints**
+contains the grid project and SKU physical/chilled data. **Paper C&TBSA and
+static validation** contains order history, optional movement network, date
+range, NSGA-II parameters, and output.
 
 ## Warehouse configuration and complete assignment
 
@@ -34,9 +25,18 @@ not duplicate its editors.
 If chilled or compatible capacity is insufficient, generation stops and directs
 the operator to update and resave the grid project before rerunning.
 
-The generated ABC or ABC + affinity baseline uses the same allocator and hard
-rules as Inventory Slotting. Only the selected baseline is generated. Standard
-inventory is placed before exception inventory.
+Attribute activation is identical to Basic and Affinity slotting. The workflow
+intersects SKU requirements discovered from the selected CSV with attributes
+configured on zone roots. A CSV attribute absent from every zone is ignored.
+Every active attribute is inherited from the saved map and used to partition
+compatible C&TBSA rack groups; the implementation has no chilled-only or
+dataset-specific attribute list.
+
+An internal physical-feasibility seed uses the shared allocator only to enforce
+warehouse rules, reserve exception storage, and identify eligible standard
+shelves. It is not an ABC or affinity optimization, and its standard-SKU
+membership is discarded by C&TBSA. Standard inventory is placed before
+exception inventory.
 Ambient user zones remain non-mixed `STANDARD` or `OVERSIZE` zones. A chilled
 zone can split by whole rack into `*_chill_normal` and `*_chill_oversize`, with
 standard chilled demand receiving capacity first. Known overweight and
@@ -47,10 +47,34 @@ compatible capacity is insufficient, assigned inventory continues through
 traffic optimization while unassigned rows are excluded, retained unchanged,
 and reported. A layout with no assigned inventory still stops.
 
-Traffic optimization swaps complete handling units only. It preserves the
-destination's zone, segment, buffer, capacity, and static address metadata.
-Standard and exception segments cannot be crossed, weight capacity is never
-bypassed, and units with incomplete physical data remain fixed and reported.
+C&TBSA follows Lee, Chung, and Yoon (2020): Stage 1 clusters inventory items and
+Stage 2 assigns the clusters
+to storage areas. For this AMR warehouse, one complete shelf is one storage
+area and its levels/slots are the paper's individual storage locations.
+Physical-exception or incomplete-data shelves remain fixed and are reported.
+
+## Hard constraints
+
+The paper model enforces:
+
+1. Every inventory load is assigned to exactly one cluster:
+   `sum_k x(j,k) = 1`.
+2. Cluster `k` contains no more loads than its available locations:
+   `sum_j x(j,k) <= Z(k)`.
+3. Cluster demand is bounded by the optimized maximum:
+   `sum_j F(j)x(j,k) <= Wmax`.
+4. `x(j,k)` is binary. The permutation chromosome and fixed-capacity section
+   boundaries preserve the first two constraints during NSGA-II operations.
+
+The warehouse implementation adds non-paper safety constraints: AMR-shelf
+storage only, unique occupied addresses, separation by every map-active SKU
+attribute profile, inherited attribute compatibility, and physical capacity
+checks. Oversize, overweight,
+multi-slot, incomplete-data, or otherwise exceptional racks remain fixed because
+the paper assumes one SKU occupies one ordinary storage location. These additions
+restrict feasibility but do not change either paper objective. Quantity support
+treats each `inventory_load_id` as one paper item, divides its logical SKU demand
+by stored quantity, and therefore permits one SKU to appear in multiple clusters.
 
 ## Demand definition
 
@@ -104,37 +128,51 @@ relative expected resource load.
 addresses, rack IDs, waypoints, pickup IDs, or vertex references to nodes.
 Unmapped and unreachable handling units remain visible in the results.
 
-## Optimization and safety
+## Paper-replication optimization
 
-The optimizer evaluates deterministic complete-unit swaps. Feasible candidates
-must have matching slot shapes and must pass chilled, rotatable dimension,
-maximum-weight, generic attribute, and capacity checks in both directions.
-Incomplete physical data fixes a unit in place. No local capacity override is
-created by this stage.
+For order `i`, SKU `j`, and shelf cluster `k`, the paper defines demand and
+correlation as `F(j) = sum_i y(i,j)` and
+`N(j,j') = sum_i y(i,j)y(i,j')`, where `y(i,j)=1` when order `i` requests SKU
+`j`. Stage 1 maximizes total `N(j,j')` for SKU pairs in the same cluster and
+minimizes `Wmax`, the largest sum of `F(j)` in any cluster.
 
-Candidate layouts are ranked by peak normalized resource load, P95 load, total
-expected travel, and relocation count. Automatic generation derives travel-cap
-candidates from feasible swaps in the active dataset, evaluates their Pareto
-tradeoff, and exposes the selected maximum travel increase and hotspot
-percentile for operator adjustment. Before and after relative metrics retain the
-same baseline denominator; raw peak and P95 traffic are also reported.
+For a multi-rack SKU, the implementation divides `F(j)` proportionally across
+its quantity loads. Loads of the same SKU have no artificial self-correlation;
+correlation with other SKUs remains inherited from `N(j,j')`. The original
+maximum-cluster-demand and correlation objectives are otherwise unchanged.
+
+A chromosome is a permutation divided into shelf-capacity sections. Empty shelf
+slots are zero-demand dummy genes. NSGA-II uses the paper's final settings:
+population 100, PMX crossover probability 0.9, 2-opt swap mutation probability
+0.1, and 50,000 generations. Five evenly distributed Pareto representatives
+are retained and balanced solution `C&TBSA3` is selected by default.
+
+In Stage 2, clusters are sorted by decreasing demand and assigned to shelves in
+increasing average workstation distance. Load order within a shelf is randomized
+with a recorded seed. Chilled inventory uses a separate feasibility stratum;
+oversize, overweight, multi-slot, or incomplete-data exception shelves remain
+fixed so each exceptional load retains its required physical footprint.
+
+Expected lane load is calculated only after placement. It is a static diagnostic
+and does not affect either paper objective. No picking-delay, collision, queue,
+or throughput result is claimed without simulation.
 
 The preview overlays lane traffic and handling-unit visits. Lanes use a
 blue-to-red load scale. Rack markers use the same scale based on visits generated
-at that location. Swapped racks remain outlined in both Before and After views.
+at that location. Reassigned racks remain outlined in both Before and After views.
 
 ## Outputs
 
 **Save layout** writes an `inventory_slotting_layout/v2` document containing the
-new assignments, refreshed buffer occupancy, workflow mode, initial strategy,
-source paths, traffic settings, before/after metrics, trials, relocations, fixed
-units, and an operation-log record.
+new assignments, refreshed buffer occupancy, paper parameters, five Pareto
+representatives, cluster-to-shelf assignments, seed/result static expected-flow
+metrics, SKU relocations, fixed exceptions, and an operation-log record.
 
 **Export report** writes:
 
 - `<name>.traffic.json` using `traffic_aware_slotting_analysis/v1`;
 - `<name>_traffic_resources.csv` with before/after resource load; and
-- `<name>_traffic_relocations.csv` with the complete-unit move audit.
+- `<name>_traffic_relocations.csv` with the SKU reassignment audit.
 
 The analysis is an expected-flow planning model. It does not replace fleet,
 controller, queueing, or collision simulation before deployment.

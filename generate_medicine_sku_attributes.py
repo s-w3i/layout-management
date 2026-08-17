@@ -42,10 +42,22 @@ def generate(input_path: Path, output_path: Path, seed: int = 42) -> list[dict]:
         dimensions = physical_maxima[sku]
         rows.append({
             "sku": sku,
-            "max_item_length": dimensions.get("max_item_length", ""),
-            "max_item_width": dimensions.get("max_item_width", ""),
-            "max_item_height": dimensions.get("max_item_height", ""),
-            "max_item_weight": dimensions.get("max_item_weight", ""),
+            "max_item_length": (
+                round(dimensions["max_item_length"], 6)
+                if "max_item_length" in dimensions else ""
+            ),
+            "max_item_width": (
+                round(dimensions["max_item_width"], 6)
+                if "max_item_width" in dimensions else ""
+            ),
+            "max_item_height": (
+                round(dimensions["max_item_height"], 6)
+                if "max_item_height" in dimensions else ""
+            ),
+            "max_item_weight": (
+                round(dimensions["max_item_weight"], 6)
+                if "max_item_weight" in dimensions else ""
+            ),
             "chilled": str(sku in chilled).lower(),
             "tablet": str(tablet).lower(),
             "flammable": str(flammable).lower(),

@@ -7,6 +7,8 @@ import math
 import re
 from typing import Any, Iterable
 
+from .config import DEFAULT_SLOT_CAPACITY
+
 
 ATTRIBUTE_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 VALUE_TYPES = ("boolean", "number", "text", "choice")
@@ -19,6 +21,8 @@ PHYSICAL_DIMENSION_KEYS = (
 PHYSICAL_WEIGHT_KEY = "max_item_weight"
 PHYSICAL_ATTRIBUTE_KEYS = (*PHYSICAL_DIMENSION_KEYS, PHYSICAL_WEIGHT_KEY)
 OVERSIZE_CAPABLE_KEY = "oversize_capable"
+# Read-only grouping value derived from the slot and machine capacity rules.
+DERIVED_OVERSIZE_KEY = "oversize"
 OVERSIZE_STORAGE_CLASSES = frozenset({
     "OVERSIZE",
     "OVERWEIGHT",
@@ -26,17 +30,12 @@ OVERSIZE_STORAGE_CLASSES = frozenset({
     "NON_VOLUMETRIC_DATA",
 })
 CORE_ATTRIBUTE_KEYS = ("chilled", OVERSIZE_CAPABLE_KEY, *PHYSICAL_ATTRIBUTE_KEYS)
-STANDARD_STORAGE_DEFAULTS = {
-    "max_item_length": 25.0,
-    "max_item_width": 19.3,
-    "max_item_height": 19.2,
-    "max_item_weight": 465.0,
-}
+STANDARD_STORAGE_DEFAULTS = dict(DEFAULT_SLOT_CAPACITY)
 OVERSIZE_STORAGE_DEFAULTS = {
-    "max_item_length": 150,
-    "max_item_width": 50,
-    "max_item_height": 95,
-    "max_item_weight": 640,
+    "max_item_length": 3.0,
+    "max_item_width": 1.9,
+    "max_item_height": 1.0,
+    "max_item_weight": 0.64,
 }
 
 
@@ -138,9 +137,38 @@ class StorageAttributeService:
     """Build hierarchy paths, resolve inheritance, and match SKU requirements."""
 
     def __init__(self, standard_storage_defaults: dict[str, Any] | None = None):
+        self.machine_carrying_capacity = {
+            key: None for key in PHYSICAL_ATTRIBUTE_KEYS
+        }
+        self.machine_handling_unit_type = ""
         self.set_standard_storage_defaults(
             standard_storage_defaults or STANDARD_STORAGE_DEFAULTS
         )
+
+    def set_machine_carrying_capacity(
+        self,
+        values: dict[str, Any] | None,
+        handling_unit_type: str = "",
+    ) -> None:
+        """Configure the optional warehouse-wide machine carrying envelope."""
+        source = values or {}
+        normalized: dict[str, float | None] = {}
+        for key in PHYSICAL_ATTRIBUTE_KEYS:
+            raw = source.get(key)
+            if raw in (None, ""):
+                normalized[key] = None
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"machine carrying capacity {key} must be numeric") from exc
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"machine carrying capacity {key} must be greater than zero"
+                )
+            normalized[key] = int(value) if value.is_integer() else value
+        self.machine_carrying_capacity = normalized
+        self.machine_handling_unit_type = str(handling_unit_type or "")
 
     def set_standard_storage_defaults(self, values: dict[str, Any]) -> None:
         if not isinstance(values, dict) or set(values) != set(PHYSICAL_ATTRIBUTE_KEYS):
@@ -170,19 +198,19 @@ class StorageAttributeService:
             ),
             AttributeDefinition(
                 "max_item_length", "Maximum item length", "number", "capacity",
-                "source length unit",
+                "m",
             ),
             AttributeDefinition(
                 "max_item_width", "Maximum item width", "number", "capacity",
-                "source length unit",
+                "m",
             ),
             AttributeDefinition(
                 "max_item_height", "Maximum item height", "number", "capacity",
-                "source length unit",
+                "m",
             ),
             AttributeDefinition(
                 "max_item_weight", "Maximum item weight", "number", "capacity",
-                "source weight unit",
+                "kg",
             ),
         )
         return {definition.key: definition for definition in definitions}
@@ -196,10 +224,20 @@ class StorageAttributeService:
         self,
         requirements: dict[str, Any] | None,
         standard_defaults: dict[str, float] | None = None,
+        machine_capacity: dict[str, Any] | None = None,
+        handling_unit_type: str | None = None,
     ) -> dict[str, Any]:
-        """Classify one-unit physical requirements against standard storage."""
+        """Classify physical requirements against both slot and machine limits."""
         requirements = requirements or {}
         defaults = standard_defaults or self.standard_storage_defaults
+        machine = (
+            self.machine_carrying_capacity
+            if machine_capacity is None else machine_capacity
+        )
+        handling_unit = str(
+            self.machine_handling_unit_type
+            if handling_unit_type is None else handling_unit_type
+        ).casefold()
         raw_weight = requirements.get(PHYSICAL_WEIGHT_KEY)
         try:
             weight_heuristic_disabled = (
@@ -221,7 +259,7 @@ class StorageAttributeService:
                 values[key] = value
         dimensions_complete = all(key in values for key in PHYSICAL_DIMENSION_KEYS)
         weight_known = PHYSICAL_WEIGHT_KEY in values
-        volumetric_oversize = False
+        slot_volumetric_oversize = False
         if dimensions_complete:
             item_dimensions = sorted(
                 values[key] for key in PHYSICAL_DIMENSION_KEYS
@@ -229,10 +267,35 @@ class StorageAttributeService:
             standard_dimensions = sorted(
                 float(defaults[key]) for key in PHYSICAL_DIMENSION_KEYS
             )
-            volumetric_oversize = any(
+            slot_volumetric_oversize = any(
                 item > capacity
                 for item, capacity in zip(item_dimensions, standard_dimensions)
             )
+        machine_volumetric_oversize = False
+        is_amr = "amr" in handling_unit or "amr" in str(handling_unit_type or "").casefold()
+        if dimensions_complete and not is_amr:
+            try:
+                machine_dimensions = sorted(
+                    float(machine[key]) for key in PHYSICAL_DIMENSION_KEYS
+                )
+            except (KeyError, TypeError, ValueError):
+                machine_dimensions = []
+            if len(machine_dimensions) == 3 and all(
+                math.isfinite(value) and value > 0 for value in machine_dimensions
+            ):
+                machine_volumetric_oversize = any(
+                    item > capacity
+                    for item, capacity in zip(item_dimensions, machine_dimensions)
+                )
+        volumetric_oversize = (
+            slot_volumetric_oversize or machine_volumetric_oversize
+        )
+        try:
+            machine_weight = float(machine.get(PHYSICAL_WEIGHT_KEY))
+        except (AttributeError, TypeError, ValueError):
+            machine_weight = math.inf
+        if not math.isfinite(machine_weight) or machine_weight <= 0:
+            machine_weight = math.inf
         if missing:
             if not dimensions_complete and not weight_known:
                 missing_data_type = "NON_VOLUMETRIC_DATA"
@@ -258,12 +321,17 @@ class StorageAttributeService:
                 "missing_fields": missing,
                 "values": values,
                 "volumetric_oversize": volumetric_oversize,
+                "slot_volumetric_oversize": slot_volumetric_oversize,
+                "machine_volumetric_oversize": machine_volumetric_oversize,
+                "machine_overweight": (
+                    values.get(PHYSICAL_WEIGHT_KEY, 0) > machine_weight
+                ),
                 "weight_heuristic_disabled": weight_heuristic_disabled,
             }
         oversize = volumetric_oversize
-        overweight = values[PHYSICAL_WEIGHT_KEY] > float(
-            defaults[PHYSICAL_WEIGHT_KEY]
-        )
+        slot_overweight = values[PHYSICAL_WEIGHT_KEY] > float(defaults[PHYSICAL_WEIGHT_KEY])
+        machine_overweight = values[PHYSICAL_WEIGHT_KEY] > machine_weight
+        overweight = slot_overweight or machine_overweight
         if oversize and overweight:
             storage_class = "OVERSIZE_AND_OVERWEIGHT"
         elif oversize:
@@ -279,6 +347,10 @@ class StorageAttributeService:
             "missing_fields": [],
             "values": values,
             "volumetric_oversize": volumetric_oversize,
+            "slot_volumetric_oversize": slot_volumetric_oversize,
+            "machine_volumetric_oversize": machine_volumetric_oversize,
+            "slot_overweight": slot_overweight,
+            "machine_overweight": machine_overweight,
             "weight_heuristic_disabled": weight_heuristic_disabled,
         }
 
@@ -386,8 +458,8 @@ class StorageAttributeService:
         ):
             issues.append(
                 f"Maximum item weight: requires {requirements[PHYSICAL_WEIGHT_KEY]} "
-                f"source weight unit, location provides "
-                f"{effective[PHYSICAL_WEIGHT_KEY]} source weight unit"
+                f"kg, location provides "
+                f"{effective[PHYSICAL_WEIGHT_KEY]} kg"
             )
         return not issues, issues, "COMPATIBLE" if not issues else "INCOMPATIBLE"
 

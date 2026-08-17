@@ -115,6 +115,8 @@ class TrafficDemand:
     unmatched_skus: tuple[str, ...]
     start_date: str
     end_date: str
+    replica_visits: dict[str, dict[str, int]] = field(default_factory=dict)
+    replica_assignment_policy: str = "traffic_balanced_alternative_source"
 
 
 @dataclass(slots=True)
@@ -360,19 +362,23 @@ class TrafficAwareSlottingService:
             str(source), capacities,
         )
 
-    @staticmethod
+    @classmethod
     def build_demand(
+        cls,
         dataset: AffinityDataset,
         assignments: list[dict],
         start_date=None,
         end_date=None,
+        network: MovementNetwork | None = None,
     ) -> TrafficDemand:
-        """Convert Store ID + Date groups into one visit per handling unit."""
+        """Route each SKU event to one alternative inventory replica."""
         start = start_date or dataset.min_date
         end = end_date or dataset.max_date
         if start > end:
             raise ValueError("Start date must be on or before end date")
         sku_units: dict[str, dict[str, set[str]]] = {}
+        replica_weights: dict[str, dict[str, float]] = {}
+        primary_rows: dict[str, dict] = {}
         for row in assignments:
             if row.get("assignment_status") != "ASSIGNED":
                 continue
@@ -395,6 +401,15 @@ class TrafficAwareSlottingService:
                     sku_units.setdefault(sku, {}).setdefault(
                         primary, set()
                     ).update(units)
+                    try:
+                        quantity = float(row.get("quantity_ea") or 1)
+                    except (TypeError, ValueError):
+                        quantity = 1.0
+                    replica_weights.setdefault(sku, {})[primary] = (
+                        replica_weights.setdefault(sku, {}).get(primary, 0.0)
+                        + max(0.0, quantity)
+                    )
+                    primary_rows.setdefault(primary, row)
         mask = (dataset.dates >= start.toordinal()) & (dataset.dates <= end.toordinal())
         indices = np.flatnonzero(mask)
         if not len(indices):
@@ -402,6 +417,42 @@ class TrafficAwareSlottingService:
         groups: dict[tuple[int, int], dict[str, set[str]]] = {}
         unmatched: set[str] = set()
         matched_events = 0
+        assigned_events: dict[str, dict[str, int]] = {
+            sku: {primary: 0 for primary in units}
+            for sku, units in sku_units.items()
+        }
+        replica_visits: dict[str, dict[str, int]] = {
+            sku: {primary: 0 for primary in units}
+            for sku, units in sku_units.items()
+        }
+        route_profiles: dict[str, tuple[float, dict[str, float]]] = {}
+        projected_resources: dict[str, float] = (
+            {resource: 0.0 for resource in network.resources}
+            if network is not None else {}
+        )
+        if network is not None:
+            route_cache = cls._shortest_routes(network)
+            for primary, row in primary_rows.items():
+                node = cls._resolve_node(row, network)
+                reachable = [
+                    endpoint for endpoint in network.endpoints
+                    if node is not None and (node, endpoint.node_id) in route_cache
+                ]
+                if not reachable:
+                    route_profiles[primary] = (math.inf, {})
+                    continue
+                total_weight = sum(endpoint.weight for endpoint in reachable)
+                distance = 0.0
+                resources: dict[str, float] = {}
+                for endpoint in reachable:
+                    share = endpoint.weight / total_weight
+                    route_distance, _links, route_resources = route_cache[
+                        (node, endpoint.node_id)
+                    ]
+                    distance += share * route_distance
+                    for resource in route_resources:
+                        resources[resource] = resources.get(resource, 0.0) + share
+                route_profiles[primary] = (distance, resources)
         for event in indices:
             sku = dataset.skus[int(dataset.sku_indices[event])]
             unit_groups = sku_units.get(sku)
@@ -410,8 +461,37 @@ class TrafficAwareSlottingService:
                 continue
             key = (int(dataset.dates[event]), int(dataset.store_indices[event]))
             task_units = groups.setdefault(key, {})
-            for primary, units in unit_groups.items():
-                task_units.setdefault(primary, set()).update(units)
+            weights = replica_weights.get(sku, {})
+
+            def replica_score(primary: str) -> tuple:
+                weight = weights.get(primary, 0.0) or 1.0
+                share_pressure = (
+                    assigned_events[sku].get(primary, 0) + 1
+                ) / weight
+                distance, resources = route_profiles.get(primary, (0.0, {}))
+                projected_peak = max(
+                    (
+                        projected_resources.get(resource, 0.0) + increment
+                    ) / (
+                        network.resource_capacities.get(resource, 1.0)
+                        if network is not None
+                        and network.resource_capacities.get(resource)
+                        else 1.0
+                    )
+                    for resource, increment in resources.items()
+                ) if resources else 0.0
+                return (share_pressure, projected_peak, distance, primary)
+
+            primary = min(sorted(unit_groups), key=replica_score)
+            units = unit_groups[primary]
+            task_units.setdefault(primary, set()).update(units)
+            assigned_events[sku][primary] += 1
+            replica_visits[sku][primary] += 1
+            _distance, resources = route_profiles.get(primary, (0.0, {}))
+            for resource, increment in resources.items():
+                projected_resources[resource] = (
+                    projected_resources.get(resource, 0.0) + increment
+                )
             matched_events += 1
         if not groups:
             raise ValueError("No order SKU is assigned in the selected slotting layout")
@@ -429,6 +509,10 @@ class TrafficAwareSlottingService:
             unmatched_skus=tuple(sorted(unmatched)),
             start_date=start.isoformat(),
             end_date=end.isoformat(),
+            replica_visits={
+                sku: dict(sorted(visits.items()))
+                for sku, visits in sorted(replica_visits.items())
+            },
         )
 
     @staticmethod
@@ -745,12 +829,13 @@ class TrafficAwareSlottingService:
             progress=progress,
             cancelled=cancelled,
         )
-        optimized_skus = set(plan.optimized_skus)
+        optimized_loads = set(plan.optimized_loads)
         source_rows = [
             copy.deepcopy(row) for row in baseline_rows
             if (
                 row.get("assignment_status") == "ASSIGNED"
-                and str(row.get("sku", "")) in optimized_skus
+                and str(row.get("inventory_load_id", row.get("sku", "")))
+                in optimized_loads
             )
         ]
         storage_layout = (
@@ -792,7 +877,8 @@ class TrafficAwareSlottingService:
             copy.deepcopy(row) for row in baseline_rows
             if (
                 row.get("assignment_status") != "ASSIGNED"
-                or str(row.get("sku", "")) not in optimized_skus
+                or str(row.get("inventory_load_id", row.get("sku", "")))
+                not in optimized_loads
             )
         ]
         result_rows = regenerated + retained_fixed
@@ -837,10 +923,14 @@ class TrafficAwareSlottingService:
                 "PASSED" if row.get("assignment_status") == "ASSIGNED"
                 else "EXCLUDED_UNASSIGNED"
             )
-        before_demand = self.build_demand(analysis.dataset, baseline_rows,
-                                          analysis.start_date, analysis.end_date)
-        after_demand = self.build_demand(analysis.dataset, result_rows,
-                                         analysis.start_date, analysis.end_date)
+        before_demand = self.build_demand(
+            analysis.dataset, baseline_rows,
+            analysis.start_date, analysis.end_date, network,
+        )
+        after_demand = self.build_demand(
+            analysis.dataset, result_rows,
+            analysis.start_date, analysis.end_date, network,
+        )
         route_cache = self._shortest_routes(network)
         before = self.analyze(
             baseline_rows, network, before_demand, route_cache=route_cache
@@ -852,17 +942,50 @@ class TrafficAwareSlottingService:
             route_cache=route_cache,
             relative_reference=float(before.metrics["relative_reference"]),
         )
-        old_by_sku = {
-            str(row.get("sku", "")): row for row in baseline_rows
+        compact_rack_count = len({
+            str(row.get("rack_id", "")) for row in baseline_rows
+            if row.get("assignment_status") == "ASSIGNED" and row.get("rack_id")
+        })
+        candidate_rack_count = len({
+            str(row.get("rack_id", "")) for row in result_rows
+            if row.get("assignment_status") == "ASSIGNED" and row.get("rack_id")
+        })
+
+        candidate_metrics = dict(after.metrics)
+        candidate_replica_visits = copy.deepcopy(after.demand.replica_visits)
+        rack_budget_trials = [
+            {
+                "rack_budget": compact_rack_count,
+                "source": "compact_feasible_baseline",
+                "selected": False,
+                **{
+                    key: before.metrics.get(key)
+                    for key in ("peak_load", "p95_load", "expected_travel")
+                },
+            },
+            {
+                "rack_budget": candidate_rack_count,
+                "source": "paper_ctbsa_selected_representative",
+                "selected": True,
+                **{
+                    key: candidate_metrics.get(key)
+                    for key in ("peak_load", "p95_load", "expected_travel")
+                },
+            },
+        ]
+        old_by_load = {
+            str(row.get("inventory_load_id", row.get("sku", ""))): row
+            for row in baseline_rows
             if row.get("assignment_status") == "ASSIGNED"
         }
-        new_by_sku = {
-            str(row.get("sku", "")): row for row in result_rows
+        new_by_load = {
+            str(row.get("inventory_load_id", row.get("sku", ""))): row
+            for row in result_rows
             if row.get("assignment_status") == "ASSIGNED"
         }
         relocations = []
-        for sku in sorted(set(old_by_sku) & set(new_by_sku)):
-            old, new = old_by_sku[sku], new_by_sku[sku]
+        for load_id in sorted(set(old_by_load) & set(new_by_load)):
+            old, new = old_by_load[load_id], new_by_load[load_id]
             if (
                 str(old.get("rack_id", "")) == str(new.get("rack_id", ""))
                 and int(old.get("storage_level") or 1)
@@ -872,7 +995,8 @@ class TrafficAwareSlottingService:
             ):
                 continue
             relocations.append({
-                "sku": sku,
+                "sku": str(new.get("sku", "")),
+                "inventory_load_id": load_id,
                 "handling_unit_id": str(new.get("handling_unit_id", "")),
                 "from_rack": str(old.get("rack_id", "")),
                 "to_rack": str(new.get("rack_id", "")),
@@ -883,6 +1007,8 @@ class TrafficAwareSlottingService:
             **plan.parameters,
             "optimized_sku_count": len(plan.optimized_skus),
             "fixed_sku_count": len(plan.fixed_skus),
+            "optimized_load_count": len(plan.optimized_loads),
+            "fixed_load_count": len(plan.fixed_loads),
             "hard_rule_profile": regenerated_summary.get(
                 "hard_rule_profile", "shared_warehouse_feasibility/v1"
             ),
@@ -892,6 +1018,19 @@ class TrafficAwareSlottingService:
             "validation_mode": "static_expected_flow_only",
             "regenerated_summary": regenerated_summary,
             "clusters": plan.cluster_rows,
+            "rack_budget_policy": "paper_ctbsa_selected_solution",
+            "compact_rack_count": compact_rack_count,
+            "selected_rack_count": candidate_rack_count,
+            "rack_budget_trials": rack_budget_trials,
+            "rack_budget_selection_reason": (
+                "selected C&TBSA Pareto representative applied without a "
+                "post-simulation route-metric veto"
+            ),
+            "route_metrics_role": "post_assignment_evaluation_only",
+            "candidate_replica_visit_allocation": candidate_replica_visits,
+            "selected_replica_visit_allocation": copy.deepcopy(
+                after.demand.replica_visits
+            ),
         }
         baseline_by_sku = {
             str(row.get("sku", "")): row for row in baseline_rows
@@ -984,7 +1123,9 @@ class TrafficAwareSlottingService:
     ) -> None:
         if len(original) != len(result):
             raise ValueError("traffic result changed the assignment row count")
-        identity = lambda row: str(row.get("sku", ""))
+        identity = lambda row: str(
+            row.get("inventory_load_id", row.get("sku", ""))
+        )
         if sorted(map(identity, original)) != sorted(map(identity, result)):
             raise ValueError("C&TBSA result changed the SKU membership")
         addresses = [
@@ -1247,7 +1388,7 @@ class TrafficAwareSlottingService:
         validation = self.validate_traffic_baseline(payload)
         stage(2, "Calculating Store ID + Date handling-unit visits")
         demand = self.build_demand(
-            dataset, payload["assignments"], start_date, end_date
+            dataset, payload["assignments"], start_date, end_date, network
         )
         grouping_metrics = {
             "baseline_handling_unit_visits": demand.handling_unit_visits,
@@ -1533,6 +1674,10 @@ class TrafficAwareSlottingService:
                 "optimized_sku_count", 0
             ),
             "fixed_sku_count": result.parameters.get("fixed_sku_count", 0),
+            "optimized_load_count": result.parameters.get("optimized_load_count", 0),
+            "fixed_load_count": result.parameters.get("fixed_load_count", 0),
+            "compact_rack_count": result.parameters.get("compact_rack_count", 0),
+            "final_occupied_rack_count": result.parameters.get("selected_rack_count", 0),
         })
         payload["summary"] = final_summary
         payload.setdefault("sources", {})["traffic_baseline_layout"] = baseline_path
@@ -1544,7 +1689,7 @@ class TrafficAwareSlottingService:
             "initial_strategy": initial_strategy,
             "optimization_strategy": "ctbsa",
             "network_type": network.source_type,
-            "demand_model": "unique_handling_unit_per_store_day",
+            "demand_model": "traffic_balanced_alternative_sku_replica",
             "start_date": result.before.demand.start_date,
             "end_date": result.before.demand.end_date,
         }
@@ -1556,6 +1701,9 @@ class TrafficAwareSlottingService:
             "unit_visits": dict(sorted(result.before.demand.unit_visits.items())),
             "after_handling_unit_visits": result.after.demand.handling_unit_visits,
             "after_unit_visits": dict(sorted(result.after.demand.unit_visits.items())),
+            "replica_assignment_policy": result.before.demand.replica_assignment_policy,
+            "replica_visits": result.before.demand.replica_visits,
+            "after_replica_visits": result.after.demand.replica_visits,
             "mapped_units": len(result.before.mapped_units),
             "unreachable_units": list(result.before.unreachable_units),
             "unmapped_units": list(result.before.unmapped_units),
@@ -1597,6 +1745,8 @@ class TrafficAwareSlottingService:
                 "start_date": result.before.demand.start_date,
                 "end_date": result.before.demand.end_date,
                 "unmatched_skus": list(result.before.demand.unmatched_skus),
+                "replica_assignment_policy": result.before.demand.replica_assignment_policy,
+                "replica_visits": result.before.demand.replica_visits,
             },
             "parameters": result.parameters,
             "before": {"metrics": result.before.metrics, "resources": result.before.resources},

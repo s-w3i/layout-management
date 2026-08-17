@@ -41,9 +41,10 @@ Use the tabs from left to right:
 |---|---|
 | **Grid Map Editor** | Create the grid, racks, workstations, zones, and buffers |
 | **SKU Affinity** | Review SKU–store frequency and SKU relationships |
+| **Stock Requirements** | Calculate minimum and buffer stock coverage for every SKU |
 | **Inventory Slotting** | Generate an ABC or ABC-plus-affinity layout |
 | **Interactive Slotting Layout** | Inspect assignments and movement ranks |
-| **Traffic-Aware Slotting** | Improve congestion using complete-unit swaps |
+| **Traffic-Aware Slotting** | Replicate two-stage C&TBSA SKU clustering and assignment |
 | **Global Traffic Optimizer** | Search globally for a congestion-balanced layout |
 | **Inventory Operations Demo** | Find inventory and test slot or shelf swaps |
 
@@ -51,15 +52,50 @@ For a new warehouse:
 
 1. Build and configure the grid, then save the `.grid.json`.
 2. Analyze the order workbook in **SKU Affinity** when affinity is required.
-3. Generate a layout in **Inventory Slotting**.
-4. Improve it with **Traffic-Aware Slotting** or **Global Traffic Optimizer**.
-5. Inspect or test the result, then save the selected `.slotting.json`.
+3. Calculate minimum and buffer stock in **Stock Requirements** when needed.
+4. Generate a layout in **Inventory Slotting**.
+5. Improve it with **Traffic-Aware Slotting** or **Global Traffic Optimizer**.
+6. Inspect or test the result, then save the selected `.slotting.json`.
 
 Start with the included demonstration map:
 
 ```text
-resources/map/demo.grid.json
+resources/map/map1.grid.json
 ```
+
+The stock calculation is also available without the UI. It uses the same
+reusable calculation module as the **Stock Requirements** tab:
+
+```bash
+python3 minimum_stock_determination.py \
+  --input "resources/data/Sample Data.xlsx" \
+  --sku-attributes resources/data/medicine_sku_attributes.csv \
+  --minimum-days 2 \
+  --buffer-days 1 \
+  --slot-length 1.9 --slot-width 0.5 --slot-height 1.0 \
+  --slot-max-weight 12.5 \
+  --rack-levels 3 --slots-per-level 4 \
+  --output resources/data/minimum_stock_requirements.csv
+```
+
+For each SKU, the complete target uses
+`ceil(average daily demand × (minimum days + buffer days))`. Average daily demand is
+measured across the inclusive calendar span of the workbook. The CSV includes
+the two targets separately and their combined total. Item dimensions from the
+SKU attributes CSV must fit in the slot in at least one rotation.
+The calculation then reports units per slot, slots occupied by each item,
+required slots, and required racks for every SKU. Quantity can spread one SKU
+across as many racks as necessary. A second `_attribute_combinations.csv`
+output shares rack slots within each selected Boolean-attribute combination and
+reports its rack total.
+
+`EA / slot` is the smaller of rotation-aware physical box-grid capacity and
+`floor(slot maximum kg ÷ item kg)`. A new slot is required as soon as either
+limit would be exceeded. For AMR, rack demand is also calculated
+by packing the indivisible slot loads into the rack grid while enforcing the
+cumulative whole-rack weight. The reported value is therefore a feasible rack
+count, not only the larger of two aggregate lower bounds. The default 12-slot
+AMR rack uses a 12.5 kg slot limit and a 150 kg whole-rack limit.
 
 ## 1. Grid Map Editor tab
 
@@ -231,15 +267,27 @@ The default inputs are:
 
 | Input | Default path |
 |---|---|
-| Grid project JSON | `resources/map/demo.grid.json` |
+| Grid project JSON | `resources/map/map1.grid.json` |
 | ABC SKU velocity CSV | `resources/data/sku_velocity_output/sku_velocity_summary.csv` |
-| Chilled SKU CSV | `resources/data/demo_chilled_requirements.csv` |
+| SKU attributes CSV | `resources/data/medicine_sku_attributes.csv` |
 | Affinity order workbook | `resources/data/Sample Data.xlsx` |
 | Output layout | `resources/data/basic_slotting_layout.slotting.json` |
 
 The grid JSON must contain generated empty buffers, at least one rack pickup,
 and at least one workstation. Inventory Slotting reconstructs the RMF graph in
 memory for route calculations.
+
+When Stock Requirements has been calculated in the current session, Inventory
+Slotting automatically uses its `total_required_ea`, `units_per_slot`,
+`slots_per_unit`, and `required_slots` values. Each required quantity slot
+becomes an independently addressable inventory load. Basic ABC and Affinity
+first compact the complete system into occupied compatible racks, then spread
+hot-SKU loads only across that rack pool and avoid adjacent positions where
+possible. Traffic-aware C&TBSA applies its selected correlation/maximum-cluster-
+demand Pareto representative; route peak, P95, and travel are reported as
+post-assignment evaluation metrics and do not veto the paper-selected layout.
+Physical oversize remains one merged, contiguous multi-slot or multi-level
+footprint per load.
 
 The SKU CSV must contain these columns:
 
@@ -262,8 +310,40 @@ as `UNKNOWN_WEIGHT`, `UNKNOWN_SIZE`, or `NON_VOLUMETRIC_DATA`. These categories
 use exception storage planning without displaying a verified overweight or
 oversize measurement. Set
 `req_max_item_weight` to `0` to explicitly disable ergonomic weight placement
-for that SKU. Requirement keys must exist in the attribute catalog before
-generation.
+for that SKU. Attribute definitions come only from the grid-project JSON and
+the selected CSV inputs. Nonphysical CSV columns must contain Boolean values;
+only length, width, height, and weight infer numeric capacity matching. An
+explicit JSON definition wins when the same key is present in both.
+During slotting, the saved map is authoritative. The allocator first discovers
+which attributes are configured across all zones. An SKU requirement absent
+from every zone is ignored. If at least one zone defines it, the attribute is
+enforced map-wide. For an active Boolean attribute, a zone without an explicit
+value is interpreted as `false`, so only `true` zones need to be labelled.
+Missing numeric values remain undefined and incompatible with a numeric
+requirement. Existing values remain hard rules except for maximum weight on an explicitly
+`oversize_capable=true` zone. Before placement, that value is raised to the
+heaviest compatible SKU in the selected dataset. The allocator never writes
+other missing values, raises standard-zone or dimensional capacities, creates a
+subzone, or changes a configured zone ID.
+Known oversize, overweight, combined, and `NON_VOLUMETRIC_DATA` physical
+exceptions require an explicit `oversize_capable=true` zone. Items without
+usable dimensional data remain marked unverified and reserve one slot because
+their actual footprint cannot be calculated. Contiguous multi-slot or
+multi-level occupancy is used only when available dimensions require it.
+
+Oversize classification now evaluates two independent limits. **Slot L/W/H and
+weight** remain the per-slot capacity configured on warehouse zones. **Global
+machine capacity** is configured separately in Grid Map Editor and Stock
+Requirements. AMR uses only its carried whole-rack weight limit; mini-load and
+pallet ASRS use the machine's L/W/H envelope and weight limit. Exceeding either
+the slot rule or the applicable machine rule classifies the SKU as a physical
+exception.
+
+Warehouse dimensions use metres and weights use kilograms. The default
+`1.9 × 0.5 × 1.0 m` slot has a cumulative `12.5 kg` limit. The default AMR
+rack has 3 levels and 4 slots per level, with a `150 kg` whole-rack limit.
+Quantities still determine how many slots and racks are required. ASRS machines
+default to a `0.25 × 0.193 × 0.192 m` envelope and `0.465 kg` limit.
 
 The included compact CSV is ready for the demo. To analyse another warehouse,
 place its transaction workbook under `resources/data/` and follow the
@@ -327,33 +407,37 @@ address. See [Inventory address rules](#inventory-address-rules).
 ### Zone storage settings in Grid Map Editor
 
 Click **Zone settings…** in Grid Map Editor after grouping the racks. The application
-initializes all zones with these source-unit demo limits:
+shows physical capacity controls only when those attributes were declared by
+the project JSON or inferred from a loaded CSV. The optional demo reset uses:
 
 | Storage | Length | Width | Height | Weight |
 |---|---:|---:|---:|---:|
 | Standard | 15 | 16 | 13 | 250 |
 
-Only chilled storage is predefined by the user. The slotting algorithm plans
-standard and oversize/overweight segments inside the selected ambient or
-chilled zones. Units are deliberately labelled as unconfirmed source units;
-the demo does not perform a centimetre, millimetre, gram or kilogram conversion.
+No SKU-derived zone value is initialized automatically. If physical capacity
+and chilled attributes are configured, the slotting algorithm checks those
+values without changing the zone. Units
+are deliberately labelled as unconfirmed source units; the demo does not
+perform a centimetre, millimetre, gram or kilogram conversion.
 
 Length, width, height, and weight maximums may be left empty. An empty field
 means that no maximum is configured for that property; it does not mean zero
 capacity. A numeric value continues to act as the maximum inherited by child
 locations.
 
-Maximums are planning inputs for normal storage. When an outlier needs more
-capacity—or has unknown size or weight—the generated child-slot segment records
-an oversize-capable override and the required or unbounded physical properties.
+Maximums are hard capacity inputs. Standard-zone capacities and dimensional
+capacities are never enlarged automatically. An oversize-capable zone is the
+one exception: its maximum weight is raised to the heaviest SKU whose Boolean
+requirements match that zone, and the updated value is saved in the generated
+layout.
 
-Mark only physically chilled zones with the **Chilled area** checkbox. Chilled
-defaults to false because it cannot be inferred safely from an RMF map. Chilled
-values inherit down to every aisle, bay, level, and slot. Oversize segments are
-created automatically and never change the chilled/ambient role.
+When `chilled` is declared by the JSON or CSV, mark physically chilled zones
+with the **Chilled area** checkbox. No chilled or ambient value is injected
+automatically. Chilled values inherit down to every aisle, bay, level, and
+slot. Slotting does not create oversize segments or change the temperature role.
 
-Use **Advanced attributes…** for optional operational attributes. The generated
-`oversize_capable` child-slot values are normally managed by the algorithm.
+Use **Advanced attributes…** for optional operational attributes. Configure
+`oversize_capable` explicitly when it should act as a map rule.
 
 ### Advanced hierarchy attributes in Grid Map Editor
 
@@ -364,11 +448,26 @@ After assigning every rack to a zone and setting the buffer capacity, click
 Zone → Aisle → Bay → Level → Slot
 ```
 
-The starter catalog contains `chilled`, `max_item_length`, `max_item_width`,
-`max_item_height`, and `max_item_weight`. You can add reusable
-boolean, number, text, or choice definitions. Exact matching is available for
-all types; numeric attributes can use capacity matching, where the location
-value must be at least the SKU requirement.
+New projects start with no attribute definitions. Load a SKU attributes CSV in
+**Stock Requirements** to infer its schema, use definitions explicitly stored
+in the map JSON, or add a Boolean definition manually. Boolean attributes use exact matching and a zone
+hierarchy level. Only length, width, height, and weight are numeric capacities,
+where the location value must be at least the SKU requirement.
+
+The **Zone hierarchy level** controls progressive subdivision. Lower numbers
+are evaluated first, and multiple attributes may share one level. For example,
+level 1 `chilled` followed by level 2 `tablet` and `flammable` first separates
+chilled storage, then applies `tablet` and `flammable` as two separate
+subdivision rules with the same priority. They are never merged into one
+combined attribute. By default, the first Boolean CSV column is level 1 and the
+remaining Boolean columns share level 2 when JSON does not state levels.
+
+When a declared value has not been configured anywhere above the selected slot,
+the selected slotting strategy may materialize exact-match values on a whole
+zone or a new independent overflow zone, and capacity values on the selected slot.
+The strategy still controls placement order and location scoring. Explicit map
+values remain immutable hard constraints, so an incompatible SKU is reported as
+unassigned instead of changing the warehouse rule.
 
 Select one or several hierarchy nodes to apply a value in bulk. Values inherit
 downward. A child can override an inherited value, and **Clear local value**
@@ -424,18 +523,18 @@ The **basic** strategy:
    frequency, then physically places all standard inventory before any
    oversize/overweight exception inventory.
 4. Preserves that logical ABC rank in the output after physical planning.
-5. Fills an already-open compatible rack before opening another rack. ABC
-   classes may mix inside that rack; efficient rack utilization has priority
-   over ABC purity.
+5. Fills an already-open compatible rack before opening another rack for
+   different SKUs. Repeated quantity loads of the same SKU instead prefer
+   unused compatible racks, then balance their load counts across racks and
+   avoid adjacent slots where capacity permits.
 6. Enforces the user-defined ambient/chilled separation. Exception inventory is
    planned inside a matching-temperature zone, so chilled outliers remain in a
    chilled zone.
-7. Reserves oversize capacity during zone planning but slots those oversize and
-   overweight exceptions last. Ambient source zones are
-   allocated as complete `STANDARD` or `OVERSIZE` zones; the planner chooses the
-   nearest combination with just enough capacity while preserving standard
-   capacity where possible. A chilled source zone may be partitioned into
-   separate `*_chill_normal` and `*_chill_oversize` generated zones.
+7. Runs a warehouse-wide feasibility pass for every oversize, overweight, and
+   physically unverified SKU. It reserves a non-overlapping compatible
+   footprint before ordinary strategy placement, so an early multi-slot item
+   cannot consume the only level or cells required by a later constrained
+   item. The saved zone boundaries and IDs remain unchanged.
 8. Uses SKU weight as a soft ergonomic heuristic: a positive weight prefers
    the middle rack level and then expands outward toward lower and upper
    levels. This is not a hard constraint; weight `0` disables the preference.
@@ -443,11 +542,14 @@ The **basic** strategy:
    required by a known dimension-oversize item. Width may span adjacent slots
    and height may span rack levels; an item whose depth cannot fit in any
    rotation is rejected. Weight-only exceptions remain single-slot inventory
-   on level 2. Unknown properties become unbounded planning assumptions on the
-   generated exception segment. The `occupied_dynamic_address` field presents
-   multi-position AMR occupancy compactly, for example
+   on level 2. An item without usable dimensions reserves one oversize-capable
+   slot and remains marked `UNVERIFIED`. The `occupied_dynamic_address` field
+   presents multi-position AMR occupancy compactly, for example
    `SHELF_124/L02/S02,03`.
-10. Uses average workstation distance to rank otherwise equivalent racks and
+10. Saves one assignment per quantity load, retaining the source SKU plus a
+   unique `inventory_load_id`, the EA held by that load, and its position in
+   the SKU's complete load set.
+11. Uses average workstation distance to rank otherwise equivalent racks and
    returns general not-enough-space only after every storage slot is occupied.
 
 The **abc_affinity** strategy keeps temperature, physical-fit, and capacity
@@ -457,6 +559,12 @@ groups from `(Store ID, Date)` and prefers a rack already required by those
 groups, reducing the distinct racks an AMR must carry. It also follows direct
 order-overlap clusters during placement, so at a high affinity weight a strongly
 related B or C SKU can be processed immediately after an A SKU.
+Basic and affinity candidates use the same persisted
+`shared_warehouse_feasibility/v1` hard-rule profile. Affinity may change SKU
+ordering and feasible location choice, but it cannot increase the Basic
+baseline's unassigned count, including at 100% affinity weight. If total
+capacity is insufficient, the two soft orderings may select different SKUs
+while still applying identical compatibility rules.
 At 0%, placement matches the basic ABC strategy. At 100%, ABC class is excluded
 from placement ordering, scoring, and tie-breaking; it is calculated afterward
 only for rack reporting. Intermediate values apply `1 - affinity weight` to the
@@ -480,10 +588,13 @@ Chilled SKUs still require chilled slots and ambient SKUs require non-chilled
 slots. If one temperature category has insufficient slots, the result reports a
 temperature-zone shortage even when the opposite category has empty capacity.
 
-The optional chilled CSV contains `sku,chilled_required`. Only selected chilled
-SKUs need rows; all absent SKUs are ambient. The included file selects 10% of
-the 1,524 sample SKUs with seed 42. Invalid booleans, duplicates, unknown SKUs,
-or conflicts with `req_chilled` stop generation.
+The optional SKU attributes CSV contains one row per SKU and may use plain
+attribute names or `req_<attribute>` columns. The included medicine demo has
+workbook-derived dimensions and weight plus the Boolean flags `chilled`,
+`tablet`, and `flammable`. The former `sku,chilled_required` format remains supported;
+a blank or absent requirement remains unspecified rather than defaulting to
+ambient. Invalid values, duplicates, unknown SKUs, or conflicts with velocity
+requirements stop generation.
 
 Missing physical data is classified conservatively: unknown weight is treated
 as overweight, unknown size as oversize, and missing both usable size and weight
@@ -492,9 +603,10 @@ algorithm gives them generated exception segments rather than normal storage.
 Production users must validate planned capacities against actual equipment.
 
 Each generated zone has exactly one result type: `STANDARD` or `OVERSIZE`.
-`MIXED` zones are not generated. `planned_zone_id` identifies the generated
-subzone while `zone_id` retains the user-defined source zone used for chilled
-inheritance and static addressing.
+`MIXED` zones are not generated. An attribute partition receives its own
+`zone_id`, static-address root, and zone-level attributes; it does not retain a
+parent-zone relationship. This applies to every rack in the zone, including
+unused racks; a storage-type change always creates another independent zone.
 
 If a rack cannot reach every workstation through the directed RMF graph, it
 ranks after reachable racks but remains usable storage. An assignment on it is
@@ -525,32 +637,27 @@ v1 files remain loadable and are normalized with an empty attribute model.
 
 ## 4. Traffic-Aware Slotting tab
 
-The tab exposes two primary workflows:
+The tab runs C&TBSA directly from the editable `.grid.json`, SKU demand and
+physical-requirement CSV, optional chilled-SKU CSV, and order-history workbook.
+ABC and the separate affinity-slotting strategy are not prerequisites.
 
-1. **Optimize Existing Layout** takes a complete `.slotting.json` and
-   order-history workbook. It preserves that file's SKU-to-unit membership and
-   skips all ABC/affinity regeneration.
-2. **Generate Layout + Optimize Traffic** takes the editable `.grid.json`, ABC
-   velocity CSV, optional chilled-SKU CSV, and order-history workbook. Select
-   **ABC** or **ABC + Affinity** as the initial strategy. Affinity weight is used
-   only for the latter. The grid project must already contain storage buffers,
-   rack zones, chilled/capacity settings, and advanced attributes.
-3. Keep **Use embedded RMF map** to reuse the active layout, or select
+1. Complete the grid project's storage buffers, rack zones, chilled/capacity
+   settings, and advanced attributes.
+2. Select the SKU CSV and order-history workbook, then set the NSGA-II
+   population, generations, representative solution, and seed.
+3. Keep **Use embedded RMF map** to use the warehouse grid, or select
    **Use network / grid project JSON**. That option accepts either an editable
    `rmf_grid_map_editor/v2` `.grid.json` directly or a generic
    `warehouse_movement_network/v1` JSON with explicit resources and capacities
    for ASRS, conveyors, cranes, lifts, or another delivery system.
-4. Review the selected baseline's unit visits, lane and rack heatmaps,
-   before/after traffic KPIs, congested resources, relocations, fixed/rejected
-   units, and selected parameters. Rerun the same workflow after editing maximum
-   travel increase or hotspot percentile when operational policy requires it.
+4. Review the physical-feasibility seed, lane and rack heatmaps,
+   seed/result static traffic KPIs, SKU relocations, fixed exceptions, the five
+   Pareto representatives, and NSGA-II parameters.
 5. Save the compatible v2 slotting layout and optionally export the traffic JSON
    plus resource and relocation CSV files.
 
-The UI keeps the settings in separate side-by-side panels. Initial ABC/affinity
-generation settings are on the left and traffic-aware optimization settings are
-on the right, so parameters that are ignored by the existing-layout workflow
-are visibly isolated.
+The left panel contains warehouse and SKU constraints. The right panel contains
+orders, optional movement-network validation, C&TBSA parameters, and output.
 
 Demand is grouped by `(Store ID, Date)`. An AMR shelf is visited at most once
 inside a group even when it contains several requested SKUs. For ASRS, every
@@ -560,15 +667,26 @@ under the primary relocatable unit for optimization. Routing uses deterministic
 shortest paths to reachable service endpoints. Endpoint weights are equal for
 RMF maps and configurable in generic networks.
 
-Every relocation is an atomic pairwise unit swap. Chilled/ambient separation,
-standard/oversize segment separation, rotation-aware dimensions, maximum
-weight, slot shape, and capacity are strict move gates. The traffic stage never
-creates a capacity override. A unit with incomplete physical data remains fixed
-and is reported. This conservative rule does not invalidate an unchanged
-generated row that is reported as unverified.
+C&TBSA follows Lee, Chung, and Yoon's two-stage method. Stage 1 applies NSGA-II
+to maximize within-shelf SKU
+co-appearance and minimize the maximum shelf demand. It uses permutation
+chromosomes, PMX crossover, and 2-opt swap mutation. Stage 2 sorts clusters by
+demand, assigns them to shelves by accessibility, and randomizes load locations
+inside each shelf. Quantity loads are separate clustering items with SKU demand
+split proportionally by stored quantity, allowing a logical SKU to span several
+shelves without changing the paper objectives. Physical-exception shelves remain
+fixed.
 
-Full-pipeline baseline generation uses the same rules as basic and affinity slotting:
-standard inventory is placed before exceptions, ambient zones remain non-mixed,
+C&TBSA discovers attributes through the same map-authoritative rule as Basic
+and Affinity slotting. It uses the intersection of CSV SKU requirements and
+zone-root attributes, ignores requirements not configured in any zone, and
+partitions movable standard racks by the complete active attribute profile.
+There is no fixed chilled-only or medicine-specific grouping schema.
+
+Before C&TBSA, an internal physical-feasibility seed places exception inventory
+and identifies eligible standard shelves. It is not an ABC or affinity
+optimization and does not control the C&TBSA clustering. Standard inventory is
+placed before exceptions, ambient zones remain non-mixed,
 chilled normal and oversize stock use separate racks, and known overweight or
 oversize-plus-overweight stock is intentionally placed at level 2 when present.
 Generated buffers from the grid project are enforced and their occupancy is
@@ -579,22 +697,21 @@ workflow stops only when no assigned inventory remains to optimize.
 
 The map contains two heat layers. Lane colour and width represent expected route
 load. Rack colour represents the handling-unit visits generated at that physical
-location. Before and After use the same demand, while handling-unit relocations
-move rack heat between positions. Purple outlines show all swapped locations;
-selecting a relocation marks its source and destination separately.
+location. Purple outlines show reassigned locations; selecting a relocation
+marks its source and destination separately.
 
 When movement-resource capacities exist, the map reports utilization. Otherwise
-it reports relative expected load, allowing the same workflow to operate without
-an AMR, ASRS, or conveyor profile. This is a static expected-flow recommendation,
-not collision-free fleet simulation.
+it reports relative expected load. Lane load is post-placement validation only;
+it is not an objective in the paper's C&TBSA model. This is not collision-free
+fleet simulation and does not estimate picking delay or throughput.
 
 See [Traffic-aware slotting](docs/traffic-aware-slotting.md) for the generic
 network contract and export details.
 
 ## 5. Global Traffic Optimizer tab
 
-This separate tab leaves the original pair-swap Traffic-Aware Slotting
-workflow unchanged. It offers three buttons:
+This separate tab is the CP-SAT alternative to the paper-replication
+Traffic-Aware Slotting workflow. It offers three buttons:
 
 1. **Optimize Existing Layout Globally** reuses a saved layout. Assigned
    handling units are optimized; unassigned SKU rows are retained unchanged.
@@ -842,7 +959,7 @@ layout_management_master/
 └── resources/
     ├── data/
     │   ├── Sample Data.xlsx                     Optional local input (ignored)
-    │   ├── demo_chilled_requirements.csv        Seeded chilled demo input
+    │   ├── medicine_sku_attributes.csv          Medicine attribute demo input
     │   ├── basic_slotting_layout.slotting.json  Generated output (ignored)
     │   └── sku_velocity_output/
     │       ├── sku_velocity_summary.csv

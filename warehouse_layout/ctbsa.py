@@ -1,9 +1,11 @@
-"""Paper-faithful C&TBSA clustering and storage-area assignment.
+"""Paper-faithful C&TBSA clustering with quantity-load SKU replication.
 
 The implementation follows Lee, Chung, and Yoon (2020): a permutation
 chromosome is divided into fixed-capacity clusters, NSGA-II maximizes
 within-cluster SKU co-appearance while minimizing the maximum cluster demand,
 PMX performs crossover, and a two-position (2-opt) swap performs mutation.
+Each stock quantity load is an item in that original formulation, allowing one
+logical SKU to occupy multiple clusters without changing either objective.
 """
 
 from __future__ import annotations
@@ -63,10 +65,14 @@ class CtbsaSearchResult:
 class CtbsaPlacementPlan:
     """Paper Stage-2 targets for the warehouse slot allocator."""
 
+    # Targets and ranks are keyed by inventory-load ID. The legacy field names
+    # remain in the serialized API because older layouts contain one load/SKU.
     target_racks: dict[str, str]
     rank_by_sku: dict[str, int]
     optimized_skus: tuple[str, ...]
     fixed_skus: tuple[str, ...]
+    optimized_loads: tuple[str, ...]
+    fixed_loads: tuple[str, ...]
     cluster_rows: list[dict]
     pareto_rows: list[dict]
     parameters: dict
@@ -377,14 +383,23 @@ class CtbsaPlacementPlanner:
         )
         rack_by_id = {str(rack["rack_id"]): rack for rack in racks}
         rows_by_rack: dict[str, list[dict]] = {}
-        assigned_by_sku = {}
-        fixed_skus = set()
+        assigned_by_load = {}
+        fixed_loads = set()
+        legacy_counts: dict[str, int] = {}
         for row in baseline_rows:
             sku = str(row.get("sku", ""))
+            legacy_counts[sku] = legacy_counts.get(sku, 0) + 1
+            load_id = str(row.get("inventory_load_id", "")).strip()
+            if not load_id:
+                load_id = (
+                    sku if legacy_counts[sku] == 1
+                    else f"{sku}#LEGACY{legacy_counts[sku]:03d}"
+                )
+                row["inventory_load_id"] = load_id
             if row.get("assignment_status") != "ASSIGNED":
-                fixed_skus.add(sku)
+                fixed_loads.add(load_id)
                 continue
-            assigned_by_sku[sku] = row
+            assigned_by_load[load_id] = row
             rack_id = str(row.get("rack_id", ""))
             rows_by_rack.setdefault(rack_id, []).append(row)
 
@@ -406,16 +421,26 @@ class CtbsaPlacementPlanner:
             if clean:
                 clean_racks.append(rack)
             else:
-                fixed_skus.update(str(row.get("sku", "")) for row in rows)
+                fixed_loads.update(
+                    str(row.get("inventory_load_id", "")) for row in rows
+                )
 
-        optimized_skus = sorted({
-            str(row.get("sku", ""))
+        optimized_loads = sorted({
+            str(row.get("inventory_load_id", ""))
             for rack in clean_racks
             for row in rows_by_rack.get(str(rack["rack_id"]), [])
-            if str(row.get("sku", ""))
+            if str(row.get("inventory_load_id", ""))
         })
-        if not optimized_skus:
+        if not optimized_loads:
             raise ValueError("C&TBSA found no complete standard AMR-shelf SKUs to cluster")
+        optimized_skus = sorted({
+            str(assigned_by_load[load_id].get("sku", ""))
+            for load_id in optimized_loads
+        })
+        fixed_skus = sorted({
+            str(row.get("sku", "")) for load_id, row in assigned_by_load.items()
+            if load_id in fixed_loads
+        })
 
         zone_attributes = dict(location_attributes or {})
         configured_attribute_keys = (
@@ -469,9 +494,9 @@ class CtbsaPlacementPlanner:
             sku: index for index, sku in enumerate(analysis.dataset.skus)
         }
         target_racks = {
-            sku: str(row.get("rack_id", ""))
-            for sku, row in assigned_by_sku.items()
-            if sku in fixed_skus and row.get("rack_id")
+            load_id: str(row.get("rack_id", ""))
+            for load_id, row in assigned_by_load.items()
+            if load_id in fixed_loads and row.get("rack_id")
         }
         rank_by_sku = {}
         cluster_rows = []
@@ -499,13 +524,13 @@ class CtbsaPlacementPlanner:
                 )
                 or "no active zone attributes"
             )
-            group_skus = [
-                sku for sku in optimized_skus
+            group_loads = [
+                load_id for load_id in optimized_loads
                 if rack_profiles.get(
-                    str(assigned_by_sku[sku].get("rack_id", ""))
+                    str(assigned_by_load[load_id].get("rack_id", ""))
                 ) == profile
             ]
-            if not group_skus:
+            if not group_loads:
                 continue
             group_racks = sorted(
                 group_racks,
@@ -516,17 +541,51 @@ class CtbsaPlacementPlanner:
                 ),
             )
             available = len(group_racks) * capacity
-            if len(group_skus) > available:
+            if len(group_loads) > available:
                 raise ValueError(
                     f"C&TBSA profile {profile_label} requires "
-                    f"{len(group_skus):,} locations but only {available:,} are available"
+                    f"{len(group_loads):,} locations but only {available:,} are available"
                 )
+            group_skus = [
+                str(assigned_by_load[load_id].get("sku", ""))
+                for load_id in group_loads
+            ]
             source_indices = [dataset_index.get(sku) for sku in group_skus]
-            demands = np.array([
-                int(analysis.sku_store_day_totals[index]) if index is not None else 0
-                for index in source_indices
-            ], dtype=np.int64)
-            correlations = np.zeros((len(group_skus), len(group_skus)), dtype=np.int64)
+            demands = np.zeros(len(group_loads), dtype=np.int64)
+            for sku in sorted(set(group_skus)):
+                members = [
+                    index for index, value in enumerate(group_skus)
+                    if value == sku
+                ]
+                dataset_position = dataset_index.get(sku)
+                total_demand = (
+                    int(analysis.sku_store_day_totals[dataset_position])
+                    if dataset_position is not None else 0
+                )
+                weights = []
+                for index in members:
+                    try:
+                        weight = float(
+                            assigned_by_load[group_loads[index]].get("quantity_ea")
+                            or 1
+                        )
+                    except (TypeError, ValueError):
+                        weight = 1.0
+                    weights.append(max(0.0, weight))
+                if not sum(weights):
+                    weights = [1.0] * len(members)
+                raw = [total_demand * value / sum(weights) for value in weights]
+                allocated = [int(np.floor(value)) for value in raw]
+                remainder = total_demand - sum(allocated)
+                order = sorted(
+                    range(len(members)),
+                    key=lambda index: (-(raw[index] - allocated[index]), group_loads[members[index]]),
+                )
+                for index in order[:remainder]:
+                    allocated[index] += 1
+                for member, value in zip(members, allocated):
+                    demands[member] = value
+            correlations = np.zeros((len(group_loads), len(group_loads)), dtype=np.int64)
             known_positions = [
                 position for position, index in enumerate(source_indices)
                 if index is not None
@@ -536,11 +595,16 @@ class CtbsaPlacementPlanner:
                 correlations[np.ix_(known_positions, known_positions)] = (
                     analysis.shared_store_days[np.ix_(known_indices, known_indices)]
                 )
+            for first in range(len(group_loads)):
+                for second in range(first + 1, len(group_loads)):
+                    if group_skus[first] == group_skus[second]:
+                        correlations[first, second] = 0
+                        correlations[second, first] = 0
             optimizer = CtbsaNsga2(
                 demands,
                 correlations,
                 [capacity] * len(group_racks),
-                real_item_count=len(group_skus),
+                real_item_count=len(group_loads),
             )
 
             def group_progress(current: int, total: int, message: str) -> None:
@@ -571,11 +635,15 @@ class CtbsaPlacementPlanner:
                 zip(cluster_records, group_racks), start=1
             ):
                 ordered_items = list(rng.permutation(items)) if items else []
-                skus = [group_skus[int(item)] for item in ordered_items]
-                for sku in skus:
+                load_ids = [group_loads[int(item)] for item in ordered_items]
+                skus = [
+                    str(assigned_by_load[load_id].get("sku", ""))
+                    for load_id in load_ids
+                ]
+                for load_id in load_ids:
                     rank += 1
-                    rank_by_sku[sku] = rank
-                    target_racks[sku] = str(rack["rack_id"])
+                    rank_by_sku[load_id] = rank
+                    target_racks[load_id] = str(rack["rack_id"])
                 cluster_rows.append({
                     "storage_class": profile_label,
                     "attribute_profile": dict(attribute_profile),
@@ -586,16 +654,19 @@ class CtbsaPlacementPlanner:
                     "sku_count": len(skus),
                     "cluster_demand": cluster_demand,
                     "skus": skus,
+                    "inventory_load_ids": load_ids,
                 })
 
-        for sku in sorted(fixed_skus):
+        for load_id in sorted(fixed_loads):
             rank += 1
-            rank_by_sku[sku] = rank
+            rank_by_sku[load_id] = rank
         return CtbsaPlacementPlan(
             target_racks=target_racks,
             rank_by_sku=rank_by_sku,
             optimized_skus=tuple(sorted(optimized_skus)),
             fixed_skus=tuple(sorted(fixed_skus)),
+            optimized_loads=tuple(sorted(optimized_loads)),
+            fixed_loads=tuple(sorted(fixed_loads)),
             cluster_rows=cluster_rows,
             pareto_rows=pareto_rows,
             parameters={
@@ -611,8 +682,13 @@ class CtbsaPlacementPlanner:
                 "active_zone_attribute_keys": active_attribute_keys,
                 "attribute_profile_count": len(active_groups),
                 "paper_hard_constraints": (
-                    "each SKU assigned to exactly one cluster; "
-                    "SKU count in cluster k does not exceed Z_k"
+                    "each inventory load assigned to exactly one cluster; "
+                    "load count in cluster k does not exceed Z_k"
+                ),
+                "multi_rack_sku_extension": (
+                    "logical SKU demand is quantity-weighted across independent "
+                    "inventory loads; original correlation and maximum-cluster-"
+                    "demand objectives are unchanged"
                 ),
                 "warehouse_hard_constraints": (
                     "AMR shelf only; unique occupied addresses; map-active SKU "

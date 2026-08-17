@@ -20,6 +20,7 @@ from matplotlib.figure import Figure
 from .affinity import AffinityCancelledError, AffinityService
 from .attribute_editor import HierarchyAttributeEditor
 from .attributes import (
+    DERIVED_OVERSIZE_KEY,
     PHYSICAL_ATTRIBUTE_KEYS,
     STANDARD_STORAGE_DEFAULTS,
     StorageAttributeService,
@@ -35,6 +36,7 @@ from .config import (
     DEFAULT_TRAFFIC_OUTPUT,
     DEFAULT_TRAFFIC_REPORT,
     DEFAULT_VELOCITY_INPUT,
+    DEFAULT_MACHINE_CAPACITY_BY_SYSTEM,
 )
 from .ctbsa import CtbsaParameters
 from .domain import GridPosition, GridProject, GridSpec, Marker, StorageLayout
@@ -43,6 +45,12 @@ from .global_traffic_gui import GlobalTrafficOptimizerTab
 from .rmf import RmfMapService
 from .slotting import SlottingLayoutRepository, SlottingService
 from .storage_planning import combined_occupied_dynamic_address
+from .stock_determination import (
+    calculate_rack_requirements,
+    determine_stock_requirements,
+    write_attribute_combination_csv,
+    write_stock_requirements_csv,
+)
 from .traffic import (
     InsufficientStorageError,
     TrafficAwareSlottingService,
@@ -52,7 +60,7 @@ from .zone_settings_editor import ZoneStorageSettingsEditor
 
 
 class GridMapEditorApp:
-    """Coordinate the seven-tab desktop UI and application services."""
+    """Coordinate the desktop UI and application services."""
 
     @staticmethod
     def sku_storage_flags(row):
@@ -150,6 +158,18 @@ class GridMapEditorApp:
             key: tk.StringVar(value=str(self.project.warehouse_storage_defaults[key]))
             for key in PHYSICAL_ATTRIBUTE_KEYS
         }
+        self.grid_machine_capacity_values = {
+            key: tk.StringVar(
+                value=(
+                    "" if self.project.machine_carrying_capacity[key] is None
+                    else str(self.project.machine_carrying_capacity[key])
+                )
+            )
+            for key in PHYSICAL_ATTRIBUTE_KEYS
+        }
+        self.grid_machine_capacity_label = tk.StringVar(
+            value="AMR whole-rack max weight (kg)"
+        )
         self.map_name = tk.StringVar(value=self.project.grid.map_name)
         self.level_name = tk.StringVar(value=self.project.grid.level_name)
         self.width = tk.StringVar(value=str(self.project.grid.width_m))
@@ -166,10 +186,10 @@ class GridMapEditorApp:
             value=storage_layout.system_type if storage_layout else "AMR"
         )
         self.grid_storage_levels = tk.StringVar(
-            value=str(storage_layout.levels_per_rack if storage_layout else 1)
+            value=str(storage_layout.levels_per_rack if storage_layout else 3)
         )
         self.grid_storage_slots = tk.StringVar(
-            value=str(storage_layout.slots_per_level if storage_layout else 6)
+            value=str(storage_layout.slots_per_level if storage_layout else 4)
         )
         self.grid_buffer_summary = tk.StringVar(
             value=(
@@ -247,9 +267,9 @@ class GridMapEditorApp:
         state["offset_x"] += delta_x
         state["offset_y"] += delta_y
         state["pan"] = (event.x, event.y)
+        self.update_canvas_scrollregion(canvas)
         if canvas is getattr(self, "canvas", None):
             self.draw_grid_demand_overlay()
-        self.update_canvas_scrollregion(canvas)
         return "break"
 
     def canvas_pan_end(self, canvas, _event=None):
@@ -278,9 +298,9 @@ class GridMapEditorApp:
             state["offset_y"] - anchor_y
         )
         state["scale"] = target_scale
+        self.update_canvas_scrollregion(canvas)
         if canvas is getattr(self, "canvas", None):
             self.draw_grid_demand_overlay()
-        self.update_canvas_scrollregion(canvas)
         return "break"
 
     def apply_canvas_viewport(self, canvas):
@@ -390,6 +410,7 @@ class GridMapEditorApp:
         notebook.grid(row=0, column=0, sticky="nsew")
         map_tab = ttk.Frame(notebook)
         affinity_tab = ttk.Frame(notebook)
+        stock_tab = ttk.Frame(notebook)
         slotting_tab = ttk.Frame(notebook)
         slotting_layout_tab = ttk.Frame(notebook)
         traffic_tab = ttk.Frame(notebook)
@@ -397,15 +418,19 @@ class GridMapEditorApp:
         operations_tab = ttk.Frame(notebook)
         notebook.add(map_tab, text="Grid Map Editor")
         notebook.add(affinity_tab, text="SKU Affinity")
+        notebook.add(stock_tab, text="Stock Requirements")
         notebook.add(slotting_tab, text="Inventory Slotting")
         notebook.add(slotting_layout_tab, text="Interactive Slotting Layout")
         notebook.add(traffic_tab, text="Traffic-Aware Slotting")
         notebook.add(global_traffic_tab, text="Global Traffic Optimizer")
         notebook.add(operations_tab, text="Inventory Operations Demo")
-        map_tab.columnconfigure(1, weight=1)
+        map_tab.columnconfigure(0, weight=1)
         map_tab.rowconfigure(0, weight=1)
-        sidebar = ttk.Frame(map_tab)
-        sidebar.grid(row=0, column=0, sticky="nsew")
+        self.grid_map_panes = ttk.Panedwindow(
+            map_tab, orient="horizontal"
+        )
+        self.grid_map_panes.grid(row=0, column=0, sticky="nsew")
+        sidebar = ttk.Frame(self.grid_map_panes, width=290)
         sidebar.columnconfigure(0, weight=1)
         sidebar.rowconfigure(0, weight=1)
         self.grid_sidebar_canvas = tk.Canvas(
@@ -441,10 +466,13 @@ class GridMapEditorApp:
                 self.grid_sidebar_window, width=event.width
             ),
         )
-        canvas_frame = ttk.Frame(map_tab, padding=(0, 12, 12, 12))
-        canvas_frame.grid(row=0, column=1, sticky="nsew")
+        canvas_frame = ttk.Frame(
+            self.grid_map_panes, padding=(0, 12, 12, 12)
+        )
         canvas_frame.columnconfigure(0, weight=1)
         canvas_frame.rowconfigure(0, weight=1)
+        self.grid_map_panes.add(sidebar, weight=0)
+        self.grid_map_panes.add(canvas_frame, weight=1)
 
         fields = [
             ("Map name", self.map_name), ("Level name", self.level_name),
@@ -510,31 +538,52 @@ class GridMapEditorApp:
 
         ttk.Separator(left).grid(row=24, column=0, columnspan=2, sticky="ew", pady=4)
         ttk.Label(left, text="Layout type").grid(row=26, column=0, sticky="w", pady=3)
-        ttk.Combobox(
+        storage_system_box = ttk.Combobox(
             left, textvariable=self.grid_storage_system, state="readonly",
             values=("AMR", "Mini-load ASRS", "Pallet ASRS"), width=16,
-        ).grid(row=26, column=1, sticky="ew", pady=3)
+        )
+        storage_system_box.grid(row=26, column=1, sticky="ew", pady=3)
+        storage_system_box.bind(
+            "<<ComboboxSelected>>", self.grid_storage_system_changed
+        )
         buffer_capacity = ttk.Frame(left)
         buffer_capacity.grid(row=27, column=0, columnspan=2, sticky="w", pady=3)
         ttk.Label(buffer_capacity, text="Levels").pack(side="left")
         ttk.Spinbox(buffer_capacity, from_=1, to=100, textvariable=self.grid_storage_levels, width=4).pack(side="left", padx=(4, 8))
         ttk.Label(buffer_capacity, text="Slots/level").pack(side="left")
         ttk.Spinbox(buffer_capacity, from_=1, to=100, textvariable=self.grid_storage_slots, width=4).pack(side="left", padx=(4, 0))
-        ttk.Button(left, text="Assign empty storage buffers", command=self.assign_grid_buffers).grid(row=28, column=0, columnspan=2, sticky="ew", pady=(4, 2))
-        ttk.Label(left, textvariable=self.grid_buffer_summary, foreground="#315b66", wraplength=230).grid(row=29, column=0, columnspan=2, sticky="w", pady=(1, 4))
+        ttk.Label(left, textvariable=self.grid_machine_capacity_label).grid(
+            row=28, column=0, sticky="w", pady=3
+        )
+        machine_capacity = ttk.Frame(left)
+        machine_capacity.grid(row=28, column=1, sticky="ew", pady=3)
+        self.grid_machine_capacity_entries = {}
+        for key, label in (
+            ("max_item_length", "L"), ("max_item_width", "W"),
+            ("max_item_height", "H"), ("max_item_weight", "Wt"),
+        ):
+            ttk.Label(machine_capacity, text=label).pack(side="left", padx=(3, 1))
+            entry = ttk.Entry(
+                machine_capacity,
+                textvariable=self.grid_machine_capacity_values[key], width=5,
+            )
+            entry.pack(side="left")
+            self.grid_machine_capacity_entries[key] = entry
+        ttk.Button(left, text="Assign empty storage buffers", command=self.assign_grid_buffers).grid(row=29, column=0, columnspan=2, sticky="ew", pady=(4, 2))
+        ttk.Label(left, textvariable=self.grid_buffer_summary, foreground="#315b66", wraplength=230).grid(row=30, column=0, columnspan=2, sticky="w", pady=(1, 4))
 
-        ttk.Separator(left).grid(row=30, column=0, columnspan=2, sticky="ew", pady=4)
-        ttk.Label(left, text="Zone ID").grid(row=32, column=0, sticky="w", pady=2)
-        ttk.Entry(left, textvariable=self.grid_zone_id, width=19).grid(row=32, column=1, sticky="ew", pady=2)
+        ttk.Separator(left).grid(row=31, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Label(left, text="Zone ID").grid(row=33, column=0, sticky="w", pady=2)
+        ttk.Entry(left, textvariable=self.grid_zone_id, width=19).grid(row=33, column=1, sticky="ew", pady=2)
         ttk.Checkbutton(
             left, text="Advance zone ID automatically",
             variable=self.grid_zone_auto,
-        ).grid(row=33, column=0, columnspan=2, sticky="w")
-        ttk.Label(left, text="Default storage L / W").grid(
-            row=34, column=0, sticky="w", pady=(4, 2)
+        ).grid(row=34, column=0, columnspan=2, sticky="w")
+        ttk.Label(left, text="Default slot L / W (m)").grid(
+            row=35, column=0, sticky="w", pady=(4, 2)
         )
         warehouse_dimensions_1 = ttk.Frame(left)
-        warehouse_dimensions_1.grid(row=34, column=1, sticky="ew", pady=(4, 2))
+        warehouse_dimensions_1.grid(row=35, column=1, sticky="ew", pady=(4, 2))
         ttk.Entry(
             warehouse_dimensions_1,
             textvariable=self.grid_warehouse_capacity_values["max_item_length"],
@@ -546,11 +595,11 @@ class GridMapEditorApp:
             textvariable=self.grid_warehouse_capacity_values["max_item_width"],
             width=8,
         ).pack(side="left")
-        ttk.Label(left, text="Default storage H / weight").grid(
-            row=35, column=0, sticky="w", pady=2
+        ttk.Label(left, text="Default slot H (m) / kg").grid(
+            row=36, column=0, sticky="w", pady=2
         )
         warehouse_dimensions_2 = ttk.Frame(left)
-        warehouse_dimensions_2.grid(row=35, column=1, sticky="ew", pady=2)
+        warehouse_dimensions_2.grid(row=36, column=1, sticky="ew", pady=2)
         ttk.Entry(
             warehouse_dimensions_2,
             textvariable=self.grid_warehouse_capacity_values["max_item_height"],
@@ -566,9 +615,9 @@ class GridMapEditorApp:
             left,
             text="Apply storage defaults to zones",
             command=self.apply_grid_warehouse_storage_defaults,
-        ).grid(row=36, column=0, columnspan=2, sticky="ew", pady=(3, 2))
+        ).grid(row=37, column=0, columnspan=2, sticky="ew", pady=(3, 2))
         zone_buttons = ttk.Frame(left)
-        zone_buttons.grid(row=37, column=0, columnspan=2, sticky="ew", pady=(3, 2))
+        zone_buttons.grid(row=38, column=0, columnspan=2, sticky="ew", pady=(3, 2))
         ttk.Button(
             zone_buttons, text="Zone settings…",
             command=self.open_grid_zone_storage_settings,
@@ -579,52 +628,12 @@ class GridMapEditorApp:
         ).pack(side="left", expand=True, fill="x", padx=(4, 0))
         ttk.Button(
             left, text="Clear rack zones", command=self.clear_grid_zones,
-        ).grid(row=38, column=0, columnspan=2, sticky="ew", pady=2)
+        ).grid(row=39, column=0, columnspan=2, sticky="ew", pady=2)
         ttk.Label(
             left, textvariable=self.grid_zone_summary, foreground="#315b66",
             wraplength=230,
-        ).grid(row=39, column=0, columnspan=2, sticky="w", pady=(1, 4))
+        ).grid(row=40, column=0, columnspan=2, sticky="w", pady=(1, 4))
 
-        ttk.Separator(left).grid(row=40, column=0, columnspan=2, sticky="ew", pady=4)
-        sku_attribute_input = ttk.Frame(left)
-        sku_attribute_input.grid(row=42, column=0, columnspan=2, sticky="ew", pady=2)
-        sku_attribute_input.columnconfigure(0, weight=1)
-        ttk.Entry(
-            sku_attribute_input, textvariable=self.grid_sku_attributes_path,
-        ).grid(row=0, column=0, sticky="ew")
-        ttk.Button(
-            sku_attribute_input, text="Load CSV…",
-            command=self.load_grid_sku_attributes_dialog,
-        ).grid(row=0, column=1, padx=(4, 0))
-        overlay_attribute_frame = ttk.Frame(left)
-        overlay_attribute_frame.grid(
-            row=43, column=0, columnspan=2, sticky="ew", pady=(3, 2)
-        )
-        overlay_attribute_frame.columnconfigure(0, weight=1)
-        ttk.Label(
-            overlay_attribute_frame,
-            text="Overlay grouping attributes (Ctrl-click to select)",
-        ).grid(row=0, column=0, sticky="w")
-        self.grid_sku_overlay_attribute_list = tk.Listbox(
-            overlay_attribute_frame,
-            selectmode="extended",
-            exportselection=False,
-            height=4,
-        )
-        self.grid_sku_overlay_attribute_list.grid(
-            row=1, column=0, sticky="ew", pady=(2, 2)
-        )
-        ttk.Button(
-            overlay_attribute_frame,
-            text="Apply overlay selection",
-            command=self.apply_grid_sku_overlay_attributes,
-        ).grid(row=2, column=0, sticky="ew")
-        ttk.Label(
-            left, textvariable=self.grid_sku_attribute_summary,
-            foreground="#315b66", wraplength=255, justify="left",
-        ).grid(row=44, column=0, columnspan=2, sticky="w", pady=(2, 5))
-
-        ttk.Separator(left).grid(row=45, column=0, columnspan=2, sticky="ew", pady=4)
         ttk.Button(left, text="Save grid project JSON…", command=self.save_project_dialog).grid(row=47, column=0, columnspan=2, sticky="ew", pady=2)
         ttk.Button(left, text="Load grid project JSON…", command=self.load_project_dialog).grid(row=48, column=0, columnspan=2, sticky="ew", pady=2)
         ttk.Button(left, text="Export RMF building YAML…", command=self.export_yaml_dialog).grid(row=49, column=0, columnspan=2, sticky="ew", pady=(5, 2))
@@ -632,14 +641,14 @@ class GridMapEditorApp:
         self.add_grid_sidebar_section(left, "grid", "WAREHOUSE GRID", 0, range(1, 8))
         self.add_grid_sidebar_section(left, "tools", "CLICK TOOLS", 9, range(10, 17))
         self.add_grid_sidebar_section(left, "point", "SELECTED GRID POINT", 18, range(19, 24))
-        self.add_grid_sidebar_section(left, "buffers", "STORAGE BUFFERS", 25, range(26, 30))
-        self.add_grid_sidebar_section(left, "settings", "WAREHOUSE SETTINGS", 31, range(32, 40))
-        self.add_grid_sidebar_section(left, "sku_attributes", "SKU ATTRIBUTES", 41, range(42, 45))
+        self.add_grid_sidebar_section(left, "buffers", "STORAGE BUFFERS", 25, range(26, 31))
+        self.add_grid_sidebar_section(left, "settings", "WAREHOUSE SETTINGS", 32, range(33, 41))
         self.add_grid_sidebar_section(left, "files", "PROJECT FILES", 46, range(47, 50))
 
         self.bind_mousewheel_tree(
             self.grid_sidebar_canvas, self.scroll_grid_sidebar
         )
+        self.update_machine_capacity_ui()
 
         self.canvas = tk.Canvas(canvas_frame, background="white", highlightthickness=1, highlightbackground="#9aa8ae")
         self.canvas.grid(row=0, column=0, sticky="nsew")
@@ -674,6 +683,7 @@ class GridMapEditorApp:
             foreground="#4d646d",
         ).grid(row=0, column=4, sticky="w")
         self._build_affinity_tab(affinity_tab)
+        self._build_stock_tab(stock_tab)
         self._build_slotting_tab(slotting_tab)
         self._build_interactive_slotting_tab(slotting_layout_tab)
         self._build_traffic_tab(traffic_tab)
@@ -681,6 +691,553 @@ class GridMapEditorApp:
             global_traffic_tab, self
         )
         self._build_operations_tab(operations_tab)
+
+    def _build_stock_tab(self, parent):
+        self.stock_input_path = tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
+        self.stock_minimum_days = tk.StringVar(value="2")
+        self.stock_buffer_days = tk.StringVar(value="1")
+        self.stock_slot_length = tk.StringVar(
+            value=str(self.project.warehouse_storage_defaults["max_item_length"])
+        )
+        self.stock_slot_width = tk.StringVar(
+            value=str(self.project.warehouse_storage_defaults["max_item_width"])
+        )
+        self.stock_slot_height = tk.StringVar(
+            value=str(self.project.warehouse_storage_defaults["max_item_height"])
+        )
+        stock_layout = self.project.storage_layout
+        default_slot_load_weight = self.project.warehouse_storage_defaults[
+            "max_item_weight"
+        ]
+        if (
+            stock_layout is not None
+            and stock_layout.system_type == "AMR"
+            and self.project.machine_carrying_capacity["max_item_weight"]
+        ):
+            default_slot_load_weight = (
+                self.project.machine_carrying_capacity["max_item_weight"]
+                / (
+                    stock_layout.levels_per_rack
+                    * stock_layout.slots_per_level
+                )
+            )
+        self.stock_slot_weight = tk.StringVar(
+            value=f"{default_slot_load_weight:g}"
+        )
+        self.stock_storage_system = tk.StringVar(value=self.grid_storage_system.get())
+        self.stock_machine_capacity_values = {
+            key: tk.StringVar(
+                value=(
+                    "" if self.project.machine_carrying_capacity[key] is None
+                    else str(self.project.machine_carrying_capacity[key])
+                )
+            )
+            for key in PHYSICAL_ATTRIBUTE_KEYS
+        }
+        self.stock_machine_capacity_label = tk.StringVar()
+        self.stock_rack_levels = tk.StringVar(
+            value=str(stock_layout.levels_per_rack if stock_layout else 3)
+        )
+        self.stock_slots_per_level = tk.StringVar(
+            value=str(stock_layout.slots_per_level if stock_layout else 4)
+        )
+        if not self.grid_sku_attributes_path.get().strip():
+            self.grid_sku_attributes_path.set(str(DEFAULT_SKU_ATTRIBUTES_INPUT))
+        self.stock_status = tk.StringVar(
+            value="Choose an order-history workbook and calculate the requirements."
+        )
+        self.stock_rows = []
+        self.stock_combination_rows = []
+        self.stock_worker = None
+        self.stock_messages = queue.Queue()
+
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+        controls = ttk.LabelFrame(
+            parent, text="Stock coverage settings", padding=12
+        )
+        controls.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        controls.columnconfigure(1, weight=1)
+        ttk.Label(controls, text="Order-history Excel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        ttk.Entry(controls, textvariable=self.stock_input_path).grid(
+            row=0, column=1, sticky="ew", pady=4
+        )
+        ttk.Button(
+            controls,
+            text="Browse…",
+            command=lambda: self.browse_slot_input(
+                self.stock_input_path,
+                [("Excel workbook", "*.xlsx"), ("All files", "*")],
+            ),
+        ).grid(row=0, column=2, padx=(8, 0), pady=4)
+
+        day_controls = ttk.Frame(controls)
+        day_controls.grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(5, 4)
+        )
+        ttk.Label(day_controls, text="Minimum stock coverage").pack(side="left")
+        ttk.Spinbox(
+            day_controls,
+            from_=1,
+            to=365,
+            increment=1,
+            textvariable=self.stock_minimum_days,
+            width=6,
+        ).pack(side="left", padx=(6, 3))
+        ttk.Label(day_controls, text="days").pack(side="left")
+        ttk.Label(day_controls, text="Buffer stock coverage").pack(
+            side="left", padx=(20, 0)
+        )
+        ttk.Spinbox(
+            day_controls,
+            from_=0,
+            to=365,
+            increment=1,
+            textvariable=self.stock_buffer_days,
+            width=6,
+        ).pack(side="left", padx=(6, 3))
+        ttk.Label(day_controls, text="days").pack(side="left")
+        self.stock_calculate_button = ttk.Button(
+            day_controls,
+            text="Calculate",
+            command=self.calculate_stock_requirements,
+        )
+        self.stock_calculate_button.pack(side="left", padx=(20, 0))
+        self.stock_export_button = ttk.Button(
+            day_controls,
+            text="Save CSV…",
+            command=self.export_stock_requirements,
+            state="disabled",
+        )
+        self.stock_export_button.pack(side="left", padx=(6, 0))
+        ttk.Label(
+            controls,
+            text=(
+                "Formula: ceil(average daily demand × (minimum + buffer days)). "
+                "The workbook's inclusive calendar span supplies the daily average."
+            ),
+            foreground="#4d646d",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 1))
+        ttk.Label(
+            controls, textvariable=self.stock_status, foreground="#315b66"
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(5, 0))
+
+        attributes = ttk.LabelFrame(
+            parent, text="SKU attributes and rack capacity", padding=10
+        )
+        attributes.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        attributes.columnconfigure(1, weight=1)
+        ttk.Label(attributes, text="SKU attributes CSV").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(
+            attributes, textvariable=self.grid_sku_attributes_path
+        ).grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Button(
+            attributes,
+            text="Load CSV…",
+            command=self.load_grid_sku_attributes_dialog,
+        ).grid(row=0, column=2, padx=(8, 0), pady=3)
+
+        capacity = ttk.Frame(attributes)
+        capacity.grid(row=1, column=0, columnspan=3, sticky="w", pady=3)
+        ttk.Label(capacity, text="Slot L / W / H (m)").pack(side="left")
+        for variable in (
+            self.stock_slot_length,
+            self.stock_slot_width,
+            self.stock_slot_height,
+        ):
+            ttk.Entry(capacity, textvariable=variable, width=7).pack(
+                side="left", padx=(5, 0)
+            )
+        ttk.Label(capacity, text="Slot max kg").pack(side="left", padx=(12, 0))
+        ttk.Entry(
+            capacity, textvariable=self.stock_slot_weight, width=7
+        ).pack(side="left", padx=(5, 0))
+        ttk.Label(capacity, text="Rack levels").pack(side="left", padx=(18, 0))
+        ttk.Spinbox(
+            capacity, from_=1, to=100, textvariable=self.stock_rack_levels,
+            width=5,
+        ).pack(side="left", padx=(5, 0))
+        ttk.Label(capacity, text="Slots / level").pack(side="left", padx=(18, 0))
+        ttk.Spinbox(
+            capacity, from_=1, to=100, textvariable=self.stock_slots_per_level,
+            width=5,
+        ).pack(side="left", padx=(5, 0))
+
+        machine = ttk.Frame(attributes)
+        machine.grid(row=2, column=0, columnspan=3, sticky="w", pady=3)
+        ttk.Label(machine, text="Warehouse type").pack(side="left")
+        stock_system_box = ttk.Combobox(
+            machine,
+            textvariable=self.stock_storage_system,
+            state="readonly",
+            values=("AMR", "Mini-load ASRS", "Pallet ASRS"),
+            width=16,
+        )
+        stock_system_box.pack(side="left", padx=(5, 14))
+        ttk.Label(machine, textvariable=self.stock_machine_capacity_label).pack(side="left")
+        self.stock_machine_capacity_entries = {}
+        for key in PHYSICAL_ATTRIBUTE_KEYS:
+            entry = ttk.Entry(
+                machine,
+                textvariable=self.stock_machine_capacity_values[key],
+                width=7,
+            )
+            entry.pack(side="left", padx=(5, 0))
+            self.stock_machine_capacity_entries[key] = entry
+        stock_system_box.bind(
+            "<<ComboboxSelected>>",
+            self.stock_storage_system_changed,
+        )
+        self.update_stock_machine_capacity_ui()
+
+        grouping = ttk.Frame(attributes)
+        grouping.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+        grouping.columnconfigure(0, weight=1)
+        ttk.Label(
+            grouping,
+            text="Rack grouping attributes (Ctrl-click to select)",
+        ).grid(row=0, column=0, sticky="w")
+        self.grid_sku_overlay_attribute_list = tk.Listbox(
+            grouping, selectmode="extended", exportselection=False, height=3
+        )
+        self.grid_sku_overlay_attribute_list.grid(
+            row=1, column=0, sticky="ew", pady=(2, 2)
+        )
+        ttk.Button(
+            grouping,
+            text="Apply grouping to stock results and grid overlay",
+            command=self.apply_grid_sku_overlay_attributes,
+        ).grid(row=1, column=1, sticky="ns", padx=(7, 0), pady=2)
+        ttk.Label(
+            grouping,
+            textvariable=self.grid_sku_attribute_summary,
+            foreground="#315b66",
+            wraplength=520,
+            justify="left",
+        ).grid(row=0, column=2, rowspan=2, sticky="w", padx=(14, 0))
+        self.sync_grid_sku_overlay_attribute_list()
+
+        result_tabs = ttk.Notebook(parent)
+        result_tabs.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        results = ttk.Frame(result_tabs, padding=8)
+        combinations = ttk.Frame(result_tabs, padding=8)
+        result_tabs.add(results, text="Per-SKU requirements")
+        result_tabs.add(combinations, text="Racks by attribute combination")
+        results.columnconfigure(0, weight=1)
+        results.rowconfigure(0, weight=1)
+        columns = (
+            "sku", "daily", "minimum_days", "minimum", "buffer_days",
+            "buffer", "total", "units_slot", "slots_unit",
+            "required_slots", "required_racks", "status",
+        )
+        self.stock_tree = ttk.Treeview(
+            results, columns=columns, show="headings", height=20
+        )
+        headings = {
+            "sku": "SKU",
+            "daily": "Avg daily demand (EA)",
+            "minimum_days": "Minimum days",
+            "minimum": "Minimum stock (EA)",
+            "buffer_days": "Buffer days",
+            "buffer": "Buffer stock (EA)",
+            "total": "Total required (EA)",
+            "units_slot": "EA / slot",
+            "slots_unit": "Slots / EA",
+            "required_slots": "Required slots",
+            "required_racks": "Required racks",
+            "status": "Rack status",
+        }
+        widths = {
+            "sku": 190, "daily": 145, "minimum_days": 105,
+            "minimum": 140, "buffer_days": 95, "buffer": 135,
+            "total": 140,
+            "units_slot": 90, "slots_unit": 90,
+            "required_slots": 105, "required_racks": 105, "status": 165,
+        }
+        for column in columns:
+            self.stock_tree.heading(column, text=headings[column])
+            self.stock_tree.column(
+                column,
+                width=widths[column],
+                anchor="w" if column == "sku" else "center",
+            )
+        vertical = ttk.Scrollbar(
+            results, orient="vertical", command=self.stock_tree.yview
+        )
+        horizontal = ttk.Scrollbar(
+            results, orient="horizontal", command=self.stock_tree.xview
+        )
+        self.stock_tree.configure(
+            yscrollcommand=vertical.set, xscrollcommand=horizontal.set
+        )
+        self.stock_tree.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+
+        combinations.columnconfigure(0, weight=1)
+        combinations.rowconfigure(0, weight=1)
+        combination_columns = (
+            "combination", "skus", "total_ea", "slots", "racks", "issues",
+        )
+        self.stock_combination_tree = ttk.Treeview(
+            combinations, columns=combination_columns, show="headings", height=12
+        )
+        combination_headings = {
+            "combination": "Attribute combination",
+            "skus": "SKUs",
+            "total_ea": "Total required (EA)",
+            "slots": "Required slots",
+            "racks": "Required racks",
+            "issues": "Unresolved SKUs",
+        }
+        combination_widths = {
+            "combination": 330, "skus": 70, "total_ea": 135,
+            "slots": 100, "racks": 100, "issues": 110,
+        }
+        for column in combination_columns:
+            self.stock_combination_tree.heading(
+                column, text=combination_headings[column]
+            )
+            self.stock_combination_tree.column(
+                column,
+                width=combination_widths[column],
+                anchor="w" if column == "combination" else "center",
+            )
+        combination_y = ttk.Scrollbar(
+            combinations,
+            orient="vertical",
+            command=self.stock_combination_tree.yview,
+        )
+        self.stock_combination_tree.configure(yscrollcommand=combination_y.set)
+        self.stock_combination_tree.grid(row=0, column=0, sticky="nsew")
+        combination_y.grid(row=0, column=1, sticky="ns")
+
+    def update_stock_machine_capacity_ui(self):
+        if not hasattr(self, "stock_machine_capacity_entries"):
+            return
+        is_amr = self.stock_storage_system.get() == "AMR"
+        self.stock_machine_capacity_label.set(
+            "AMR whole-rack max weight (kg)"
+            if is_amr else "ASRS max L/W/H (m) / kg"
+        )
+        for key in PHYSICAL_ATTRIBUTE_KEYS:
+            state = "disabled" if is_amr and key != "max_item_weight" else "normal"
+            self.stock_machine_capacity_entries[key].configure(state=state)
+
+    def stock_storage_system_changed(self, _event=None):
+        defaults = DEFAULT_MACHINE_CAPACITY_BY_SYSTEM[
+            self.stock_storage_system.get()
+        ]
+        for key, variable in self.stock_machine_capacity_values.items():
+            value = defaults[key]
+            variable.set("" if value is None else str(value))
+        if self.stock_storage_system.get() == "AMR":
+            try:
+                slot_count = (
+                    int(self.stock_rack_levels.get())
+                    * int(self.stock_slots_per_level.get())
+                )
+                self.stock_slot_weight.set(
+                    f'{defaults["max_item_weight"] / slot_count:g}'
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        self.update_stock_machine_capacity_ui()
+
+    def calculate_stock_requirements(self):
+        try:
+            minimum_days = int(self.stock_minimum_days.get())
+            buffer_days = int(self.stock_buffer_days.get())
+            source = Path(self.stock_input_path.get().strip()).expanduser()
+            attribute_source = Path(
+                self.grid_sku_attributes_path.get().strip()
+            ).expanduser()
+            slot_dimensions = (
+                float(self.stock_slot_length.get()),
+                float(self.stock_slot_width.get()),
+                float(self.stock_slot_height.get()),
+            )
+            slot_max_weight = float(self.stock_slot_weight.get())
+            levels = int(self.stock_rack_levels.get())
+            slots = int(self.stock_slots_per_level.get())
+            machine_capacity = self.parse_machine_capacity(
+                self.stock_machine_capacity_values,
+                self.stock_storage_system.get(),
+            )
+            if minimum_days < 1 or buffer_days < 0:
+                raise ValueError(
+                    "Minimum days must be at least 1 and buffer days cannot be negative."
+                )
+            if levels < 1 or slots < 1:
+                raise ValueError("Rack levels and slots per level must be at least 1.")
+            if any(value <= 0 for value in slot_dimensions) or slot_max_weight <= 0:
+                raise ValueError(
+                    "Slot length, width, height, and maximum weight must be greater than zero."
+                )
+        except (ValueError, TypeError) as exc:
+            messagebox.showerror("Stock requirements", str(exc))
+            return
+
+        self.project.machine_carrying_capacity = machine_capacity
+        if (
+            self.project.storage_layout is not None
+            and self.project.storage_layout.system_type
+            == self.stock_storage_system.get()
+        ):
+            self.project.storage_layout.machine_carrying_capacity = dict(
+                machine_capacity
+            )
+        handling_unit = {
+            "AMR": "AMR shelf",
+            "Mini-load ASRS": "Tote",
+            "Pallet ASRS": "Pallet",
+        }[self.stock_storage_system.get()]
+        self.attributes.set_machine_carrying_capacity(
+            machine_capacity, handling_unit
+        )
+
+        resolved_attributes = str(attribute_source.resolve())
+        if (
+            self.project.sku_attribute_source != resolved_attributes
+            or not self.project.sku_attribute_summary
+        ) and not self.load_grid_sku_attributes(attribute_source):
+            return
+        combination_attributes = tuple(self.project.sku_overlay_attributes)
+        attribute_catalog = copy.deepcopy(self.project.attribute_catalog)
+
+        self.stock_rows = []
+        self.stock_combination_rows = []
+        self.stock_tree.delete(*self.stock_tree.get_children())
+        self.stock_combination_tree.delete(
+            *self.stock_combination_tree.get_children()
+        )
+        self.stock_calculate_button.configure(state="disabled")
+        self.stock_export_button.configure(state="disabled")
+        self.stock_status.set("Reading order history and calculating stock…")
+
+        def worker():
+            try:
+                rows = determine_stock_requirements(
+                    source, minimum_days, buffer_days
+                )
+                requirements = self.slotting.load_sku_attribute_requirements(
+                    attribute_source,
+                    {str(row["sku"]) for row in rows},
+                    attribute_catalog,
+                    include_derived_grouping=True,
+                )
+                rows, combinations = calculate_rack_requirements(
+                    rows,
+                    requirements,
+                    slot_dimensions,
+                    levels,
+                    slots,
+                    combination_attributes,
+                    slot_max_weight=slot_max_weight,
+                    rack_max_weight=(
+                        machine_capacity["max_item_weight"]
+                        if self.stock_storage_system.get() == "AMR" else None
+                    ),
+                )
+                self.stock_messages.put(("done", (rows, combinations)))
+            except Exception as exc:
+                self.stock_messages.put(("error", exc))
+
+        self.stock_worker = threading.Thread(target=worker, daemon=True)
+        self.stock_worker.start()
+        self.root.after(80, self.poll_stock_requirements)
+
+    def poll_stock_requirements(self):
+        try:
+            kind, payload = self.stock_messages.get_nowait()
+        except queue.Empty:
+            if self.stock_worker and self.stock_worker.is_alive():
+                self.root.after(80, self.poll_stock_requirements)
+            return
+
+        self.stock_calculate_button.configure(state="normal")
+        if kind == "error":
+            self.stock_status.set("Stock calculation failed.")
+            messagebox.showerror("Stock requirements", str(payload))
+            return
+
+        rows, combinations = payload
+        self.stock_rows = rows
+        self.stock_combination_rows = combinations
+        for row in rows:
+            self.stock_tree.insert("", "end", values=(
+                row["sku"],
+                f'{row["average_daily_demand_ea"]:g}',
+                row["minimum_stock_days"],
+                row["minimum_stock_ea"],
+                row["buffer_stock_days"],
+                row["minimum_buffer_stock_ea"],
+                row["total_required_ea"],
+                row["units_per_slot"] or "—",
+                row["slots_per_unit"] or "—",
+                row["required_slots"] if row["required_slots"] != "" else "—",
+                row["required_racks"] if row["required_racks"] != "" else "—",
+                row["rack_calculation_status"],
+            ))
+        for row in combinations:
+            self.stock_combination_tree.insert("", "end", values=(
+                row["attribute_combination"],
+                row["sku_count"],
+                row["total_required_ea"],
+                row["required_slots"],
+                f'{row["required_racks"]}{"+" if row["unresolved_skus"] else ""}',
+                row["unresolved_skus"],
+            ))
+        summary = copy.deepcopy(self.project.sku_attribute_summary)
+        summary["attribute_combinations"] = copy.deepcopy(combinations)
+        self.project.sku_attribute_summary = summary
+        self.grid_sku_attribute_summary.set(
+            self.format_sku_attribute_summary(summary)
+        )
+        self.redraw()
+        first = rows[0]
+        unresolved = sum(
+            not str(row["rack_calculation_status"]).startswith("CALCULATED")
+            for row in rows
+        )
+        self.stock_export_button.configure(state="normal")
+        self.stock_status.set(
+            f'{len(rows):,} SKUs · {first["observation_start"]} to '
+            f'{first["observation_end"]} ({first["observation_days"]:,} days) · '
+            f'{unresolved:,} unresolved rack calculations'
+        )
+
+    def export_stock_requirements(self):
+        if not self.stock_rows:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save stock requirements",
+            initialdir=str(Path(self.stock_input_path.get()).expanduser().parent),
+            initialfile="minimum_stock_requirements.csv",
+            defaultextension=".csv",
+            filetypes=(("CSV", "*.csv"), ("All files", "*")),
+        )
+        if not path:
+            return
+        try:
+            output = write_stock_requirements_csv(self.stock_rows, Path(path))
+            combination_output = Path(path).with_name(
+                f"{Path(path).stem}_attribute_combinations.csv"
+            )
+            write_attribute_combination_csv(
+                self.stock_combination_rows, combination_output
+            )
+        except OSError as exc:
+            messagebox.showerror("Save stock requirements", str(exc))
+            return
+        self.stock_status.set(
+            f"Saved {len(self.stock_rows):,} SKUs to {output} and grouped racks "
+            f"to {combination_output.name}"
+        )
 
     def _build_affinity_tab(self, parent):
         self.affinity_input_path = tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
@@ -1387,8 +1944,8 @@ class GridMapEditorApp:
         self.slot_affinity_recommendation = None
         self.slot_handling_unit = tk.StringVar(value="AMR shelf")
         self.slot_zone = tk.StringVar(value="Z01")
-        self.slot_levels = tk.StringVar(value="1")
-        self.slot_slots = tk.StringVar(value="6")
+        self.slot_levels = tk.StringVar(value="3")
+        self.slot_slots = tk.StringVar(value="4")
         self.slot_summary = tk.StringVar(value="Choose the inputs and generate a slotting layout.")
         self.slot_progress_value = tk.DoubleVar(value=0)
         self.slot_progress_text = tk.StringVar(value="Ready")
@@ -1749,13 +2306,13 @@ class GridMapEditorApp:
             foreground="#4d646d",
             wraplength=210,
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        columns = ("abc_rank", "affinity_rank", "sku", "class", "flags", "static", "dynamic", "unit_type", "unit_id", "status")
+        columns = ("abc_rank", "affinity_rank", "sku", "rack_quantity", "class", "flags", "static", "dynamic", "unit_type", "unit_id", "status")
         tree_frame = ttk.Frame(rack_view)
         tree_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=8, pady=(8, 0))
         tree_frame.columnconfigure(0, weight=1); tree_frame.rowconfigure(0, weight=1)
         self.slot_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-        headings = {"abc_rank":"ABC rank", "affinity_rank":"Affinity order", "sku":"SKU", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Occupied dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
-        widths = {"abc_rank":65, "affinity_rank":85, "sku":95, "class":50, "flags":180, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
+        headings = {"abc_rank":"ABC rank", "affinity_rank":"Affinity order", "sku":"SKU", "rack_quantity":"Qty in rack (EA)", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Occupied dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
+        widths = {"abc_rank":65, "affinity_rank":85, "sku":95, "rack_quantity":95, "class":50, "flags":180, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
         for column in columns:
             self.slot_tree.heading(column, text=headings[column]); self.slot_tree.column(column, width=widths[column], anchor="center" if column not in {"flags","static","dynamic"} else "w")
         yscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.slot_tree.yview)
@@ -1771,8 +2328,8 @@ class GridMapEditorApp:
         self.traffic_order_path = tk.StringVar(value=str(DEFAULT_TRAFFIC_INPUT))
         self.traffic_last_workflow = None
         self.traffic_handling_unit = tk.StringVar(value="AMR shelf")
-        self.traffic_levels = tk.StringVar(value="1")
-        self.traffic_slots = tk.StringVar(value="6")
+        self.traffic_levels = tk.StringVar(value="3")
+        self.traffic_slots = tk.StringVar(value="4")
         self.traffic_network_mode = tk.StringVar(value="Use embedded RMF map")
         self.traffic_network_path = tk.StringVar()
         self.traffic_start_date = tk.StringVar()
@@ -2586,11 +3143,28 @@ class GridMapEditorApp:
             if self.traffic_result else 0
         )
         fixed_assigned_skus = max(0, assigned_skus - optimized_skus)
+        optimized_loads = int(
+            self.traffic_result.parameters.get("optimized_load_count", 0)
+            if self.traffic_result else 0
+        )
+        compact_racks = int(
+            self.traffic_result.parameters.get("compact_rack_count", 0)
+            if self.traffic_result else generation_summary.get(
+                "compact_rack_count", 0
+            )
+        )
+        selected_racks = int(
+            self.traffic_result.parameters.get(
+                "selected_rack_count", compact_racks
+            ) if self.traffic_result else compact_racks
+        )
         self.traffic_assignment_summary.set(
             f"Assigned SKUs {assigned_skus:,} / {total_skus:,}  · "
             f"Optimized by C&TBSA {optimized_skus:,}  · "
+            f"load targets {optimized_loads:,}  · "
             f"Fixed exceptions {fixed_assigned_skus:,}  · "
-            f"Unassigned {unassigned_skus:,}"
+            f"Unassigned {unassigned_skus:,}  · "
+            f"occupied racks {compact_racks:,} → {selected_racks:,}"
         )
         baseline_rows = (
             self.traffic_baseline_payload.get("assignments", [])
@@ -3057,6 +3631,7 @@ class GridMapEditorApp:
         self.ops_movement_status=tk.StringVar(value="Load a layout and import order history to rank unit movements.")
         self.ops_details=tk.StringVar(value="Search for a SKU to show its current addresses and map position.")
         self.ops_payload=None; self.ops_building=None; self.ops_rows=[]; self.ops_racks=[]; self.ops_highlight_rack=None
+        self.ops_search_racks=set();self.ops_search_skus=set()
         self.ops_shelf_selection=[];self.ops_sku_selection=[];self.ops_inventory_rows={}
         self.ops_movement_by_unit={};self.ops_movement_summary={};self.ops_movement_analysis=None
         parent.columnconfigure(0,weight=1); parent.rowconfigure(1,weight=1)
@@ -3104,10 +3679,10 @@ class GridMapEditorApp:
         ttk.Label(control,textvariable=self.ops_details,justify="left",wraplength=470).grid(row=1,column=0,sticky="ew",pady=(0,10))
 
         inventory=ttk.LabelFrame(control,text="SELECTED RACK INVENTORY",padding=6); inventory.grid(row=2,column=0,sticky="nsew",pady=(0,8)); inventory.columnconfigure(0,weight=1); inventory.rowconfigure(0,weight=1)
-        columns=("sku","class","flags","static","dynamic","unit")
+        columns=("sku","quantity","class","flags","static","dynamic","unit")
         self.ops_inventory_tree=ttk.Treeview(inventory,columns=columns,show="headings",height=8)
-        headings={"sku":"SKU","class":"ABC","flags":"Storage flags","static":"Static address","dynamic":"Occupied dynamic address","unit":"Shelf / unit"}
-        widths={"sku":100,"class":45,"flags":180,"static":190,"dynamic":220,"unit":110}
+        headings={"sku":"SKU","quantity":"Qty in rack (EA)","class":"ABC","flags":"Storage flags","static":"Static address","dynamic":"Occupied dynamic address","unit":"Shelf / unit"}
+        widths={"sku":100,"quantity":100,"class":45,"flags":180,"static":190,"dynamic":220,"unit":110}
         for column in columns:
             self.ops_inventory_tree.heading(column,text=headings[column]);self.ops_inventory_tree.column(column,width=widths[column],anchor="center" if column in {"class","unit"} else "w")
         inventory_y=ttk.Scrollbar(inventory,orient="vertical",command=self.ops_inventory_tree.yview)
@@ -3142,7 +3717,7 @@ class GridMapEditorApp:
             )
         except (OSError,ValueError,TypeError,json.JSONDecodeError,yaml.YAMLError) as exc:
             messagebox.showerror("Layout load failed",str(exc));return
-        self.ops_payload=payload;self.ops_building=payload["building"];self.ops_rows=payload["assignments"];self.ops_racks=racks;self.ops_highlight_rack=None;self.ops_shelf_selection=[];self.ops_sku_selection=[]
+        self.ops_payload=payload;self.ops_building=payload["building"];self.ops_rows=payload["assignments"];self.ops_racks=racks;self.ops_highlight_rack=None;self.ops_search_racks=set();self.ops_search_skus=set();self.ops_shelf_selection=[];self.ops_sku_selection=[]
         self.ops_source_sku.set("");self.ops_target_sku.set("")
         source_history=(payload.get("sources",{}).get("movement_order_workbook") or payload.get("sources",{}).get("traffic_order_workbook") or payload.get("sources",{}).get("affinity_order_workbook") or "")
         if source_history:self.ops_history_path.set(source_history)
@@ -3233,16 +3808,18 @@ class GridMapEditorApp:
         for rack in self.ops_racks:
             rack_id=rack["rack_id"];x,y=self.ops_screen_point(rack["x"],rack["y"],geometry);rows=grouped.get(rack_id,[])
             shelf_selected=rack_id in shelf_racks;selected=rack_id==self.ops_highlight_rack
-            outline="#e07a1f" if shelf_selected else ("#087f8c" if selected else "white")
+            search_match=rack_id in self.ops_search_racks
+            outline="#e07a1f" if shelf_selected else ("#065f69" if selected else ("#087f8c" if search_match else "white"))
             if handling_unit_type=="AMR shelf":
                 unit_id=str(rows[0].get("handling_unit_id","")) if rows else ""
                 movement=self.ops_movement_by_unit.get(unit_id,{})
                 fill=class_colours.get(movement.get("movement_class",""),"#7b8b92")
-                radius=11 if shelf_selected else (9 if selected else 4)
-                self.ops_canvas.create_oval(x-radius,y-radius,x+radius,y+radius,fill=fill,outline=outline,width=4 if shelf_selected else (3 if selected else 1),tags=("ops_rack",f"opsrack:{rack_id}",f"opsunit:{unit_id}"))
+                radius=11 if shelf_selected or selected else (9 if search_match else 4)
+                self.ops_canvas.create_oval(x-radius,y-radius,x+radius,y+radius,fill=fill,outline=outline,width=4 if shelf_selected else (4 if selected else (3 if search_match else 1)),tags=("ops_rack",f"opsrack:{rack_id}",f"opsunit:{unit_id}"))
             else:
-                outer_radius=11 if selected else 7
-                self.ops_canvas.create_oval(x-outer_radius,y-outer_radius,x+outer_radius,y+outer_radius,fill="",outline="#087f8c" if selected else "#aab4b8",width=3 if selected else 1,tags=("ops_rack",f"opsrack:{rack_id}"))
+                outer_radius=13 if selected else (11 if search_match else 7)
+                rack_outline="#065f69" if selected else ("#087f8c" if search_match else "#aab4b8")
+                self.ops_canvas.create_oval(x-outer_radius,y-outer_radius,x+outer_radius,y+outer_radius,fill="",outline=rack_outline,width=4 if selected else (3 if search_match else 1),tags=("ops_rack",f"opsrack:{rack_id}"))
                 locations={}
                 for row in rows:
                     occupied=row.get("occupied_handling_units") or [{"handling_unit_id":row.get("handling_unit_id",""),"storage_level":row.get("storage_level",1),"storage_slot":row.get("storage_slot",1)}]
@@ -3256,7 +3833,7 @@ class GridMapEditorApp:
                     movement=self.ops_movement_by_unit.get(unit_id,{})
                     fill=class_colours.get(movement.get("movement_class",""),"#7b8b92")
                     self.ops_canvas.create_oval(unit_x-3,unit_y-3,unit_x+3,unit_y+3,fill=fill,outline="white",width=1,tags=("ops_rack",f"opsrack:{rack_id}",f"opsunit:{unit_id}"))
-            if selected:
+            if selected or search_match:
                 self.ops_canvas.create_text(x,y-18,text=rack_id,fill="#065f69",font=("TkDefaultFont",9,"bold"))
         for vertex in vertices:
             params=vertex[4] if len(vertex)>4 and isinstance(vertex[4],dict) else {}
@@ -3274,8 +3851,9 @@ class GridMapEditorApp:
         if not rack_id:return
         rows=[row for row in self.ops_rows if row.get("assignment_status")=="ASSIGNED" and row.get("rack_id")==rack_id]
         rows.sort(key=lambda row:(int(row.get("storage_level") or 0),int(row.get("storage_slot") or 0),str(row.get("sku",""))))
+        rack_quantities=self.rack_sku_quantity_totals(rows)
         for row in rows:
-            item=self.ops_inventory_tree.insert("","end",values=(row.get("sku",""),row.get("velocity_class",""),self.sku_storage_flags(row),row.get("static_address",""),self.occupied_dynamic_address(row),row.get("handling_unit_id","")))
+            item=self.ops_inventory_tree.insert("","end",values=(row.get("sku",""),rack_quantities.get((str(rack_id),str(row.get("sku",""))),""),row.get("velocity_class",""),self.sku_storage_flags(row),row.get("static_address",""),self.occupied_dynamic_address(row),row.get("handling_unit_id","")))
             self.ops_inventory_rows[item]=row
 
     def ops_inventory_select(self,_event=None):
@@ -3296,6 +3874,7 @@ class GridMapEditorApp:
         else:self.ops_status.set(f"Selected SKU swap: {self.ops_sku_selection[0]} ↔ {self.ops_sku_selection[1]} · click Execute mock swap.")
 
     def show_ops_assignment(self,row):
+        self.ops_search_racks=set();self.ops_search_skus=set()
         self.ops_highlight_rack=row.get("rack_id","")
         self.show_ops_rack_inventory(self.ops_highlight_rack)
         local = self.ops_payload.get("location_attributes", {}) if self.ops_payload else {}
@@ -3320,11 +3899,24 @@ class GridMapEditorApp:
     def search_ops_sku(self):
         if not self.ops_rows:
             messagebox.showinfo("Load layout","Load a slotting layout first.");return
-        try:row=self.inventory.find_sku(self.ops_rows,self.ops_search.get())
+        try:matches=self.inventory.find_skus(self.ops_rows,self.ops_search.get())
         except ValueError as exc:messagebox.showerror("SKU search",str(exc));return
-        self.show_ops_assignment(row)
-        if self.ops_swap_mode.get()=="SKU slot":self.select_ops_sku_for_swap(row)
-        else:self.ops_status.set(f"Located SKU {row['sku']} at {row['static_address']}")
+        matches=[row for row in matches if row.get("assignment_status")=="ASSIGNED" and row.get("rack_id")]
+        if not matches:
+            messagebox.showerror("SKU search",f"SKU has no assigned rack: {self.ops_search.get().strip()}");return
+        self.ops_search_racks={str(row.get("rack_id")) for row in matches}
+        self.ops_search_skus={str(row.get("sku","")).strip().lower() for row in matches}
+        self.ops_highlight_rack=None
+        self.show_ops_rack_inventory(None)
+        sku_names=sorted({str(row.get("sku","")) for row in matches})
+        sku_label=", ".join(sku_names)
+        self.ops_details.set(
+            f"SKU: {sku_label}\n"
+            f"Found {len(matches):,} assigned load(s) across {len(self.ops_search_racks):,} rack(s).\n"
+            "All matching racks are highlighted. Click one to display its full rack inventory and matching SKU details."
+        )
+        self.ops_status.set(f"Located {sku_label} across {len(self.ops_search_racks):,} rack(s) · select a highlighted rack")
+        self.draw_ops_layout()
 
     def ops_rack_click(self,event):
         item=self.ops_canvas.find_withtag("current")
@@ -3333,7 +3925,28 @@ class GridMapEditorApp:
         if not found:return
         rack_id=found[0];rows=[row for row in self.ops_rows if row.get("assignment_status")=="ASSIGNED" and row.get("rack_id")==rack_id]
         self.ops_highlight_rack=rack_id
+        search_rows=[row for row in rows if str(row.get("sku","")).strip().lower() in self.ops_search_skus]
         self.show_ops_rack_inventory(rack_id)
+        if search_rows:
+            quantities=[]
+            for row in search_rows:
+                try:quantities.append(float(row.get("quantity_ea")))
+                except (TypeError,ValueError):pass
+            quantity_label=f"{sum(quantities):g} EA" if quantities else "not available"
+            sku_names=sorted({str(row.get("sku","")) for row in search_rows})
+            addresses=", ".join(str(row.get("static_address","")) for row in search_rows)
+            self.ops_details.set(
+                f"Selected rack: {rack_id}\n"
+                f"SKU: {', '.join(sku_names)} · {len(search_rows):,} load(s) · quantity on this rack {quantity_label}\n"
+                f"Addresses: {addresses}\n"
+                "Select a row in the rack inventory table for its swap operation."
+            )
+            self.ops_status.set(
+                f"Selected rack {rack_id} · showing all {len(rows):,} rack load(s) · "
+                f"{len(search_rows):,} match the searched SKU"
+            )
+        elif self.ops_search_racks:
+            self.ops_details.set(f"Selected rack: {rack_id}\nThis rack does not contain the searched SKU; showing all rack inventory.")
         if self.ops_swap_mode.get()=="Whole shelf":
             self.select_ops_shelf_for_swap(rack_id,rows)
         else:self.draw_ops_layout()
@@ -3449,6 +4062,13 @@ class GridMapEditorApp:
             stored_layout = (
                 StorageLayout.from_dict(payload["storage_layout"])
                 if payload.get("storage_layout") else None
+            )
+            self.attributes.set_machine_carrying_capacity(
+                (
+                    stored_layout.machine_carrying_capacity
+                    if stored_layout is not None else None
+                ),
+                payload.get("handling_unit_type", ""),
             )
             if stored_layout is not None:
                 roots = {
@@ -3788,7 +4408,7 @@ class GridMapEditorApp:
                 ),
             )
         self.slot_unassigned_summary.set(
-            f"{len(unassigned):,} SKU(s) could not be slotted."
+            f"{len(unassigned):,} inventory load(s) could not be slotted."
             if unassigned else "All SKUs were slotted successfully."
         )
 
@@ -3821,6 +4441,10 @@ class GridMapEditorApp:
                     else None
                 ),
             )
+            if self.stock_rows:
+                skus = self.slotting.apply_stock_requirements(
+                    skus, self.stock_rows
+                )
             self.update_slot_progress(25, f"Loaded {len(skus):,} SKUs")
             levels=int(self.slot_levels.get()); slots=int(self.slot_slots.get())
             source_affinity = ""
@@ -3970,14 +4594,25 @@ class GridMapEditorApp:
                     f"{rack_touches['total_rack_touches']:,} "
                     f"({comparison['total_rack_touch_change_fraction'] * 100:+.2f}%)"
                 )
-        self.slot_summary.set(
+        quantity_summary = (
+            f"Assigned {summary['assigned_load_count']:,}/"
+            f"{summary['inventory_load_count']:,} inventory loads from "
+            f"{summary['sku_count']:,} SKUs · fully assigned SKUs "
+            f"{summary['fully_assigned_sku_count']:,} · partially assigned "
+            f"{summary['partially_assigned_sku_count']:,} · unassigned loads "
+            f"{summary['unassigned_load_count']:,}"
+            if summary.get("quantity_enabled_sku_count") else
             f"Assigned {summary['assigned_count']:,}/{summary['sku_count']:,} SKUs · "
-            f"unassigned {summary['unassigned_count']:,} · "
+            f"unassigned {summary['unassigned_count']:,}"
+        )
+        self.slot_summary.set(
+            quantity_summary + " · "
             f"temperature-zone shortage "
             f"{summary['unassigned_status_counts'].get('UNASSIGNED_NO_CHILLED_LOCATION', 0) + summary['unassigned_status_counts'].get('UNASSIGNED_NO_AMBIENT_LOCATION', 0):,} · "
             f"all slots occupied {summary['unassigned_no_capacity_count']:,} · "
             f"map-defined oversize zones {summary['auto_planned_oversize_segment_count']:,} · "
-            f"{summary['rack_count']} racks ({summary['unreachable_rack_count']} unreachable) · "
+            f"occupied racks {summary.get('final_occupied_rack_count', 0):,}/"
+            f"{summary['rack_count']:,} ({summary['unreachable_rack_count']} unreachable) · "
             f"{summary['workstation_count']} workstations · {summary['zone_count']} zones · capacity {summary['capacity']:,} · "
             f"buffers occupied {summary['occupied_buffer_count']:,}/{summary['buffer_count']:,} "
             f"({summary['buffer_occupancy_rate'] * 100:.1f}%) · "
@@ -3996,13 +4631,39 @@ class GridMapEditorApp:
         self.slot_generate_button.configure(state="normal")
         self.update_slot_progress(100, "Complete")
 
+    @staticmethod
+    def rack_sku_quantity_totals(rows):
+        """Return stored EA per logical SKU and rack for quantity-aware views."""
+        totals = {}
+        for row in rows:
+            if row.get("assignment_status") != "ASSIGNED":
+                continue
+            raw = row.get("quantity_ea")
+            if raw in (None, ""):
+                continue
+            try:
+                quantity = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(quantity):
+                continue
+            key = (str(row.get("rack_id", "")), str(row.get("sku", "")))
+            totals[key] = totals.get(key, 0.0) + quantity
+        return {key: f"{value:g}" for key, value in totals.items()}
+
     def show_slotting_rows(self, rows):
         self.slot_tree.delete(*self.slot_tree.get_children())
+        rack_quantities = self.rack_sku_quantity_totals(rows)
         for row in rows[:1000]:
             self.slot_tree.insert("", "end", values=(
                 row.get("abc_frequency_rank", row.get("sku_rank", "")),
                 row.get("affinity_placement_rank", ""),
-                row["sku"], row["velocity_class"], self.sku_storage_flags(row),
+                row["sku"],
+                rack_quantities.get(
+                    (str(row.get("rack_id", "")), str(row.get("sku", ""))),
+                    "",
+                ),
+                row["velocity_class"], self.sku_storage_flags(row),
                 row["static_address"], self.occupied_dynamic_address(row),
                 row["handling_unit_type"], row["handling_unit_id"],
                 row["assignment_status"],
@@ -4385,6 +5046,9 @@ class GridMapEditorApp:
         self.show_slotting_rows(rows); self.draw_slotting_layout()
         if not rack: return
         classes={label:sum(row["velocity_class"]==label for row in rows) for label in ("A","B","C")}
+        distinct_skus={str(row.get("sku","")) for row in rows if str(row.get("sku","")).strip()}
+        rack_quantities=self.rack_sku_quantity_totals(rows)
+        rack_total_quantity=sum(float(value) for value in rack_quantities.values())
         unit_ids=sorted({row["handling_unit_id"] for row in rows})
         zone_path = rack.get("zone_id", "UNASSIGNED")
         self.slot_rack_zone_name.set(zone_path)
@@ -4448,7 +5112,7 @@ class GridMapEditorApp:
             f"Current static buffer address: {rows[0]['static_address'] if rows else rack.get('zone_id','UNASSIGNED')+'/'+rack['aisle_id']+'/'+rack['static_bay_id']}\n"
             f"{movement_detail}"
             f"Rack pick-frequency ABC: {rack_class or 'unassigned'} · frequency rank {rack_frequency_rank or 'n/a'} · picks {rack_pick_frequency or 0}\n"
-            f"Assigned SKUs: {len(rows)} · A {classes['A']} / B {classes['B']} / C {classes['C']}\n"
+            f"Assigned SKUs: {len(distinct_skus)} · inventory loads {len(rows)} · stored quantity {rack_total_quantity:g} EA · A {classes['A']} / B {classes['B']} / C {classes['C']}\n"
             f"Storage flags: CHILLED={chilled_count} · OVERSIZE / WEIGHT EXCEPTION={exception_count}\n"
             f"Physical classes: "
             + (", ".join(
@@ -4490,7 +5154,7 @@ class GridMapEditorApp:
         return (
             f"{int(summary.get('sku_count', 0)):,} SKUs loaded\n"
             f"Overlay grouping: {selected_text}\n"
-            "Configure these attributes by zone:\n" + " · ".join(details)
+            "Attributes discovered:\n" + " · ".join(details)
         )
 
     def load_grid_sku_attributes_dialog(self):
@@ -4548,6 +5212,11 @@ class GridMapEditorApp:
             f"Loaded attributes for {summary['sku_count']:,} SKUs. "
             "Configure the listed values in warehouse zone settings."
         )
+        if hasattr(self, "stock_status"):
+            self.stock_status.set(
+                f"Loaded attributes for {summary['sku_count']:,} SKUs. "
+                "Click Calculate to include rack requirements."
+            )
         self.redraw()
         return True
 
@@ -4586,6 +5255,64 @@ class GridMapEditorApp:
         self.status.set(
             f"Rack-demand overlay now groups SKUs by {selected_text}."
         )
+        if getattr(self, "stock_rows", None):
+            self.refresh_stock_rack_grouping()
+        return True
+
+    def refresh_stock_rack_grouping(self):
+        """Regroup existing stock results without rescanning order history."""
+        try:
+            source = Path(self.project.sku_attribute_source)
+            requirements = self.slotting.load_sku_attribute_requirements(
+                source,
+                {str(row["sku"]) for row in self.stock_rows},
+                self.project.attribute_catalog,
+                include_derived_grouping=True,
+            )
+            rows, combinations = calculate_rack_requirements(
+                self.stock_rows,
+                requirements,
+                (
+                    float(self.stock_slot_length.get()),
+                    float(self.stock_slot_width.get()),
+                    float(self.stock_slot_height.get()),
+                ),
+                int(self.stock_rack_levels.get()),
+                int(self.stock_slots_per_level.get()),
+                self.project.sku_overlay_attributes,
+                slot_max_weight=float(self.stock_slot_weight.get()),
+                rack_max_weight=(
+                    float(self.stock_machine_capacity_values[
+                        "max_item_weight"
+                    ].get())
+                    if self.stock_storage_system.get() == "AMR" else None
+                ),
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            messagebox.showerror("Stock rack grouping", str(exc))
+            return False
+        self.stock_rows = rows
+        self.stock_combination_rows = combinations
+        self.stock_combination_tree.delete(
+            *self.stock_combination_tree.get_children()
+        )
+        for row in combinations:
+            self.stock_combination_tree.insert("", "end", values=(
+                row["attribute_combination"],
+                row["sku_count"],
+                row["total_required_ea"],
+                row["required_slots"],
+                f'{row["required_racks"]}{"+" if row["unresolved_skus"] else ""}',
+                row["unresolved_skus"],
+            ))
+        summary = copy.deepcopy(self.project.sku_attribute_summary)
+        summary["attribute_combinations"] = copy.deepcopy(combinations)
+        self.project.sku_attribute_summary = summary
+        self.grid_sku_attribute_summary.set(
+            self.format_sku_attribute_summary(summary)
+        )
+        self.redraw()
+        self.stock_status.set("Rack results regrouped without rescanning order history.")
         return True
 
     def generate_grid(self):
@@ -4597,10 +5324,20 @@ class GridMapEditorApp:
             return
         self.push_undo()
         warehouse_defaults = dict(self.project.warehouse_storage_defaults)
+        machine_capacity = dict(self.project.machine_carrying_capacity)
+        attribute_catalog = copy.deepcopy(self.project.attribute_catalog)
+        sku_attribute_source = self.project.sku_attribute_source
+        sku_attribute_summary = copy.deepcopy(self.project.sku_attribute_summary)
+        sku_overlay_attributes = list(self.project.sku_overlay_attributes)
         self.project = GridProject(
-            spec, warehouse_storage_defaults=warehouse_defaults
+            spec,
+            warehouse_storage_defaults=warehouse_defaults,
+            machine_carrying_capacity=machine_capacity,
         )
-        self.project.attribute_catalog = []
+        self.project.attribute_catalog = attribute_catalog
+        self.project.sku_attribute_source = sku_attribute_source
+        self.project.sku_attribute_summary = sku_attribute_summary
+        self.project.sku_overlay_attributes = sku_overlay_attributes
         self.attributes.set_standard_storage_defaults(warehouse_defaults)
         self.sync_grid_storage_controls()
         self.sync_grid_sku_attribute_controls()
@@ -4619,10 +5356,56 @@ class GridMapEditorApp:
         self.grid_storage_system.set(layout.system_type)
         self.grid_storage_levels.set(str(layout.levels_per_rack))
         self.grid_storage_slots.set(str(layout.slots_per_level))
+        if hasattr(self, "stock_rack_levels"):
+            self.stock_rack_levels.set(str(layout.levels_per_rack))
+            self.stock_slots_per_level.set(str(layout.slots_per_level))
+            self.stock_storage_system.set(layout.system_type)
+            self.update_stock_machine_capacity_ui()
         self.grid_buffer_summary.set(
             f"{len(layout.buffers)} empty {layout.buffer_level} buffer(s) · "
             f"dynamic unit {layout.handling_unit_type}"
         )
+        self.update_machine_capacity_ui()
+
+    def update_machine_capacity_ui(self):
+        """Show the carrying dimensions used by the selected machine type."""
+        if not hasattr(self, "grid_machine_capacity_entries"):
+            return
+        is_amr = self.grid_storage_system.get() == "AMR"
+        self.grid_machine_capacity_label.set(
+            "AMR whole-rack max weight (kg)"
+            if is_amr else "ASRS max L/W/H (m) / kg"
+        )
+        for key in PHYSICAL_ATTRIBUTE_KEYS:
+            state = "disabled" if is_amr and key != "max_item_weight" else "normal"
+            self.grid_machine_capacity_entries[key].configure(state=state)
+
+    def grid_storage_system_changed(self, _event=None):
+        defaults = DEFAULT_MACHINE_CAPACITY_BY_SYSTEM[
+            self.grid_storage_system.get()
+        ]
+        for key, variable in self.grid_machine_capacity_values.items():
+            value = defaults[key]
+            variable.set("" if value is None else str(value))
+        self.update_machine_capacity_ui()
+
+    @staticmethod
+    def parse_machine_capacity(values, system_type):
+        """Parse optional carrying limits; AMR ignores volumetric limits."""
+        result = {}
+        for key in PHYSICAL_ATTRIBUTE_KEYS:
+            text = values[key].get().strip()
+            if system_type == "AMR" and key != "max_item_weight":
+                result[key] = None
+                continue
+            if not text:
+                result[key] = None
+                continue
+            value = float(text)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("Machine carrying limits must be greater than zero.")
+            result[key] = value
+        return result
 
     def sync_grid_warehouse_storage_controls(self):
         self.attributes.set_standard_storage_defaults(
@@ -4630,6 +5413,34 @@ class GridMapEditorApp:
         )
         for key, variable in self.grid_warehouse_capacity_values.items():
             variable.set(str(self.project.warehouse_storage_defaults[key]))
+        if hasattr(self, "stock_slot_weight"):
+            slot_weight = self.project.warehouse_storage_defaults[
+                "max_item_weight"
+            ]
+            layout = self.project.storage_layout
+            if (
+                layout is not None
+                and layout.system_type == "AMR"
+                and self.project.machine_carrying_capacity["max_item_weight"]
+            ):
+                slot_weight = (
+                    self.project.machine_carrying_capacity["max_item_weight"]
+                    / (layout.levels_per_rack * layout.slots_per_level)
+                )
+            self.stock_slot_weight.set(f"{slot_weight:g}")
+        for key, variable in self.grid_machine_capacity_values.items():
+            value = self.project.machine_carrying_capacity[key]
+            variable.set("" if value is None else str(value))
+        if hasattr(self, "stock_machine_capacity_values"):
+            for key, variable in self.stock_machine_capacity_values.items():
+                value = self.project.machine_carrying_capacity[key]
+                variable.set("" if value is None else str(value))
+            if self.project.storage_layout is not None:
+                self.stock_storage_system.set(
+                    self.project.storage_layout.system_type
+                )
+            self.update_stock_machine_capacity_ui()
+        self.update_machine_capacity_ui()
 
     def sync_grid_sku_attribute_controls(self):
         self.grid_sku_attributes_path.set(self.project.sku_attribute_source)
@@ -4649,6 +5460,14 @@ class GridMapEditorApp:
         available = list(
             summary.get("available_combination_attributes") or []
         )
+        summary_attributes = summary.get("attributes") or {}
+        if (
+            all(key in summary_attributes for key in PHYSICAL_ATTRIBUTE_KEYS)
+            and DERIVED_OVERSIZE_KEY not in available
+        ):
+            # Older saved projects predate the derived selector. Expose it
+            # immediately; applying the selection refreshes the full summary.
+            available.append(DERIVED_OVERSIZE_KEY)
         selected = set(self.project.sku_overlay_attributes)
         for index, key in enumerate(available):
             widget.insert("end", key)
@@ -4668,7 +5487,12 @@ class GridMapEditorApp:
             slots = int(self.grid_storage_slots.get())
             if not any(marker.role == "rack" for marker in self.project.markers.values()):
                 raise ValueError("place at least one rack pickup before assigning buffers")
+            machine_capacity = self.parse_machine_capacity(
+                self.grid_machine_capacity_values,
+                self.grid_storage_system.get(),
+            )
             self.push_undo()
+            self.project.machine_carrying_capacity = machine_capacity
             self.project.assign_storage_buffers(
                 self.grid_storage_system.get(), levels, slots
             )
@@ -4885,10 +5709,16 @@ class GridMapEditorApp:
         layout = self.project.storage_layout
         try:
             levels = int(
-                layout.levels_per_rack if layout else self.grid_storage_levels.get()
+                self.stock_rack_levels.get()
+                if hasattr(self, "stock_rack_levels")
+                else layout.levels_per_rack
+                if layout else self.grid_storage_levels.get()
             )
             slots = int(
-                layout.slots_per_level if layout else self.grid_storage_slots.get()
+                self.stock_slots_per_level.get()
+                if hasattr(self, "stock_slots_per_level")
+                else layout.slots_per_level
+                if layout else self.grid_storage_slots.get()
             )
         except (TypeError, ValueError):
             levels, slots = 1, 1
@@ -4897,17 +5727,34 @@ class GridMapEditorApp:
         total_racks = 0
         for combination in combinations:
             sku_count = int(combination.get("sku_count", 0))
-            racks = math.ceil(sku_count / rack_capacity)
-            total_racks += racks
+            if "required_racks" in combination:
+                racks = combination.get("required_racks")
+            else:
+                racks = math.ceil(sku_count / rack_capacity)
+            if racks is not None:
+                total_racks += int(racks)
             attributes = combination.get("attributes") or {}
             profile = " · ".join(
                 f"{key}={'T' if value is True else 'F' if value is False else '?'}"
                 for key, value in attributes.items()
             ) or "no Boolean flags"
+            total_ea = combination.get("total_required_ea")
+            demand_text = (
+                f" · {int(total_ea):,} EA"
+                if total_ea is not None else ""
+            )
+            unresolved = int(combination.get("unresolved_skus", 0))
+            rack_text = (
+                f"{int(racks):,}{'+' if unresolved else ''} racks"
+                if racks is not None else "unresolved"
+            )
             display_rows.append((
                 f"{combination.get('storage_type', 'STANDARD')} · {profile} · "
-                f"{sku_count:,} SKUs → {racks:,} racks",
-                self.grid_demand_combination_is_covered(combination, racks),
+                f"{sku_count:,} SKUs{demand_text} → {rack_text}",
+                (
+                    self.grid_demand_combination_is_covered(combination, int(racks))
+                    if racks is not None and not unresolved else False
+                ),
             ))
         x = float(self.canvas.canvasx(max(12, self.canvas.winfo_width() - 12)))
         y = float(self.canvas.canvasy(12))
@@ -4931,7 +5778,7 @@ class GridMapEditorApp:
             cursor_y = (bounds[3] + 2) if bounds else cursor_y + 18
 
         add_line(
-            f"Estimated rack demand · {rack_capacity} SKU slots/rack",
+            f"Calculated rack demand · {rack_capacity} storage slots/rack",
             bold=True,
         )
         for text, covered in display_rows:
@@ -4940,12 +5787,12 @@ class GridMapEditorApp:
                 fill="#173f73" if covered else "#243238",
                 tags=("grid_demand_covered",) if covered else (),
             )
-        add_line(f"Total estimated: {total_racks:,} racks", bold=True)
+        add_line(f"Total calculated: {total_racks:,} racks", bold=True)
         bounds = self.canvas.bbox("grid_demand_overlay")
         if bounds:
             rectangle_id = self.canvas.create_rectangle(
                 bounds[0] - 9, bounds[1] - 7,
-                bounds[2] + 9, bounds[3] + 7,
+                x, bounds[3] + 7,
                 fill="#f8fbfc",
                 outline="#50656e",
                 width=1,

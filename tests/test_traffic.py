@@ -12,6 +12,7 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from warehouse_layout import (
+    AttributeDefinition,
     GridProject,
     GridSpec,
     Marker,
@@ -19,29 +20,37 @@ from warehouse_layout import (
     TrafficAwareSlottingService,
 )
 from warehouse_layout.affinity import AffinityService
+from warehouse_layout.ctbsa import CtbsaParameters, CtbsaPlacementPlanner
 from warehouse_layout.traffic import NETWORK_SCHEMA, TRAFFIC_EXPORT_SCHEMA
 
 
 class TrafficAwareSlottingTests(unittest.TestCase):
     def setUp(self):
         self.attributes = StorageAttributeService()
-        self.service = TrafficAwareSlottingService(self.attributes)
+        self.service = TrafficAwareSlottingService(
+            self.attributes,
+            ctbsa_parameters=CtbsaParameters(
+                population_size=10,
+                generations=5,
+                random_seed=1,
+            ),
+        )
         self.catalog = self.attributes.serialize_catalog(
             self.attributes.starter_catalog()
         )
         self.requirements = {
             "chilled": False,
+            "max_item_length": 0.1,
+            "max_item_width": 0.1,
+            "max_item_height": 0.1,
+            "max_item_weight": 0.1,
+        }
+        self.capacity = {
+            "chilled": False,
             "max_item_length": 1,
             "max_item_width": 1,
             "max_item_height": 1,
             "max_item_weight": 1,
-        }
-        self.capacity = {
-            "chilled": False,
-            "max_item_length": 10,
-            "max_item_width": 10,
-            "max_item_height": 10,
-            "max_item_weight": 10,
         }
 
     def row(self, sku, unit, bay, vertex):
@@ -129,6 +138,258 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         }
         path.write_text(json.dumps(payload), encoding="utf-8")
 
+    def run_small_ctbsa(
+        self, directory: Path, *, cancelled=None, slots_per_level=2,
+        initial_strategy="basic", workflow_mode="full_pipeline",
+    ):
+        project = GridProject(
+            GridSpec(3, 1, 1, "ctbsa", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (1, 0): Marker("rack", "RACK_02"),
+                (3, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        building = project.to_building_dict()
+        order_path = directory / "orders.xlsx"
+        self.write_orders(order_path)
+        affinity_service = AffinityService(directory / "cache")
+        analysis = affinity_service.analyze(
+            affinity_service.load_orders(order_path)
+        )
+        skus = [
+            {
+                "sku": "SKU_H", "pick_frequency": 10,
+                "velocity_class": "A",
+                "sku_requirements": dict(self.requirements),
+            },
+            {
+                "sku": "SKU_L", "pick_frequency": 1,
+                "velocity_class": "C",
+                "sku_requirements": dict(self.requirements),
+            },
+        ]
+        network = self.service.network_from_rmf(building)
+        pipeline = self.service.run_full_pipeline(
+            building,
+            skus,
+            analysis,
+            network,
+            initial_strategy=initial_strategy,
+            levels_per_rack=1,
+            slots_per_level=slots_per_level,
+            handling_unit_type="AMR shelf",
+            attribute_catalog=self.catalog,
+            location_attributes={"Z01": dict(self.capacity)},
+            workflow_mode=workflow_mode,
+            cancelled=cancelled,
+        )
+        return pipeline, network, order_path
+
+    def test_direct_pipeline_uses_physical_feasibility_not_abc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline, _network, _orders = self.run_small_ctbsa(
+                Path(directory),
+                initial_strategy="physical_feasibility",
+                workflow_mode="direct_ctbsa",
+            )
+        self.assertEqual(pipeline.workflow_mode, "direct_ctbsa")
+        self.assertEqual(pipeline.initial_strategy, "physical_feasibility")
+        self.assertTrue(
+            pipeline.pretraffic_payload["feasibility_seed_only"]
+        )
+        self.assertEqual(
+            pipeline.output_payload["pipeline"]["stages"][0],
+            "physical_feasibility_seed",
+        )
+        self.assertEqual(
+            pipeline.optimization.parameters["rack_budget_policy"],
+            "paper_ctbsa_selected_solution",
+        )
+        self.assertEqual(
+            pipeline.optimization.parameters["route_metrics_role"],
+            "post_assignment_evaluation_only",
+        )
+        self.assertTrue(
+            pipeline.optimization.parameters["rack_budget_trials"][-1]["selected"]
+        )
+
+    def test_ctbsa_uses_all_map_active_csv_attribute_profiles(self):
+        project = GridProject(
+            GridSpec(2, 1, 1, "ctbsa-attributes", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_FISH"),
+                (1, 0): Marker("rack", "RACK_MEAT"),
+                (2, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        catalog = self.attributes.normalize_catalog(self.catalog)
+        catalog["fish_area"] = AttributeDefinition(
+            "fish_area", "Fish area", "boolean", "exact",
+            hierarchy_level=1,
+        )
+        catalog["tablet"] = AttributeDefinition(
+            "tablet", "Tablet", "boolean", "exact",
+            hierarchy_level=2,
+        )
+        locations = {
+            "Z_FISH": {**self.capacity, "fish_area": True},
+            "Z_MEAT": dict(self.capacity),
+        }
+        skus = [
+            {
+                "sku": "SKU_H", "pick_frequency": 10,
+                "velocity_class": "A",
+                "sku_requirements": {
+                    **self.requirements, "fish_area": True, "tablet": True,
+                },
+            },
+            {
+                "sku": "SKU_L", "pick_frequency": 1,
+                "velocity_class": "C",
+                "sku_requirements": {
+                    **self.requirements, "fish_area": False, "tablet": False,
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            order_path = directory / "orders.xlsx"
+            self.write_orders(order_path)
+            affinity_service = AffinityService(directory / "cache")
+            analysis = affinity_service.analyze(
+                affinity_service.load_orders(order_path)
+            )
+            building = project.to_building_dict()
+            pipeline = self.service.run_full_pipeline(
+                building,
+                skus,
+                analysis,
+                self.service.network_from_rmf(building),
+                initial_strategy="physical_feasibility",
+                levels_per_rack=1,
+                slots_per_level=1,
+                handling_unit_type="AMR shelf",
+                zone_assignments={"G0_0": "Z_FISH", "G1_0": "Z_MEAT"},
+                attribute_catalog=self.attributes.serialize_catalog(catalog),
+                location_attributes=locations,
+                workflow_mode="direct_ctbsa",
+            )
+
+        parameters = pipeline.optimization.parameters
+        self.assertIn("fish_area", parameters["active_zone_attribute_keys"])
+        self.assertNotIn("tablet", parameters["active_zone_attribute_keys"])
+        self.assertEqual(parameters["attribute_profile_count"], 2)
+        profiles = {
+            row["attribute_profile"]["fish_area"]
+            for row in parameters["clusters"]
+        }
+        self.assertEqual(profiles, {False, True})
+        for row in pipeline.optimization.assignments:
+            if row.get("assignment_status") != "ASSIGNED":
+                continue
+            expected = locations[row["zone_id"]].get("fish_area", False)
+            self.assertIs(row["sku_requirements"]["fish_area"], expected)
+
+    def test_ctbsa_targets_quantity_inventory_loads_independently(self):
+        project = GridProject(
+            GridSpec(3, 1, 1, "ctbsa-quantity", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (1, 0): Marker("rack", "RACK_02"),
+                (2, 0): Marker("rack", "RACK_03"),
+                (3, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        building = project.to_building_dict()
+        rows, compact_summary = self.service.slotting.generate_basic(
+            copy.deepcopy(building),
+            [
+                {
+                    "sku": "SKU_H", "pick_frequency": 10,
+                    "velocity_class": "A", "total_required_ea": 5,
+                    "required_slots": 5, "slots_per_unit": 1,
+                    "sku_requirements": dict(self.requirements),
+                },
+                {
+                    "sku": "SKU_L", "pick_frequency": 1,
+                    "velocity_class": "C", "total_required_ea": 1,
+                    "required_slots": 1, "slots_per_unit": 1,
+                    "sku_requirements": dict(self.requirements),
+                },
+            ],
+            1, 3, "AMR shelf",
+            attribute_catalog=self.catalog,
+            location_attributes={"Z01": dict(self.capacity)},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            order_path = directory / "orders.xlsx"
+            self.write_orders(order_path)
+            affinity = AffinityService(directory / "cache")
+            analysis = affinity.analyze(affinity.load_orders(order_path))
+            plan = CtbsaPlacementPlanner(self.service.slotting).build(
+                rows, copy.deepcopy(building), analysis,
+                levels_per_rack=1, slots_per_level=3,
+                attribute_catalog=self.catalog,
+                location_attributes={"Z01": dict(self.capacity)},
+                parameters=CtbsaParameters(
+                    population_size=10, generations=5, random_seed=1,
+                ),
+            )
+
+        hot_loads = {
+            row["inventory_load_id"] for row in rows if row["sku"] == "SKU_H"
+        }
+        self.assertEqual(len(hot_loads), 5)
+        self.assertTrue(hot_loads.issubset(plan.target_racks))
+        self.assertGreater(
+            len({plan.target_racks[load_id] for load_id in hot_loads}), 1
+        )
+        self.assertGreater(
+            len(set(plan.target_racks.values())),
+            compact_summary["final_occupied_rack_count"],
+        )
+
+    def test_unverified_oversize_one_slot_baseline_passes_validation(self):
+        project = GridProject(
+            GridSpec(2, 1, 1, "unverified-traffic", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (2, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        locations = {
+            "Z01": {
+                **self.capacity,
+                "oversize_capable": True,
+            }
+        }
+        rows, _summary = self.service.slotting.generate_basic(
+            project.to_building_dict(),
+            [{
+                "sku": "NO_VOLUME",
+                "pick_frequency": 1,
+                "velocity_class": "A",
+                "sku_requirements": {"chilled": False},
+            }],
+            1,
+            1,
+            "AMR shelf",
+            attribute_catalog=self.catalog,
+            location_attributes=locations,
+        )
+        validation = self.service.validate_traffic_baseline({
+            "assignments": rows,
+            "rack_capacity": {"levels": 1, "slots_per_level": 1},
+            "attribute_catalog": self.catalog,
+            "location_attributes": locations,
+        })
+
+        self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
+        self.assertEqual(rows[0]["compatibility_status"], "UNVERIFIED")
+        self.assertEqual(validation["unverified_physical_sku_count"], 1)
+
     def test_store_day_demand_counts_each_unit_once(self):
         with tempfile.TemporaryDirectory() as directory:
             order_path = Path(directory) / "orders.xlsx"
@@ -138,6 +399,33 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertEqual(demand.fulfillment_groups, 10)
         self.assertEqual(demand.unit_visits, {"UNIT_H": 10, "UNIT_L": 1})
         self.assertEqual(demand.handling_unit_visits, 11)
+
+    def test_replicated_sku_event_uses_one_quantity_balanced_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            order_path = directory / "one-order.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Date", "Store ID", "Item or SKU", "Quantity (in EA)"])
+            sheet.append([date(2026, 1, 1), "STORE_1", "SKU_H", 1])
+            workbook.save(order_path)
+            dataset = AffinityService(directory / "cache").load_orders(order_path)
+            first = self.row("SKU_H", "UNIT_H_1", "BAY_HOT", 0)
+            second = self.row("SKU_H", "UNIT_H_2", "BAY_COOL", 1)
+            first.update({"inventory_load_id": "SKU_H#Q001", "quantity_ea": 3})
+            second.update({"inventory_load_id": "SKU_H#Q002", "quantity_ea": 2})
+
+            demand = self.service.build_demand(dataset, [first, second])
+
+        self.assertEqual(demand.handling_unit_visits, 1)
+        self.assertEqual(sum(demand.unit_visits.values()), 1)
+        self.assertEqual(
+            sum(demand.replica_visits["SKU_H"].values()), 1
+        )
+        self.assertEqual(
+            demand.replica_assignment_policy,
+            "traffic_balanced_alternative_source",
+        )
 
     def test_asrs_demand_counts_each_occupied_slot_retrieval(self):
         payload = self.payload()
@@ -177,7 +465,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             [["UNIT_H"], ["UNIT_H_2"]],
         )
 
-    def test_generic_routes_capacities_and_deterministic_optimization(self):
+    def test_generic_routes_and_capacities_are_analyzed(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             order_path, network_path = directory / "orders.xlsx", directory / "network.json"
@@ -188,17 +476,9 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             demand = self.service.build_demand(dataset, payload["assignments"])
             network = self.service.load_network(network_path)
             before = self.service.analyze(payload["assignments"], network, demand)
-            result = self.service.optimize(payload, network, demand)
         self.assertEqual(before.metrics["peak_load"], 10)
-        self.assertLess(result.after.metrics["peak_load"], before.metrics["peak_load"])
-        self.assertEqual(
-            result.before.metrics["relative_reference"],
-            result.after.metrics["relative_reference"],
-        )
-        self.assertEqual({row["sku"] for row in result.assignments}, {"SKU_H", "SKU_L"})
-        high = next(row for row in result.assignments if row["sku"] == "SKU_H")
-        self.assertEqual(high["static_bay_id"], "BAY_COOL")
-        self.assertTrue(result.relocations)
+        self.assertTrue(before.metrics["capacity_mode"])
+        self.assertEqual(before.metrics["expected_travel"], 11)
 
     def test_rmf_adapter_builds_generic_directed_resources(self):
         project = GridProject(
@@ -236,13 +516,6 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertEqual(network.endpoints[0].endpoint_id, "PACK_01")
         self.assertTrue(network.links)
 
-    def test_hotspot_suggestion_changes_with_resource_distribution(self):
-        first = self.service._suggest_hotspot_percentile([1, 1, 1, 10])
-        second = self.service._suggest_hotspot_percentile([1, 1, 5, 5, 5])
-        self.assertNotEqual(first, second)
-        self.assertEqual(first, 75)
-        self.assertEqual(second, 40)
-
     def test_full_pipeline_starts_from_raw_skus_and_building(self):
         project = GridProject(
             GridSpec(3, 1, 1, "pipeline", "L1"),
@@ -275,6 +548,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 building, skus, affinity, self.service.network_from_rmf(building),
                 affinity_weight=1.0, levels_per_rack=1, slots_per_level=2,
                 attribute_catalog=self.catalog,
+                location_attributes={"Z01": dict(self.capacity)},
                 optimize_traffic=True, source_orders=str(order_path),
                 source_grid_project="/input/warehouse.grid.json",
             )
@@ -284,7 +558,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertEqual(result.initial_strategy, "abc_affinity")
         self.assertEqual(result.grouping_metrics["hard_validation_status"], "PASSED")
         self.assertIsNotNone(result.optimization)
-        self.assertEqual(result.output_payload["strategy"], "abc_affinity")
+        self.assertEqual(result.output_payload["strategy"], "ctbsa")
         self.assertEqual(
             result.output_payload["traffic_analysis"]["unit_visits"],
             result.baseline_demand.unit_visits,
@@ -338,52 +612,39 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 levels_per_rack=1,
                 slots_per_level=2,
                 attribute_catalog=self.catalog,
+                location_attributes={"Z01": dict(self.capacity)},
                 source_orders=str(order_path),
             )
         self.assertEqual(result.initial_strategy, "basic")
         self.assertEqual(result.basic_summary["assigned_count"], 2)
         self.assertEqual(result.affinity_summary, {})
-        self.assertEqual(result.output_payload["strategy"], "basic")
+        self.assertEqual(result.output_payload["strategy"], "ctbsa")
         self.assertEqual(
             result.output_payload["traffic_configuration"]["initial_strategy"],
             "basic",
         )
 
-    def test_existing_layout_is_optimized_without_regeneration(self):
-        payload = self.payload()
-        payload.update({
-            "strategy": "basic",
-            "handling_unit_type": "Tote",
-            "rack_capacity": {"levels": 1, "slots_per_level": 1},
-        })
-        baseline_membership = [
-            (row["sku"], row["handling_unit_id"])
-            for row in payload["assignments"]
-        ]
+    def test_existing_layout_is_reclustered_with_ctbsa(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            order_path = directory / "orders.xlsx"
-            network_path = directory / "network.json"
-            self.write_orders(order_path)
-            self.write_network(network_path)
+            initial, network, order_path = self.run_small_ctbsa(directory)
+            payload = initial.pretraffic_payload
             dataset = AffinityService(directory / "cache").load_orders(
                 order_path
             )
             result = self.service.run_existing_layout(
                 payload,
                 dataset,
-                self.service.load_network(network_path),
+                network,
                 baseline_path="/input/baseline.slotting.json",
                 source_orders=str(order_path),
             )
         self.assertEqual(result.workflow_mode, "existing_layout")
         self.assertEqual(result.initial_strategy, "basic")
+        self.assertEqual(result.output_payload["strategy"], "ctbsa")
         self.assertEqual(
-            [
-                (row["sku"], row["handling_unit_id"])
-                for row in result.pretraffic_payload["assignments"]
-            ],
-            baseline_membership,
+            result.optimization.parameters["method"],
+            "Lee_Chung_Yoon_2020_CTBSA",
         )
         self.assertEqual(
             result.output_payload["sources"]["traffic_baseline_layout"],
@@ -395,23 +656,19 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         )
 
     def test_existing_layout_excludes_and_retains_unassigned_skus(self):
-        payload = self.payload()
-        payload["assignments"][1]["assignment_status"] = (
-            "UNASSIGNED_NO_COMPATIBLE_LOCATION"
-        )
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            order_path = directory / "orders.xlsx"
-            network_path = directory / "network.json"
-            self.write_orders(order_path)
-            self.write_network(network_path)
+            initial, network, order_path = self.run_small_ctbsa(directory)
+            payload = copy.deepcopy(initial.pretraffic_payload)
+            target = next(row for row in payload["assignments"] if row["sku"] == "SKU_L")
+            target["assignment_status"] = "UNASSIGNED_NO_COMPATIBLE_LOCATION"
             dataset = AffinityService(directory / "cache").load_orders(
                 order_path
             )
             result = self.service.run_existing_layout(
                 payload,
                 dataset,
-                self.service.load_network(network_path),
+                network,
             )
         retained = next(
             row for row in result.optimization.assignments
@@ -425,6 +682,51 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             result.grouping_metrics["excluded_unassigned_sku_count"], 1
         )
 
+    def test_existing_layout_retains_multislot_physical_exception_rack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            initial, network, order_path = self.run_small_ctbsa(
+                directory, slots_per_level=1
+            )
+            payload = copy.deepcopy(initial.pretraffic_payload)
+            fixed = next(
+                row for row in payload["assignments"] if row["sku"] == "SKU_L"
+            )
+            original_address = fixed["storage_location_address"]
+            fixed["occupied_slot_count"] = 2
+            dataset = AffinityService(directory / "cache").load_orders(
+                order_path
+            )
+            result = self.service.run_existing_layout(payload, dataset, network)
+        retained = next(
+            row for row in result.optimization.assignments
+            if row["sku"] == "SKU_L"
+        )
+        self.assertEqual(retained["storage_location_address"], original_address)
+        self.assertIn(
+            "SKU_L",
+            {row["handling_unit_id"] for row in result.optimization.rejected_units},
+        )
+        rejected = next(
+            row for row in result.optimization.rejected_units
+            if row["handling_unit_id"] == "SKU_L"
+        )
+        self.assertEqual(rejected["sku"], "SKU_L")
+        self.assertIn("physical_storage_class", rejected)
+        self.assertIn("fixed", rejected["reason"])
+        self.assertEqual(
+            result.optimization.parameters["hard_rule_profile"],
+            "map_authoritative_warehouse_feasibility/v4",
+        )
+        self.assertEqual(
+            result.optimization.parameters["hard_rule_validation"][
+                "hard_validation_status"
+            ],
+            "PASSED",
+        )
+        self.assertEqual(retained["hard_rule_status"], "PASSED")
+        self.assertIn("CONTIGUOUS_FOOTPRINT", retained["hard_rule_labels"])
+
     def test_strict_oversize_uses_contiguous_slots_and_overweight_uses_level_two(self):
         project = GridProject(
             GridSpec(2, 1, 1, "physical", "L1"),
@@ -436,11 +738,12 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         location_capacity = {
             "Z01": {
                 "chilled": False,
-                "max_item_length": 10,
-                # The 20-wide SKU is automatically spread across two slots.
-                "max_item_width": 16,
-                "max_item_height": 10,
-                "max_item_weight": 400,
+                "oversize_capable": True,
+                "max_item_length": 0.10,
+                # The 3.2 m-wide SKU is automatically spread across two slots.
+                "max_item_width": 1.6,
+                "max_item_height": 0.10,
+                "max_item_weight": 0.600,
             }
         }
         skus = [
@@ -448,18 +751,18 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 "sku": "SKU_OVERSIZE", "pick_frequency": 100,
                 "velocity_class": "A",
                 "sku_requirements": {
-                    "chilled": False, "max_item_length": 10,
-                    "max_item_width": 26, "max_item_height": 10,
-                    "max_item_weight": 20,
+                    "chilled": False, "max_item_length": 0.10,
+                    "max_item_width": 3.2, "max_item_height": 0.10,
+                    "max_item_weight": 0.020,
                 },
             },
             {
                 "sku": "SKU_HEAVY", "pick_frequency": 90,
                 "velocity_class": "A",
                 "sku_requirements": {
-                    "chilled": False, "max_item_length": 5,
-                    "max_item_width": 5, "max_item_height": 5,
-                    "max_item_weight": 500,
+                    "chilled": False, "max_item_length": 0.05,
+                    "max_item_width": 0.05, "max_item_height": 0.05,
+                    "max_item_weight": 13.0,
                 },
             },
         ]
@@ -478,10 +781,11 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             for address in oversize["occupied_static_addresses"]
         ]
         self.assertEqual(occupied_slots[1] - occupied_slots[0], 1)
+        self.assertEqual(heavy["assignment_status"], "ASSIGNED")
         self.assertEqual(heavy["storage_level"], 2)
         self.assertEqual(summary["occupied_slot_count"], 3)
 
-    def test_strict_oversize_is_automatically_slotted_in_standard_rack(self):
+    def test_strict_oversize_is_rejected_from_standard_rack(self):
         project = GridProject(
             GridSpec(2, 1, 1, "physical", "L1"),
             {
@@ -493,25 +797,85 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             "sku": "SKU_OVERSIZE", "pick_frequency": 100,
             "velocity_class": "A",
             "sku_requirements": {
-                "chilled": False, "max_item_length": 10,
-                "max_item_width": 26, "max_item_height": 10,
-                "max_item_weight": 20,
+                "chilled": False, "max_item_length": 0.10,
+                "max_item_width": 3.2, "max_item_height": 0.10,
+                "max_item_weight": 0.020,
             },
         }
         rows, summary = self.service.slotting.generate_basic(
             project.to_building_dict(), [oversize], 1, 4, "AMR shelf",
             attribute_catalog=self.catalog,
             location_attributes={"Z01": {
-                "chilled": False, "max_item_length": 10,
-                "max_item_width": 16, "max_item_height": 10,
-                "max_item_weight": 100,
+                "chilled": False, "max_item_length": 0.10,
+                "max_item_width": 1.6, "max_item_height": 0.10,
+                "max_item_weight": 0.100,
             }},
             strict_compatibility=True,
             auto_plan_oversize=False,
         )
-        self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
-        self.assertEqual(rows[0]["occupied_slot_count"], 2)
-        self.assertEqual(summary["unassigned_count"], 0)
+        self.assertEqual(
+            rows[0]["assignment_status"],
+            "UNASSIGNED_NO_COMPATIBLE_LOCATION",
+        )
+        self.assertEqual(rows[0]["occupied_slot_count"], 0)
+        self.assertEqual(summary["unassigned_count"], 1)
+
+    def test_quantity_copies_of_oversize_sku_use_separate_contiguous_racks(self):
+        project = GridProject(
+            GridSpec(3, 1, 1, "quantity-oversize", "L1"),
+            {
+                (0, 0): Marker("rack", "RACK_01"),
+                (1, 0): Marker("rack", "RACK_02"),
+                (2, 0): Marker("rack", "RACK_03"),
+                (3, 1): Marker("workstation", "PACK_01"),
+            },
+        )
+        sku = {
+            "sku": "SKU_OVERSIZE",
+            "pick_frequency": 100,
+            "velocity_class": "A",
+            "total_required_ea": 2,
+            "units_per_slot": "",
+            "slots_per_unit": 2,
+            "required_slots": 4,
+            "required_racks": 2,
+            "sku_requirements": {
+                "chilled": False,
+                "max_item_length": 0.10,
+                "max_item_width": 3.2,
+                "max_item_height": 0.10,
+                "max_item_weight": 0.020,
+            },
+        }
+        rows, summary = self.service.slotting.generate_basic(
+            project.to_building_dict(),
+            [sku],
+            1,
+            3,
+            "AMR shelf",
+            attribute_catalog=self.catalog,
+            location_attributes={
+                "Z01": {
+                    "chilled": False,
+                    "oversize_capable": True,
+                    "max_item_length": 0.10,
+                    "max_item_width": 1.6,
+                    "max_item_height": 0.10,
+                    "max_item_weight": 0.100,
+                }
+            },
+        )
+
+        self.assertEqual(summary["inventory_load_count"], 2)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row["rack_id"] for row in rows}), 2)
+        self.assertTrue(all(row["occupied_slot_count"] == 2 for row in rows))
+        for row in rows:
+            slots = sorted(
+                int(address.rsplit("S", 1)[-1])
+                for address in row["occupied_static_addresses"]
+            )
+            self.assertEqual(slots[1] - slots[0], 1)
 
     def test_oversize_can_span_levels_and_overweight_starts_at_level_two(self):
         project = GridProject(
@@ -525,28 +889,27 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             "sku": "SKU_TALL_HEAVY", "pick_frequency": 100,
             "velocity_class": "A",
             "sku_requirements": {
-                "chilled": False, "max_item_length": 14,
-                "max_item_width": 14, "max_item_height": 20,
-                "max_item_weight": 500,
+                "chilled": False, "max_item_length": 0.14,
+                "max_item_width": 0.14, "max_item_height": 0.20,
+                "max_item_weight": 0.500,
             },
         }
         rows, summary = self.service.slotting.generate_basic(
             project.to_building_dict(), [sku], 3, 4, "AMR shelf",
             attribute_catalog=self.catalog,
             location_attributes={"Z01": {
-                "chilled": False, "max_item_length": 15,
-                "max_item_width": 16, "max_item_height": 13,
-                "max_item_weight": 250,
+                "chilled": False, "max_item_length": 0.15,
+                "max_item_width": 0.16, "max_item_height": 0.13,
+                "max_item_weight": 0.250,
             }},
             strict_compatibility=True,
             auto_plan_oversize=False,
         )
-        self.assertEqual(rows[0]["assignment_status"], "ASSIGNED")
-        self.assertEqual(rows[0]["storage_level"], 2)
-        self.assertEqual(rows[0]["occupied_level_span"], 2)
-        self.assertEqual(rows[0]["occupied_horizontal_slot_span"], 1)
-        self.assertEqual(rows[0]["occupied_slot_count"], 2)
-        self.assertEqual(summary["occupied_slot_count"], 2)
+        self.assertEqual(
+            rows[0]["assignment_status"], "UNASSIGNED_NO_COMPATIBLE_LOCATION"
+        )
+        self.assertEqual(rows[0]["occupied_slot_count"], 0)
+        self.assertEqual(summary["occupied_slot_count"], 0)
 
     def test_full_pipeline_proceeds_with_partial_layout(self):
         project = GridProject(
@@ -574,6 +937,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 self.service.network_from_rmf(building),
                 levels_per_rack=1, slots_per_level=1,
                 attribute_catalog=self.catalog,
+                location_attributes={"Z01": dict(self.capacity)},
                 optimize_traffic=False,
             )
         self.assertEqual(result.baseline_summary["assigned_count"], 1)
@@ -589,7 +953,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             1,
         )
 
-    def test_full_pipeline_uses_dedicated_ambient_oversize_zone(self):
+    def test_full_pipeline_preserves_ambient_map_zones(self):
         project = GridProject(
             GridSpec(2, 1, 1, "oversize-pipeline", "L1"),
             {
@@ -600,9 +964,9 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         )
         building = project.to_building_dict()
         oversize_requirements = {
-            "chilled": False, "max_item_length": 10,
-            "max_item_width": 26, "max_item_height": 10,
-            "max_item_weight": 20,
+            "chilled": False, "max_item_length": 0.10,
+            "max_item_width": 3.2, "max_item_height": 0.10,
+            "max_item_weight": 0.020,
         }
         skus = [
             {"sku": "SKU_H", "pick_frequency": 10, "velocity_class": "A",
@@ -623,12 +987,16 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 attribute_catalog=self.catalog,
                 zone_assignments={"G0_0": "Z01", "G1_0": "Z02"},
                 location_attributes={
-                    zone: {
-                        "chilled": False, "max_item_length": 10,
-                        "max_item_width": 16, "max_item_height": 13,
-                        "max_item_weight": 100,
-                    }
-                    for zone in ("Z01", "Z02")
+                    "Z01": {
+                        "chilled": False, "max_item_length": 0.10,
+                        "max_item_width": 1.6, "max_item_height": 0.13,
+                        "max_item_weight": 0.100,
+                    },
+                    "Z02": {
+                        "chilled": False, "oversize_capable": True,
+                        "max_item_length": 0.10, "max_item_width": 1.6,
+                        "max_item_height": 0.13, "max_item_weight": 0.100,
+                    },
                 },
                 optimize_traffic=False,
             )
@@ -643,7 +1011,11 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertEqual(oversize["occupied_horizontal_slot_span"], 2)
         self.assertEqual(oversize["planned_storage_type"], "OVERSIZE")
         self.assertEqual(standard["planned_storage_type"], "STANDARD")
-        self.assertNotEqual(oversize["rack_id"], standard["rack_id"])
+        self.assertEqual(result.affinity_summary["generated_attribute_zones"], {})
+        self.assertEqual(
+            set(result.affinity_summary["zone_assignments"].values()),
+            {"Z01", "Z02"},
+        )
 
     def test_full_pipeline_places_known_overweight_inventory_on_level_two(self):
         project = GridProject(
@@ -660,7 +1032,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 "sku": "SKU_H", "pick_frequency": 10, "velocity_class": "A",
                 "sku_requirements": {
                     **self.requirements,
-                    "max_item_weight": 500,
+                    "max_item_weight": 13.0,
                 },
             },
             {
@@ -699,17 +1071,20 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             row for row in result.affinity_assignments if row["sku"] == "SKU_H"
         )
         self.assertEqual(heavy["physical_storage_class"], "OVERWEIGHT")
-        self.assertEqual(heavy["planned_storage_type"], "OVERSIZE")
-        self.assertEqual(heavy["storage_level"], 2)
+        self.assertEqual(
+            heavy["assignment_status"], "UNASSIGNED_NO_COMPATIBLE_LOCATION"
+        )
+        self.assertEqual(heavy["planned_storage_type"], "")
         unknown = next(
             row for row in result.affinity_assignments
             if row["sku"] == "SKU_UNKNOWN"
         )
         self.assertEqual(unknown["physical_missing_data_type"], "UNKNOWN_WEIGHT")
         self.assertEqual(unknown["physical_storage_class"], "UNKNOWN_WEIGHT")
-        self.assertEqual(unknown["planned_storage_type"], "OVERSIZE")
+        self.assertEqual(unknown["planned_storage_type"], "STANDARD")
+        self.assertEqual(unknown["assignment_status"], "ASSIGNED")
 
-    def test_full_pipeline_splits_chilled_standard_and_oversize_racks(self):
+    def test_full_pipeline_preserves_chilled_zone_without_splitting(self):
         project = GridProject(
             GridSpec(2, 1, 1, "chilled-pipeline", "L1"),
             {
@@ -725,7 +1100,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 "sku_requirements": {
                     **self.requirements,
                     "chilled": True,
-                    "max_item_length": 26,
+                    "max_item_length": 3.2,
                 },
             },
             {
@@ -750,18 +1125,23 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 levels_per_rack=1, slots_per_level=4,
                 attribute_catalog=self.catalog,
                 location_attributes={
-                    "Z01": {**self.capacity, "chilled": True},
+                    "Z01": {
+                        **self.capacity,
+                        "chilled": True,
+                        "oversize_capable": True,
+                    },
                 },
                 optimize_traffic=False,
             )
         by_sku = {row["sku"]: row for row in result.affinity_assignments}
         standard = by_sku["SKU_L"]
         oversize = by_sku["SKU_H"]
-        self.assertEqual(standard["planned_zone_id"], "Z01_chill_normal")
-        self.assertEqual(oversize["planned_zone_id"], "Z01_chill_oversize")
-        self.assertNotEqual(standard["rack_id"], oversize["rack_id"])
-        self.assertTrue(standard["static_address"].startswith("Z01_chill_normal/"))
-        self.assertTrue(oversize["static_address"].startswith("Z01_chill_oversize/"))
+        self.assertEqual(standard["planned_storage_type"], "OVERSIZE")
+        self.assertEqual(oversize["planned_storage_type"], "OVERSIZE")
+        self.assertEqual(standard["zone_id"], oversize["zone_id"])
+        self.assertEqual(result.affinity_summary["generated_attribute_zones"], {})
+        self.assertTrue(standard["static_address"].startswith(standard["zone_id"] + "/"))
+        self.assertTrue(oversize["static_address"].startswith(oversize["zone_id"] + "/"))
 
     def test_full_pipeline_uses_generated_buffers_and_reports_occupancy(self):
         project = GridProject(
@@ -798,6 +1178,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
                 levels_per_rack=1, slots_per_level=2,
                 handling_unit_type="AMR shelf",
                 attribute_catalog=self.catalog,
+                location_attributes={"Z01": dict(self.capacity)},
                 storage_layout=storage_layout,
                 optimize_traffic=False,
             )
@@ -814,6 +1195,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
 
     def test_strict_chilled_physical_and_missing_data_rules(self):
         payload = self.payload()
+        payload["location_attributes"]["Z01"] = dict(self.capacity)
         first, second = payload["assignments"]
         second_capacity = payload["location_attributes"][second["static_address"]]
         second_capacity["chilled"] = True
@@ -821,7 +1203,7 @@ class TrafficAwareSlottingTests(unittest.TestCase):
         self.assertFalse(compatible)
         self.assertIn("Chilled", reason)
         second_capacity["chilled"] = False
-        second_capacity["max_item_weight"] = 0.5
+        second_capacity["max_item_weight"] = 0.05
         compatible, reason = self.service._strict_unit_compatibility([first], [second], payload)
         self.assertFalse(compatible)
         self.assertIn("weight", reason.lower())
@@ -851,14 +1233,9 @@ class TrafficAwareSlottingTests(unittest.TestCase):
     def test_exports_and_layout_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            order_path, network_path = directory / "orders.xlsx", directory / "network.json"
-            self.write_orders(order_path)
-            self.write_network(network_path)
-            payload = self.payload()
-            dataset = AffinityService(directory / "cache").load_orders(order_path)
-            demand = self.service.build_demand(dataset, payload["assignments"])
-            network = self.service.load_network(network_path)
-            result = self.service.optimize(payload, network, demand)
+            pipeline, network, order_path = self.run_small_ctbsa(directory)
+            payload = pipeline.pretraffic_payload
+            result = pipeline.optimization
             paths = self.service.export(result, directory / "review.traffic.json", network)
             saved = self.service.result_payload(
                 payload, result, baseline_path="baseline.slotting.json",
@@ -867,21 +1244,13 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             self.assertTrue(all(path.exists() for path in paths))
             self.assertEqual(json.loads(paths[0].read_text())["schema"], TRAFFIC_EXPORT_SCHEMA)
             self.assertEqual(saved["schema"], "inventory_slotting_layout/v2")
-            self.assertEqual(saved["traffic_configuration"]["network_type"], "generic_json")
-            self.assertEqual(saved["operation_log"][-1]["operation"], "traffic_aware_slotting")
+            self.assertEqual(saved["traffic_configuration"]["network_type"], "embedded_rmf")
+            self.assertEqual(saved["operation_log"][-1]["operation"], "ctbsa_slotting")
 
     def test_cancellation_stops_optimization(self):
         with tempfile.TemporaryDirectory() as directory:
-            directory = Path(directory)
-            order_path, network_path = directory / "orders.xlsx", directory / "network.json"
-            self.write_orders(order_path)
-            self.write_network(network_path)
-            dataset = AffinityService(directory / "cache").load_orders(order_path)
-            payload = self.payload()
-            demand = self.service.build_demand(dataset, payload["assignments"])
-            network = self.service.load_network(network_path)
             with self.assertRaisesRegex(RuntimeError, "cancelled"):
-                self.service.optimize(payload, network, demand, cancelled=lambda: True)
+                self.run_small_ctbsa(Path(directory), cancelled=lambda: True)
 
 
 if __name__ == "__main__":

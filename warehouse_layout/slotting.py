@@ -13,10 +13,12 @@ from pathlib import Path
 from .affinity import AffinityAnalysis
 from .attributes import (
     AttributeDefinition,
+    DERIVED_OVERSIZE_KEY,
     OVERSIZE_CAPABLE_KEY,
     PHYSICAL_ATTRIBUTE_KEYS,
     PHYSICAL_WEIGHT_KEY,
     StorageAttributeService,
+    requires_oversize_capable,
 )
 from .rmf import RmfMapService
 from .slotting_strategies import create_strategy
@@ -123,8 +125,7 @@ class SlottingService:
             definition = AttributeDefinition(
                 key, label, "number", "capacity",
                 (
-                    "source weight unit"
-                    if key == PHYSICAL_WEIGHT_KEY else "source length unit"
+                    "kg" if key == PHYSICAL_WEIGHT_KEY else "m"
                 ),
             )
         elif raw_values and lowered.issubset(boolean_tokens):
@@ -227,10 +228,11 @@ class SlottingService:
                 summary_attributes[key]["minimum"] = min(numeric)
                 summary_attributes[key]["maximum"] = max(numeric)
 
+        physical_enabled = self.attributes.has_physical_catalog(catalog)
         available_boolean_keys = sorted(
             (
                 key for key in columns.values()
-                if key != OVERSIZE_CAPABLE_KEY
+                if key not in {OVERSIZE_CAPABLE_KEY, DERIVED_OVERSIZE_KEY}
                 and catalog[key].value_type == "boolean"
             ),
             key=lambda key: (
@@ -239,6 +241,8 @@ class SlottingService:
                 list(columns.values()).index(key),
             ),
         )
+        if physical_enabled:
+            available_boolean_keys.append(DERIVED_OVERSIZE_KEY)
         if combination_attribute_keys is None:
             boolean_keys = available_boolean_keys
         else:
@@ -253,15 +257,34 @@ class SlottingService:
             boolean_keys = [
                 key for key in available_boolean_keys if key in requested_set
             ]
-        physical_enabled = self.attributes.has_physical_catalog(catalog)
         combinations = Counter()
         for requirements in parsed_rows:
-            storage_type = planned_storage_type(
-                self.attributes.physical_profile(requirements),
-                physical_enabled,
+            profile = self.attributes.physical_profile(requirements)
+            storage_type = planned_storage_type(profile, physical_enabled)
+            signature = tuple(
+                requires_oversize_capable(profile)
+                if key == DERIVED_OVERSIZE_KEY
+                else requirements.get(key)
+                for key in boolean_keys
             )
-            signature = tuple(requirements.get(key) for key in boolean_keys)
             combinations[(storage_type, signature)] += 1
+        if physical_enabled:
+            derived_values = [
+                requires_oversize_capable(
+                    self.attributes.physical_profile(requirements)
+                )
+                for requirements in parsed_rows
+            ]
+            summary_attributes[DERIVED_OVERSIZE_KEY] = {
+                "label": "Oversize",
+                "value_type": "boolean",
+                "match_rule": "exact",
+                "hierarchy_level": None,
+                "values": [str(value) for value in sorted(set(derived_values))],
+                "distinct_count": len(set(derived_values)),
+                "populated_count": len(derived_values),
+                "derived": True,
+            }
         combination_summary = []
         for (storage_type, signature), count in sorted(
             combinations.items(),
@@ -281,7 +304,12 @@ class SlottingService:
         }
 
     def load_sku_attribute_requirements(
-        self, path: Path, known_skus: set[str], attribute_catalog=None
+        self,
+        path: Path,
+        known_skus: set[str],
+        attribute_catalog=None,
+        *,
+        include_derived_grouping: bool = False,
     ) -> dict[str, dict]:
         catalog, _summary = self.inspect_sku_attribute_csv(
             path, attribute_catalog
@@ -311,6 +339,13 @@ class SlottingService:
                     raise ValueError(
                         f"SKU attributes CSV row {row_number}: {exc}"
                     ) from exc
+            if (
+                include_derived_grouping
+                and self.attributes.has_physical_catalog(catalog)
+            ):
+                requirements[DERIVED_OVERSIZE_KEY] = requires_oversize_capable(
+                    self.attributes.physical_profile(requirements)
+                )
             values[sku] = requirements
         return values
 
@@ -326,6 +361,37 @@ class SlottingService:
             for sku, requirements in values.items()
             if "chilled" in requirements
         }
+
+    @staticmethod
+    def apply_stock_requirements(
+        sku_rows: list[dict], stock_rows: list[dict]
+    ) -> list[dict]:
+        """Attach calculated stock targets to velocity rows by SKU."""
+        stock_by_sku: dict[str, dict] = {}
+        for row in stock_rows:
+            sku = str(row.get("sku", "")).strip()
+            if not sku:
+                raise ValueError("stock requirements contain a blank SKU")
+            if sku in stock_by_sku:
+                raise ValueError(f"stock requirements contain duplicate SKU: {sku}")
+            stock_by_sku[sku] = row
+        result = []
+        for source in sku_rows:
+            row = dict(source)
+            stock = stock_by_sku.get(str(row.get("sku", "")).strip())
+            if stock is not None:
+                for key in (
+                    "total_required_ea",
+                    "units_per_slot",
+                    "slots_per_unit",
+                    "required_slots",
+                    "required_racks",
+                    "rack_calculation_status",
+                ):
+                    if key in stock:
+                        row[key] = stock[key]
+            result.append(row)
+        return result
 
     def load_velocity(
         self,
@@ -408,7 +474,20 @@ class SlottingService:
                     if attribute_values is not None else {}
                 )
                 for key, file_value in external.items():
-                    if key in requirements and requirements[key] != file_value:
+                    conflicting = (
+                        key in requirements and requirements[key] != file_value
+                    )
+                    if conflicting and key in PHYSICAL_ATTRIBUTE_KEYS:
+                        try:
+                            conflicting = not math.isclose(
+                                float(requirements[key]),
+                                float(file_value),
+                                rel_tol=1e-9,
+                                abs_tol=1e-12,
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    if conflicting:
                         raise ValueError(
                             f"conflicting {key} requirement between velocity and "
                             "SKU attributes CSV"

@@ -1006,7 +1006,7 @@ class GlobalTrafficSlottingService:
         if progress:
             progress(1, 8, "Building Store ID + Date global demand")
         demand = self.traffic.build_demand(
-            dataset, rows, start_date, end_date
+            dataset, rows, start_date, end_date, network
         )
         route_cache = self._terminal_only_rack_routes(network)
         before = self.traffic.analyze(
@@ -1700,6 +1700,8 @@ class GlobalTrafficSlottingService:
             "fulfillment_groups": demand.fulfillment_groups,
             "handling_unit_visits": demand.handling_unit_visits,
             "unit_visits": dict(sorted(demand.unit_visits.items())),
+            "replica_assignment_policy": demand.replica_assignment_policy,
+            "replica_visits": demand.replica_visits,
             "balance": balance_metrics,
             "relocations": relocations,
         }

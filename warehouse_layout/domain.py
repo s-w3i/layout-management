@@ -6,7 +6,11 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, Tuple
 
-from .config import PROJECT_SCHEMA
+from .config import (
+    DEFAULT_MACHINE_CAPACITY_BY_SYSTEM,
+    DEFAULT_SLOT_CAPACITY,
+    PROJECT_SCHEMA,
+)
 
 
 GridPosition = Tuple[int, int]
@@ -91,9 +95,10 @@ class StorageLayout:
     """Empty static buffers generated from rack markers in an editable project."""
 
     system_type: str = "AMR"
-    levels_per_rack: int = 1
-    slots_per_level: int = 6
+    levels_per_rack: int = 3
+    slots_per_level: int = 4
     buffers: list[dict[str, Any]] = field(default_factory=list)
+    machine_carrying_capacity: dict[str, float | None] = field(default_factory=dict)
 
     @property
     def buffer_level(self) -> str:
@@ -134,6 +139,7 @@ class StorageLayout:
             "handling_unit_type": self.handling_unit_type,
             "levels_per_rack": self.levels_per_rack,
             "slots_per_level": self.slots_per_level,
+            "machine_carrying_capacity": dict(self.machine_carrying_capacity),
             "buffers": [dict(item) for item in self.buffers],
         }
 
@@ -141,9 +147,12 @@ class StorageLayout:
     def from_dict(cls, value: dict[str, Any]) -> "StorageLayout":
         layout = cls(
             system_type=str(value.get("system_type", "AMR")),
-            levels_per_rack=int(value.get("levels_per_rack", 1)),
-            slots_per_level=int(value.get("slots_per_level", 6)),
+            levels_per_rack=int(value.get("levels_per_rack", 3)),
+            slots_per_level=int(value.get("slots_per_level", 4)),
             buffers=[dict(item) for item in value.get("buffers", [])],
+            machine_carrying_capacity=dict(
+                value.get("machine_carrying_capacity") or {}
+            ),
         )
         layout.validate()
         return layout
@@ -158,12 +167,13 @@ class GridProject:
     attribute_catalog: list[dict[str, Any]] = field(default_factory=list)
     location_attributes: dict[str, dict[str, Any]] = field(default_factory=dict)
     warehouse_storage_defaults: dict[str, float] = field(
-        default_factory=lambda: {
-            "max_item_length": 25.0,
-            "max_item_width": 19.3,
-            "max_item_height": 19.2,
-            "max_item_weight": 465.0,
-        }
+        default_factory=lambda: dict(DEFAULT_SLOT_CAPACITY)
+    )
+    # Global carrying envelope of the selected material-handling machine.
+    # AMR layouts use only max_item_weight (the carried rack limit); ASRS
+    # layouts use the complete dimensional and weight envelope.
+    machine_carrying_capacity: dict[str, float | None] = field(
+        default_factory=lambda: dict(DEFAULT_MACHINE_CAPACITY_BY_SYSTEM["AMR"])
     )
     deleted_positions: set[GridPosition] = field(default_factory=set)
     coordinate_overrides: dict[GridPosition, tuple[float, float]] = field(
@@ -260,6 +270,18 @@ class GridProject:
         for key, value in self.warehouse_storage_defaults.items():
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"warehouse storage default {key} must be greater than zero")
+        if (
+            not isinstance(self.machine_carrying_capacity, dict)
+            or set(self.machine_carrying_capacity) != required_storage_defaults
+        ):
+            raise ValueError(
+                "machine carrying capacity must define length, width, height, and weight"
+            )
+        for key, value in self.machine_carrying_capacity.items():
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"machine carrying capacity {key} must be greater than zero")
         if self.storage_layout is not None:
             self.storage_layout.validate()
             rack_positions = {
@@ -369,6 +391,7 @@ class GridProject:
             "schema": PROJECT_SCHEMA,
             "grid": asdict(self.grid),
             "warehouse_storage_defaults": dict(self.warehouse_storage_defaults),
+            "machine_carrying_capacity": dict(self.machine_carrying_capacity),
             "markers": [
                 {"column": column, "row": row, **asdict(marker)}
                 for (column, row), marker in sorted(
@@ -450,6 +473,22 @@ class GridProject:
                 or project.warehouse_storage_defaults
             ).items()
         }
+        saved_machine_capacity = data.get("machine_carrying_capacity")
+        if saved_machine_capacity is None:
+            saved_machine_capacity = DEFAULT_MACHINE_CAPACITY_BY_SYSTEM[
+                (
+                    project.storage_layout.system_type
+                    if project.storage_layout is not None else "AMR"
+                )
+            ]
+        project.machine_carrying_capacity = {
+            key: (
+                None
+                if saved_machine_capacity.get(key) in (None, "")
+                else float(saved_machine_capacity[key])
+            )
+            for key in project.machine_carrying_capacity
+        }
         project.deleted_positions = {
             (int(item["column"]), int(item["row"]))
             for item in data.get("deleted_positions", [])
@@ -499,7 +538,12 @@ class GridProject:
         self, system_type: str, levels_per_rack: int, slots_per_level: int
     ) -> StorageLayout:
         """Replace the project buffer catalog using the current rack markers."""
-        layout = StorageLayout(system_type, levels_per_rack, slots_per_level)
+        layout = StorageLayout(
+            system_type,
+            levels_per_rack,
+            slots_per_level,
+            machine_carrying_capacity=dict(self.machine_carrying_capacity),
+        )
         for (column, row), marker in sorted(
             self.markers.items(), key=lambda item: (item[0][1], item[0][0])
         ):

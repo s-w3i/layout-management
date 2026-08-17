@@ -106,15 +106,17 @@ def read_transactions(input_path: Path):
         raise ValueError(f"Missing required column(s): {', '.join(sorted(missing))}")
 
     sku_index, date_index, qty_index = (positions[name] for name in ("Item or SKU", "Date", "Quantity (in EA)"))
-    physical_indexes = {
-        key: positions.get(header_name)
-        for key, header_name in (
-            ("max_item_length", "Length"),
-            ("max_item_width", "Width"),
-            ("max_item_height", "Height"),
-            ("max_item_weight", "Weight"),
+    physical_indexes = {}
+    for key, header_names in (
+        ("max_item_length", ("Length (m)", "Length")),
+        ("max_item_width", ("Width (m)", "Width")),
+        ("max_item_height", ("Height (m)", "Height")),
+        ("max_item_weight", ("Weight (kg)", "Weight")),
+    ):
+        physical_indexes[key] = next(
+            (positions[name] for name in header_names if name in positions),
+            None,
         )
-    }
     for values in rows:
         sku = values[sku_index] if sku_index < len(values) else None
         picked_date = excel_date(values[date_index] if date_index < len(values) else None)
@@ -232,7 +234,11 @@ def main() -> None:
     summary = []
     for sku in frequency:
         requirements = {
-            key: physical_maxima[sku].get(key) for key in PHYSICAL_ATTRIBUTE_KEYS
+            key: (
+                round(physical_maxima[sku][key], 6)
+                if key in physical_maxima[sku] else None
+            )
+            for key in PHYSICAL_ATTRIBUTE_KEYS
         }
         data_status, storage_class = classify_physical(requirements)
         summary.append({

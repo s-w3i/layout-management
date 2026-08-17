@@ -97,10 +97,10 @@ class ZoneStorageSettingsEditor(tk.Toplevel):
         if "oversize_capable" not in self.active_keys:
             oversize_check.configure(state="disabled")
         field_labels = {
-            "max_item_length": "Max length",
-            "max_item_width": "Max width",
-            "max_item_height": "Max height",
-            "max_item_weight": "Max weight",
+            "max_item_length": "Max length (m)",
+            "max_item_width": "Max width (m)",
+            "max_item_height": "Max height (m)",
+            "max_item_weight": "Max weight (kg)",
         }
         for index, key in enumerate(PHYSICAL_ATTRIBUTE_KEYS, start=3):
             ttk.Label(frame, text=field_labels[key]).grid(row=1, column=index, sticky="w", padx=4, pady=(12, 3))
@@ -127,8 +127,8 @@ class ZoneStorageSettingsEditor(tk.Toplevel):
                 "Only chilled storage is predefined by the user. Maximum fields "
                 "may remain empty (unbounded), or be entered as planning inputs. "
                 "Slotting does not generate oversize segments automatically. "
-                "Units are intentionally preserved as unconfirmed source length and "
-                "source weight units. Production limits must be checked against the racks."
+                "Dimensions use metres and weight uses kilograms. Production limits "
+                "must be checked against the racks."
             ),
             foreground="#8a4b08",
             wraplength=870,

@@ -44,21 +44,29 @@ class InventoryService:
         self.attributes = attributes or self.slotting.attributes
 
     @staticmethod
-    def find_sku(rows: list[dict], sku: str) -> dict:
+    def find_skus(rows: list[dict], sku: str) -> list[dict]:
+        """Return every assignment matching an exact SKU, or a partial SKU query."""
         wanted = sku.strip().lower()
-        exact = next(
-            (row for row in rows if str(row.get("sku", "")).lower() == wanted),
-            None,
-        )
+        if not wanted:
+            raise ValueError("enter a SKU to search")
+        exact = [
+            row for row in rows
+            if str(row.get("sku", "")).strip().lower() == wanted
+        ]
         if exact:
             return exact
         matches = [
             row for row in rows
-            if wanted and wanted in str(row.get("sku", "")).lower()
+            if wanted in str(row.get("sku", "")).lower()
         ]
         if not matches:
             raise ValueError(f"SKU not found: {sku}")
-        return matches[0]
+        return matches
+
+    @classmethod
+    def find_sku(cls, rows: list[dict], sku: str) -> dict:
+        """Return the first matching assignment for single-load operations."""
+        return cls.find_skus(rows, sku)[0]
 
     def swap_sku_slots(
         self,
