@@ -180,6 +180,13 @@ class GridProject:
         default_factory=dict
     )
     deleted_lanes: set[GridLane] = field(default_factory=set)
+    # Explicit lanes drawn by the user. They normally differ from generated
+    # row/column neighbours, but are retained if a topology edit temporarily
+    # makes the same connection generated.
+    added_lanes: set[GridLane] = field(default_factory=set)
+    # A lane absent from this set is bidirectional.  Tuple order is meaningful:
+    # (start, end) permits travel from start to end only.
+    one_way_lanes: set[GridLane] = field(default_factory=set)
     sku_attribute_source: str = ""
     sku_attribute_summary: dict[str, Any] = field(default_factory=dict)
     sku_overlay_attributes: list[str] = field(default_factory=list)
@@ -218,11 +225,43 @@ class GridProject:
             raise ValueError(
                 "SKU overlay attributes must be a unique list of attribute keys"
             )
-        available_lanes = set(self._iter_connected_lane_positions())
-        invalid_lanes = sorted(self.deleted_lanes - available_lanes)
+        generated_lanes = set(self._iter_connected_lane_positions())
+        invalid_lanes = sorted(self.deleted_lanes - generated_lanes)
         if invalid_lanes:
             raise ValueError(
                 f"deleted lane is not part of the current grid: {invalid_lanes[0]}"
+            )
+        active_positions = set(self.iter_positions())
+        invalid_added = sorted(
+            lane for lane in self.added_lanes
+            if lane != self.normalized_lane(*lane)
+            or lane[0] == lane[1]
+            or lane[0] not in active_positions
+            or lane[1] not in active_positions
+        )
+        if invalid_added:
+            raise ValueError(
+                "added lane must be a normalized connection "
+                f"between active grid points: {invalid_added[0]}"
+            )
+        active_lanes = (generated_lanes - self.deleted_lanes) | self.added_lanes
+        invalid_one_way = sorted(
+            lane for lane in self.one_way_lanes
+            if self.normalized_lane(*lane) not in active_lanes
+        )
+        if invalid_one_way:
+            raise ValueError(
+                "one-way lane is not an active lane in the current grid: "
+                f"{invalid_one_way[0]}"
+            )
+        opposing = sorted(
+            lane for lane in self.one_way_lanes
+            if (lane[1], lane[0]) in self.one_way_lanes
+        )
+        if opposing:
+            raise ValueError(
+                "one physical lane cannot contain opposing one-way overrides: "
+                f"{opposing[0]}"
             )
         endpoint_ids = []
         for (column, row), marker in self.markers.items():
@@ -373,10 +412,103 @@ class GridProject:
             for start, end in zip(positions, positions[1:]):
                 yield self.normalized_lane(start, end)
 
+    def generated_lane_positions(self) -> set[GridLane]:
+        """Return lanes derived from the currently active grid lattice."""
+        return set(self._iter_connected_lane_positions())
+
+    def reconcile_lane_state(self) -> None:
+        """Remove stale lane state after grid points are deleted or restored."""
+        generated = self.generated_lane_positions()
+        active_positions = set(self.iter_positions())
+        self.added_lanes = {
+            self.normalized_lane(*lane)
+            for lane in self.added_lanes
+            if lane[0] != lane[1]
+            and lane[0] in active_positions
+            and lane[1] in active_positions
+        }
+        self.deleted_lanes &= generated
+        active_lanes = (generated - self.deleted_lanes) | self.added_lanes
+        self.one_way_lanes = {
+            lane for lane in self.one_way_lanes
+            if self.normalized_lane(*lane) in active_lanes
+        }
+
+    def add_lane(self, start: GridPosition, end: GridPosition) -> str:
+        """Add or restore a lane and return ``added``, ``restored``, or ``existing``."""
+        lane = self.normalized_lane(start, end)
+        if start == end:
+            raise ValueError("a lane must connect two different grid points")
+        active_positions = set(self.iter_positions())
+        if start not in active_positions or end not in active_positions:
+            raise ValueError("a lane can connect only active grid points")
+        generated = self.generated_lane_positions()
+        if lane in generated:
+            if lane not in self.deleted_lanes:
+                return "existing"
+            self.deleted_lanes.remove(lane)
+            return "restored"
+        if lane in self.added_lanes:
+            return "existing"
+        self.added_lanes.add(lane)
+        return "added"
+
+    def remove_lane(self, start: GridPosition, end: GridPosition) -> bool:
+        """Remove an active generated or explicitly drawn lane."""
+        lane = self.normalized_lane(start, end)
+        if lane in self.added_lanes:
+            self.added_lanes.remove(lane)
+        elif lane in self.generated_lane_positions() and lane not in self.deleted_lanes:
+            self.deleted_lanes.add(lane)
+        else:
+            return False
+        self.one_way_lanes.discard(lane)
+        self.one_way_lanes.discard((lane[1], lane[0]))
+        return True
+
     def iter_lane_positions(self) -> Iterable[GridLane]:
         for lane in self._iter_connected_lane_positions():
             if lane not in self.deleted_lanes:
                 yield lane
+        generated = self.generated_lane_positions()
+        yield from sorted(lane for lane in self.added_lanes if lane not in generated)
+
+    def one_way_direction(self, lane: GridLane) -> GridLane | None:
+        """Return the allowed orientation, or None for a bidirectional lane."""
+        normalized = self.normalized_lane(*lane)
+        if normalized in self.one_way_lanes:
+            return normalized
+        reverse = (normalized[1], normalized[0])
+        return reverse if reverse in self.one_way_lanes else None
+
+    def set_lane_direction(
+        self,
+        lane: GridLane,
+        direction: GridLane | None,
+    ) -> None:
+        """Set a physical lane to bidirectional or to one allowed direction."""
+        normalized = self.normalized_lane(*lane)
+        if normalized not in set(self.iter_lane_positions()):
+            raise ValueError(f"lane is not active in the current grid: {normalized}")
+        reverse = (normalized[1], normalized[0])
+        self.one_way_lanes.discard(normalized)
+        self.one_way_lanes.discard(reverse)
+        if direction is None:
+            return
+        oriented = (tuple(direction[0]), tuple(direction[1]))
+        if self.normalized_lane(*oriented) != normalized:
+            raise ValueError("one-way direction must use the selected lane endpoints")
+        self.one_way_lanes.add(oriented)
+
+    def iter_traversable_lane_positions(self) -> Iterable[GridLane]:
+        """Yield every allowed directed traversal edge."""
+        for lane in self.iter_lane_positions():
+            direction = self.one_way_direction(lane)
+            if direction is not None:
+                yield direction
+            else:
+                yield lane
+                yield (lane[1], lane[0])
 
     @property
     def vertex_count(self) -> int:
@@ -385,6 +517,14 @@ class GridProject:
     @property
     def edge_count(self) -> int:
         return sum(1 for _lane in self.iter_lane_positions())
+
+    @property
+    def one_way_lane_count(self) -> int:
+        return len(self.one_way_lanes)
+
+    @property
+    def bidirectional_lane_count(self) -> int:
+        return self.edge_count - self.one_way_lane_count
 
     def to_project_dict(self) -> dict:
         result = {
@@ -432,6 +572,22 @@ class GridProject:
                     "end": {"column": end[0], "row": end[1]},
                 }
                 for start, end in sorted(self.deleted_lanes)
+            ]
+        if self.added_lanes:
+            result["added_lanes"] = [
+                {
+                    "start": {"column": start[0], "row": start[1]},
+                    "end": {"column": end[0], "row": end[1]},
+                }
+                for start, end in sorted(self.added_lanes)
+            ]
+        if self.one_way_lanes:
+            result["one_way_lanes"] = [
+                {
+                    "start": {"column": start[0], "row": start[1]},
+                    "end": {"column": end[0], "row": end[1]},
+                }
+                for start, end in sorted(self.one_way_lanes)
             ]
         if self.sku_attribute_source:
             result["sku_attribute_source"] = self.sku_attribute_source
@@ -505,6 +661,20 @@ class GridProject:
                 (int(item["end"]["column"]), int(item["end"]["row"])),
             )
             for item in data.get("deleted_lanes", [])
+        }
+        project.added_lanes = {
+            project.normalized_lane(
+                (int(item["start"]["column"]), int(item["start"]["row"])),
+                (int(item["end"]["column"]), int(item["end"]["row"])),
+            )
+            for item in data.get("added_lanes", [])
+        }
+        project.one_way_lanes = {
+            (
+                (int(item["start"]["column"]), int(item["start"]["row"])),
+                (int(item["end"]["column"]), int(item["end"]["row"])),
+            )
+            for item in data.get("one_way_lanes", [])
         }
         project.sku_attribute_source = str(
             data.get("sku_attribute_source", "")
@@ -589,7 +759,6 @@ class GridProject:
             vertices.append(vertex)
 
         lane_parameters = {
-            "bidirectional": [4, True],
             "demo_mock_floor_name": [1, ""],
             "demo_mock_lift_name": [1, ""],
             "graph_idx": [2, 0],
@@ -600,10 +769,15 @@ class GridProject:
         position_indexes = {
             position: index for index, position in enumerate(self.iter_positions())
         }
-        lanes = [
-            [position_indexes[start], position_indexes[end], dict(lane_parameters)]
-            for start, end in self.iter_lane_positions()
-        ]
+        lanes = []
+        for lane in self.iter_lane_positions():
+            direction = self.one_way_direction(lane)
+            start, end = direction or lane
+            parameters = dict(lane_parameters)
+            parameters["bidirectional"] = [4, direction is None]
+            lanes.append([
+                position_indexes[start], position_indexes[end], parameters,
+            ])
 
         corner_positions = [
             (0, 0),
