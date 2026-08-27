@@ -1,16 +1,19 @@
 # Warehouse Layout Management
 
-A Python desktop application for:
+A Python toolkit for designing an AMR warehouse, generating slotting layouts,
+and comparing their throughput.
 
-- creating grid-based Open-RMF warehouse maps;
-- generating ABC and affinity-based inventory layouts;
-- optimizing traffic and global congestion;
-- searching inventory and testing slot or shelf swaps.
+## Start here
 
-No warehouse drawing is required. Grid point `(0, 0)` is the bottom-left
-corner, and positive Y points upward.
+Pick one goal. You do not need to read the whole README first.
 
-## Quick start
+| I want to… | Go to |
+|---|---|
+| Open the warehouse editor | [Launch the desktop app](#launch-the-desktop-app) |
+| Compare four slotting layouts | [Run a headless throughput comparison](#run-a-headless-throughput-comparison) |
+| Watch AMRs move | [Run the live simulation](#run-the-live-simulation) |
+| Understand the full GUI workflow | [Main workflow](#main-workflow) |
+| Fix a problem | [Troubleshooting](#troubleshooting) |
 
 ### Requirements
 
@@ -18,20 +21,109 @@ corner, and positive Y points upward.
 - Tkinter
 - PyYAML, openpyxl, matplotlib and OR-Tools
 
-On Ubuntu or Debian:
+### Install once
+
+Estimated time: **5–10 minutes** on a typical Ubuntu workstation.
+
+1. Install the system and Python dependencies:
 
 ```bash
 sudo apt install python3 python3-tk python3-pip
 python3 -m pip install PyYAML openpyxl matplotlib ortools
 ```
 
-Clone and start:
+2. Clone the repository and enter it:
 
 ```bash
 git clone https://github.com/s-w3i/layout-management.git
 cd layout-management
+```
+
+Installation is complete when the dependency and clone commands exit without
+an error.
+
+## Launch the desktop app
+
+Estimated time: **under 10 seconds** after dependencies are installed.
+
+Run:
+
+```bash
 python3 rmf_grid_map_editor.py
 ```
+
+The **Warehouse Layout Management** window should open. Start with
+`resources/map/map1.grid.json` if you want an included demonstration map.
+
+## Run a headless throughput comparison
+
+Estimated time: **3–8 minutes** for the included 179 dates with four workers,
+depending on CPU speed.
+
+Run all four included layouts across every observed order date with four
+persistent workers:
+
+```bash
+python3 amr_simulation/run_simulation.py \
+  --mode batch \
+  --grid resources/map/map1_1.grid.json \
+  --orders "resources/data/Sample Data.xlsx" \
+  --config amr_simulation/config/default.json \
+  --layout resources/map/map1_basic.slotting.json \
+  --layout resources/map/map1_pure_affinity.slotting.json \
+  --layout resources/map/map1_traffic_zone_balance_off.slotting.json \
+  --layout resources/map/map1_traffic_zone_balance_on.slotting.json \
+  --workers 4 \
+  --output amr_simulation/results/all_layouts_40_amrs
+```
+
+You are done when all four progress bars reach 100%. Open:
+
+```text
+amr_simulation/results/all_layouts_40_amrs/layout_comparison.csv
+```
+
+Useful controls:
+
+- `--workers 4` runs one persistent process per layout.
+- `--start-date YYYY-MM-DD --end-date YYYY-MM-DD` limits the date range.
+- `--event-log` writes detailed events; omit it for faster batch runs.
+- A validation failure exits with status 2 and writes `validation_report.json`.
+
+## Run the live simulation
+
+Estimated time to open: **5–15 seconds** after preflight validation.
+
+Run one layout and one date:
+
+```bash
+python3 amr_simulation/run_simulation.py \
+  --mode debug \
+  --grid resources/map/map1_1.grid.json \
+  --orders "resources/data/Sample Data.xlsx" \
+  --config amr_simulation/config/default.json \
+  --layout resources/map/map1_basic.slotting.json \
+  --date 2023-01-03 \
+  --speed 120 \
+  --output amr_simulation/results/live_demo
+```
+
+The animation opens automatically. Use **Play/Pause**, **Next event**,
+**Restart**, and the **Speed** slider. Set `--speed 1` for wall-clock playback.
+
+## Simulator rules
+
+Travel timing uses stop-turn-go kinematics. Consecutive collinear A* edges are
+merged into straight runs; each run accelerates and brakes, and each direction
+change performs an in-place rotation. Defaults are 1.5 m/s, 0.75 m/s², 90°/s,
+and 90°/s². Motion, handling, workstation, and AMR start settings live in the
+JSON configuration. The simulator is separate from the Grid Map Editor; v1
+permits AMR overlap and does not reserve paths, detect collisions, or replan.
+Each workstation admits one robot at a time. Later robots wait loaded at their
+path's penultimate grid node in FIFO order until the current robot finishes
+workstation service, then traverse the final edge into the workstation.
+Historical `Time` values are ignored: all Store ID tasks for a selected date
+are available at simulation time zero, eliminating demand-release idle gaps.
 
 ## Main workflow
 
@@ -123,7 +215,13 @@ X=`0, 3, 6, 9, 12, 15, 18, 20`.
 
 Click **Generate / reset grid**. The editor creates horizontal and vertical
 edges between neighbouring points. All generated lanes are bidirectional by
-default.
+default. To restrict traffic flow, choose **Directions**, click a lane, select
+**Bidirectional** or either displayed one-way direction, and click **Apply**.
+One-way lanes are shown in blue with an arrow; plain lanes remain bidirectional.
+Use **Draw points** to restore deleted grid-lattice points. Use **Draw lanes**
+to drag a connection between two active points; this restores a deleted segment
+or creates a persistent custom lane. Custom lanes are included in RMF export and
+in the simulator's directed A* graph.
 
 > Generating a new grid removes the current rack and workstation markers after
 > confirmation.
@@ -193,6 +291,13 @@ warehouse project.
 - Click **Apply point edit**.
 
 For bulk removal, choose **Clear markers (drag)** and drag over the points.
+
+### Set lane directions
+
+- Choose **Directions** and click a lane segment.
+- Select **Bidirectional** or one of the two endpoint directions.
+- Click **Apply**. The saved grid project, RMF export, traffic analysis, and AMR
+  simulator all use the selected direction.
 
 ### Undo and redo
 
@@ -271,7 +376,7 @@ The default inputs are:
 | ABC SKU velocity CSV | `resources/data/sku_velocity_output/sku_velocity_summary.csv` |
 | SKU attributes CSV | `resources/data/medicine_sku_attributes.csv` |
 | Affinity order workbook | `resources/data/Sample Data.xlsx` |
-| Output layout | `resources/data/basic_slotting_layout.slotting.json` |
+| Output layout | `resources/map/basic_slotting_layout.slotting.json` |
 
 The grid JSON must contain generated empty buffers, at least one rack pickup,
 and at least one workstation. Inventory Slotting reconstructs the RMF graph in
@@ -677,6 +782,14 @@ split proportionally by stored quantity, allowing a logical SKU to span several
 shelves without changing the paper objectives. Physical-exception shelves remain
 fixed.
 
+The optional **Balance workload across zones** setting extends Stage 1 with a
+third Pareto objective: minimum peak quantity-weighted zone demand normalized by
+compatible usable slot capacity. Auto selects the equal-weight normalized knee;
+representatives 1–5 allow a manual override. Stage 2 then preserves every
+Pareto-selected zone while minimizing attributed traffic and travel between
+compatible racks inside that zone. Turning the setting off retains the original
+two-objective behavior.
+
 C&TBSA discovers attributes through the same map-authoritative rule as Basic
 and Affinity slotting. It uses the intersection of CSV SKU requirements and
 zone-root attributes, ignores requirements not configured in any zone, and
@@ -696,9 +809,14 @@ unchanged in the result, and reported in the status and saved metadata. The
 workflow stops only when no assigned inventory remains to optimize.
 
 The map contains two heat layers. Lane colour and width represent expected route
-load. Rack colour represents the handling-unit visits generated at that physical
-location. Purple outlines show reassigned locations; selecting a relocation
+load. Rack colour can represent handling-unit visits, normalized zone demand,
+or normalized zone traffic. Purple outlines show reassigned locations; selecting a relocation
 marks its source and destination separately.
+
+**Load saved run…** reopens a generated traffic-aware layout without rerunning
+slotting. It restores the saved final visit allocation, configuration, Pareto
+and zone details, then reroutes those visits through the embedded or recorded
+movement network to reconstruct the expected resource heatmap.
 
 When movement-resource capacities exist, the map reports utilization. Otherwise
 it reports relative expected load. Lane load is post-placement validation only;
@@ -781,9 +899,9 @@ The same independent pipeline is available without Tkinter:
 ```bash
 python3 global_traffic_slotting.py \
   --mode existing \
-  --layout resources/data/basic_slotting_layout.slotting.json \
+  --layout resources/map/basic_slotting_layout.slotting.json \
   --orders resources/data/Sample\ Data.xlsx \
-  --output resources/data/global_traffic_layout.slotting.json
+  --output resources/map/global_traffic_layout.slotting.json
 ```
 
 See [Global traffic optimizer](docs/global-traffic-optimizer.md) for the full
