@@ -17,6 +17,9 @@
   "service_seconds": 10.0,
   "reservation_wait_seconds": 5.0,
   "dram_conflict_wait_seconds": 15.0,
+  "loaded_priority_enabled": true,
+  "mutex_passage_enabled": true,
+  "corridor_coordination_enabled": true,
   "motion": {
     "max_linear_speed_mps": 1.5,
     "linear_acceleration_mps2": 0.75,

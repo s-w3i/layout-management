@@ -332,6 +332,71 @@ class WarehouseServiceTests(unittest.TestCase):
         self.assertEqual(loaded.deleted_lanes, {removed})
         self.assertEqual(loaded.to_building_dict(), building)
 
+    def test_drawn_custom_lane_round_trips_and_exports(self):
+        start, end = (0, 0), (2, 1)
+        self.assertEqual(self.project.add_lane(start, end), "added")
+        lane = self.project.normalized_lane(start, end)
+        self.project.set_lane_direction(lane, (end, start))
+        self.project.validate()
+
+        loaded = GridProject.from_project_dict(self.project.to_project_dict())
+        self.assertEqual(loaded.added_lanes, {lane})
+        self.assertEqual(loaded.one_way_direction(lane), (end, start))
+
+        level = loaded.to_building_dict()["levels"]["L1"]
+        names = [vertex[3] for vertex in level["vertices"]]
+        exported = next(
+            item for item in level["lanes"]
+            if {names[item[0]], names[item[1]]} == {"G0_0", "G2_1"}
+        )
+        self.assertEqual((names[exported[0]], names[exported[1]]), ("G2_1", "G0_0"))
+        self.assertEqual(exported[2]["bidirectional"], [4, False])
+
+    def test_custom_lane_survives_temporary_generated_topology(self):
+        custom = self.project.normalized_lane((0, 1), (2, 1))
+        self.assertEqual(self.project.add_lane(*custom), "added")
+        self.project.markers.pop((1, 1), None)
+        self.project.deleted_positions.add((1, 1))
+        self.project.reconcile_lane_state()
+        self.project.validate()
+        self.assertEqual(list(self.project.iter_lane_positions()).count(custom), 1)
+
+        self.project.deleted_positions.remove((1, 1))
+        self.project.reconcile_lane_state()
+        self.project.validate()
+        self.assertIn(custom, self.project.added_lanes)
+        self.assertIn(custom, set(self.project.iter_lane_positions()))
+
+    def test_one_way_lane_round_trips_and_exports_direction(self):
+        lane = self.project.normalized_lane((0, 0), (1, 0))
+        direction = ((1, 0), (0, 0))
+        self.project.set_lane_direction(lane, direction)
+        self.project.validate()
+
+        self.assertEqual(self.project.one_way_direction(lane), direction)
+        self.assertIn(direction, set(self.project.iter_traversable_lane_positions()))
+        self.assertNotIn(lane, set(self.project.iter_traversable_lane_positions()))
+        self.assertEqual(self.project.one_way_lane_count, 1)
+
+        payload = self.project.to_project_dict()
+        loaded = GridProject.from_project_dict(payload)
+        self.assertEqual(loaded.one_way_lanes, {direction})
+
+        level = loaded.to_building_dict()["levels"]["L1"]
+        names = [vertex[3] for vertex in level["vertices"]]
+        exported = next(
+            item for item in level["lanes"]
+            if {names[item[0]], names[item[1]]} == {"G0_0", "G1_0"}
+        )
+        self.assertEqual((names[exported[0]], names[exported[1]]), ("G1_0", "G0_0"))
+        self.assertEqual(exported[2]["bidirectional"], [4, False])
+
+    def test_opposing_one_way_overrides_are_rejected(self):
+        lane = self.project.normalized_lane((0, 0), (1, 0))
+        self.project.one_way_lanes = {lane, (lane[1], lane[0])}
+        with self.assertRaisesRegex(ValueError, "opposing one-way"):
+            self.project.validate()
+
     def test_project_round_trip_preserves_warehouse_configuration(self):
         self.project.assign_storage_buffers("AMR", 2, 4)
         self.project.zone_assignments = {

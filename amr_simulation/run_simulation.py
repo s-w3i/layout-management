@@ -10,9 +10,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
-from multiprocessing import Manager
 from pathlib import Path
-from queue import Empty
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -48,16 +46,18 @@ def _layout_name(path: Path) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "layout"
 
 
-def _simulate_layout(name, project, racks, dated_tasks, mapping, config, trace, progress_queue):
-    router = GridRouter(project)
-    results = []
-    for tasks in dated_tasks:
-        results.append(
-            simulate_day(project, router, racks, tasks, mapping, config, trace=trace)
-        )
-        if progress_queue is not None:
-            progress_queue.put(name)
-    return results
+def _duration(seconds: float) -> str:
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
+
+
+def _simulate_one(name, index, project, racks, tasks, mapping, config, trace):
+    started = time.monotonic()
+    result = simulate_day(
+        project, GridRouter(project), racks, tasks, mapping, config, trace=trace
+    )
+    return name, index, result, time.monotonic() - started
 
 
 def _show_progress(
@@ -112,6 +112,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    run_started = time.monotonic()
+    started_at = datetime.now(timezone.utc)
     args = parser().parse_args(argv)
     if args.amrs is not None and args.amrs < 1:
         parser().error("--amrs must be positive")
@@ -178,36 +180,49 @@ def main(argv: list[str] | None = None) -> int:
     retain_events = args.event_log or config.detailed_event_log or args.mode == "debug"
     dates = sorted(tasks_by_date)
     completed = {}
-    started = time.monotonic()
+    day_timings = []
+    simulation_started = time.monotonic()
     progress = dict.fromkeys(names, 0)
     if args.mode == "batch" and dates:
-        _show_progress(progress, len(dates), started, redraw=False)
+        _show_progress(progress, len(dates), simulation_started, redraw=False)
     dated_tasks = [tasks_by_date[task_date] for task_date in dates]
-    if args.mode == "batch" and args.workers > 1 and len(loaded_layouts) > 1:
-        with Manager() as manager, ProcessPoolExecutor(
-            max_workers=min(args.workers, len(loaded_layouts))
+    if args.mode == "batch" and dates:
+        completed = {name: [None] * len(dates) for name in names}
+        with ProcessPoolExecutor(
+            max_workers=min(args.workers, len(loaded_layouts) * len(dates))
         ) as pool:
-            progress_queue = manager.Queue()
             futures = {
                 pool.submit(
-                    _simulate_layout, name, project, racks, dated_tasks,
-                    mapping, config, retain_events, progress_queue,
+                    _simulate_one, name, index, project, racks, day_tasks,
+                    mapping, config, retain_events,
                 ): name
                 for name, racks, _report, _directory in loaded_layouts
+                for index, day_tasks in enumerate(dated_tasks)
             }
             pending = set(futures)
+            last_redraw = simulation_started
             while pending:
-                try:
-                    name = progress_queue.get(timeout=0.1)
-                    progress[name] += 1
+                time.sleep(0.1)
+                now = time.monotonic()
+                if now - last_redraw >= 1.0:
                     _show_progress(
-                        progress, len(dates), started, redraw=True, changed=name
+                        progress, len(dates), simulation_started, redraw=True
                     )
-                except Empty:
-                    pass
+                    last_redraw = now
                 finished = {future for future in pending if future.done()}
                 for future in finished:
-                    completed[futures[future]] = future.result()
+                    name, index, result, elapsed = future.result()
+                    completed[name][index] = result
+                    day_timings.append({
+                        "layout": name,
+                        "date": dates[index].isoformat(),
+                        "seconds": elapsed,
+                    })
+                    progress[name] += 1
+                    _show_progress(
+                        progress, len(dates), simulation_started,
+                        redraw=True, changed=name,
+                    )
                 pending -= finished
     else:
         for name, racks, _report, _directory in loaded_layouts:
@@ -223,17 +238,11 @@ def main(argv: list[str] | None = None) -> int:
                 if args.mode == "batch":
                     progress[name] += 1
                     _show_progress(
-                        progress, len(dates), started, redraw=True, changed=name
+                        progress, len(dates), simulation_started, redraw=True, changed=name
                     )
             completed[name] = results
 
-    if args.mode == "batch" and dates:
-        while sum(progress.values()) < len(names) * len(dates):
-            name = progress_queue.get()
-            progress[name] += 1
-            _show_progress(
-                progress, len(dates), started, redraw=True, changed=name
-            )
+    simulation_finished = time.monotonic()
 
     summaries = []
     debug_result = None
@@ -246,13 +255,41 @@ def main(argv: list[str] | None = None) -> int:
         debug_result = results[0] if args.mode == "debug" else None
     if len(summaries) > 1:
         write_csv(output / "layout_comparison.csv", summaries)
+    exported_at = time.monotonic()
+    timing = {
+        "started_at_utc": started_at.isoformat(),
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": args.mode,
+        "layout_count": len(loaded_layouts),
+        "date_count": len(dates),
+        "workers_requested": args.workers,
+        "workers_used": (
+            min(args.workers, len(loaded_layouts) * len(dates))
+            if args.mode == "batch" and dates else 1
+        ),
+        "day_runs": sorted(
+            day_timings, key=lambda item: (item["layout"], item["date"])
+        ),
+        "setup_seconds": simulation_started - run_started,
+        "simulation_seconds": simulation_finished - simulation_started,
+        "export_seconds": exported_at - simulation_finished,
+        "total_seconds": exported_at - run_started,
+    }
+    write_json(output / "run_timing.json", timing)
     if debug_result is not None:
         run_debugger(
             project, debug_result, config.spawn_nodes,
             speed=args.speed,
             initial_heading_degrees=config.initial_heading_degrees,
         )
-    print(f"results written to {output}")
+    print(
+        f"simulation completed in {_duration(timing['simulation_seconds'])} "
+        f"({timing['simulation_seconds']:.2f}s)"
+    )
+    print(
+        f"total runtime {_duration(timing['total_seconds'])} "
+        f"({timing['total_seconds']:.2f}s); results written to {output}"
+    )
     return 0
 
 

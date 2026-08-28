@@ -129,6 +129,8 @@ def run_debugger(
     amr_artist = axis.scatter([], [], s=35, zorder=4)
     reservation_artist = LineCollection([], linewidths=4, alpha=0.8, zorder=3)
     axis.add_collection(reservation_artist)
+    corridor_artist = LineCollection([], linewidths=7, alpha=0.45, zorder=2)
+    axis.add_collection(corridor_artist)
     headings = [axis.plot([], [], color="#222222", linewidth=1.5, zorder=5)[0] for _ in amr_ids]
     paths = [axis.plot([], [], color="#4895ef", alpha=0.35, zorder=2)[0] for _ in amr_ids]
     status = axis.text(
@@ -185,6 +187,11 @@ def run_debugger(
         key=lambda event: float(event["time_seconds"]),
     )
     reservation_times = [float(event["time_seconds"]) for event in reservation_events]
+    corridor_events = sorted(
+        (event for event in result.events if event["event"] in {"corridor_owned", "corridor_released"}),
+        key=lambda event: float(event["time_seconds"]),
+    )
+    corridor_times = [float(event["time_seconds"]) for event in corridor_events]
     initial_owners = {
         grid_position(spawn): amr_id for amr_id, spawn in zip(amr_ids, spawn_nodes)
     }
@@ -193,6 +200,7 @@ def run_debugger(
         for index, amr_id in enumerate(amr_ids)
     }
     reservation_state = {"index": 0, "owners": dict(initial_owners)}
+    corridor_state = {"index": 0, "passages": {}}
 
     def reservation_owners(when):
         target = bisect.bisect_right(reservation_times, when)
@@ -210,6 +218,21 @@ def run_debugger(
                     del reservation_state["owners"][node]
             reservation_state["index"] += 1
         return reservation_state["owners"]
+
+    def active_corridors(when):
+        target = bisect.bisect_right(corridor_times, when)
+        if target < corridor_state["index"]:
+            corridor_state["index"] = 0
+            corridor_state["passages"] = {}
+        while corridor_state["index"] < target:
+            event = corridor_events[corridor_state["index"]]
+            key = tuple(sorted(event.get("nodes", ())))
+            if event["event"] == "corridor_owned":
+                corridor_state["passages"][key] = event
+            else:
+                corridor_state["passages"].pop(key, None)
+            corridor_state["index"] += 1
+        return corridor_state["passages"].values()
 
     def active_job(amr_id):
         index = bisect.bisect_right(job_starts[amr_id], controller.time) - 1
@@ -235,6 +258,15 @@ def run_debugger(
                 reserved_colors.append(owner_colors[owner])
         reservation_artist.set_segments(reserved_segments)
         reservation_artist.set_colors(reserved_colors)
+        corridor_segments, corridor_colors = [], []
+        for event in active_corridors(controller.time):
+            points = [project.coordinates(*grid_position(node)) for node in event["nodes"]]
+            corridor_segments.extend(zip(points, points[1:]))
+            corridor_colors.extend(
+                [owner_colors.get(event["amr_id"], "#f4a261")] * max(0, len(points) - 1)
+            )
+        corridor_artist.set_segments(corridor_segments)
+        corridor_artist.set_colors(corridor_colors)
         reserved = {job["rack_id"] for job in active.values() if job}
         away = {
             job["rack_id"]
@@ -287,7 +319,7 @@ def run_debugger(
             f"Throughput    {throughput:,.2f} lines/h"
         )
         return (
-            rack_artist, reservation_artist, amr_artist, status, *headings, *paths
+            rack_artist, corridor_artist, reservation_artist, amr_artist, status, *headings, *paths
         )
 
     animation = FuncAnimation(

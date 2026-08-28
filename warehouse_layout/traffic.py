@@ -847,6 +847,79 @@ class TrafficAwareSlottingService:
             "zones": rows,
         }
 
+    def restore_saved_result(
+        self, payload: dict, network: MovementNetwork
+    ) -> TrafficOptimizationResult:
+        """Rebuild final expected traffic from a saved traffic-aware layout."""
+        traffic = payload.get("traffic_analysis") or {}
+        configuration = copy.deepcopy(payload.get("traffic_configuration") or {})
+        if not traffic or not configuration:
+            raise ValueError(
+                "saved layout has no traffic analysis/configuration to restore"
+            )
+        assignments = copy.deepcopy(payload.get("assignments") or [])
+        if not assignments:
+            raise ValueError("saved traffic-aware layout has no assignments")
+        unit_visits = {
+            str(unit): int(visits)
+            for unit, visits in (
+                traffic.get("after_unit_visits") or traffic.get("unit_visits") or {}
+            ).items()
+        }
+        demand = TrafficDemand(
+            unit_visits=unit_visits,
+            fulfillment_groups=int(traffic.get("fulfillment_groups") or 0),
+            handling_unit_visits=int(
+                traffic.get("after_handling_unit_visits")
+                or sum(unit_visits.values())
+            ),
+            matched_events=0,
+            unmatched_skus=tuple(str(value) for value in traffic.get("unmatched_skus", [])),
+            start_date=str(configuration.get("start_date") or ""),
+            end_date=str(configuration.get("end_date") or ""),
+            replica_visits=copy.deepcopy(
+                traffic.get("after_replica_visits")
+                or traffic.get("replica_visits") or {}
+            ),
+            replica_assignment_policy=str(
+                traffic.get("replica_assignment_policy")
+                or "traffic_balanced_alternative_source"
+            ),
+        )
+        saved_after_metrics = traffic.get("after") or {}
+        analysis = self.analyze(
+            assignments,
+            network,
+            demand,
+            relative_reference=(
+                float(saved_after_metrics["relative_reference"])
+                if saved_after_metrics.get("relative_reference") is not None
+                else None
+            ),
+        )
+        saved_zone = (traffic.get("zone_analysis") or {}).get("after")
+        analysis.zone_analysis = (
+            copy.deepcopy(saved_zone)
+            if saved_zone else self.analyze_zones(assignments, analysis, payload)
+        )
+        parameters = {
+            **configuration,
+            "restored_saved_run": True,
+            "restored_resource_view": "rerouted_saved_final_unit_visits",
+        }
+        return TrafficOptimizationResult(
+            assignments=assignments,
+            before=analysis,
+            after=analysis,
+            relocations=copy.deepcopy(traffic.get("relocations") or []),
+            rejected_units=copy.deepcopy(traffic.get("rejected_units") or []),
+            parameters=parameters,
+            trials=copy.deepcopy(
+                traffic.get("trials")
+                or configuration.get("pareto_frontier") or []
+            ),
+        )
+
     def _strict_unit_compatibility(
         self, source_rows: list[dict], target_rows: list[dict], payload: dict
     ) -> tuple[bool, str]:
@@ -1182,7 +1255,10 @@ class TrafficAwareSlottingService:
             "validation_mode": "static_expected_flow_only",
             "regenerated_summary": regenerated_summary,
             "clusters": plan.cluster_rows,
-            "rack_budget_policy": "paper_ctbsa_selected_solution",
+            "rack_budget_policy": (
+                "extended_ctbsa_selected_solution"
+                if zone_workload_enabled else "paper_ctbsa_selected_solution"
+            ),
             "compact_rack_count": compact_rack_count,
             "selected_rack_count": candidate_rack_count,
             "rack_budget_trials": rack_budget_trials,
@@ -1190,7 +1266,10 @@ class TrafficAwareSlottingService:
                 "selected C&TBSA Pareto representative applied without a "
                 "post-simulation route-metric veto"
             ),
-            "route_metrics_role": "post_assignment_evaluation_only",
+            "route_metrics_role": (
+                "within_selected_zone_assignment_then_post_evaluation"
+                if zone_workload_enabled else "post_assignment_evaluation_only"
+            ),
             "candidate_replica_visit_allocation": candidate_replica_visits,
             "selected_replica_visit_allocation": copy.deepcopy(
                 after.demand.replica_visits

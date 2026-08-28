@@ -72,7 +72,8 @@ attribute profile, inherited attribute compatibility, and physical capacity
 checks. Oversize, overweight,
 multi-slot, incomplete-data, or otherwise exceptional racks remain fixed because
 the paper assumes one SKU occupies one ordinary storage location. These additions
-restrict feasibility but do not change either paper objective. Quantity support
+restrict feasibility but do not change either paper objective when zone-aware
+search is disabled. Quantity support
 treats each `inventory_load_id` as one paper item, divides its logical SKU demand
 by stored quantity, and therefore permits one SKU to appear in multiple clusters.
 
@@ -141,25 +142,47 @@ its quantity loads. Loads of the same SKU have no artificial self-correlation;
 correlation with other SKUs remains inherited from `N(j,j')`. The original
 maximum-cluster-demand and correlation objectives are otherwise unchanged.
 
+With **Balance workload across zones** enabled, cluster boundaries are tied to
+compatible rack zones and NSGA-II adds a third objective: minimize the maximum
+quantity-weighted zone demand divided by compatible usable slot capacity. Auto
+selection chooses the equal-weight normalized knee across affinity loss, shelf
+peak, and zone peak; representatives 1–5 provide a manual override. No fixed
+degradation limit is imposed, so every selected tradeoff is reported explicitly.
+
 A chromosome is a permutation divided into shelf-capacity sections. Empty shelf
 slots are zero-demand dummy genes. NSGA-II uses the paper's final settings:
 population 100, PMX crossover probability 0.9, 2-opt swap mutation probability
 0.1, and 50,000 generations. Five evenly distributed Pareto representatives
-are retained and balanced solution `C&TBSA3` is selected by default.
+are retained and balanced solution `C&TBSA3` is selected by default in the
+paper-compatible mode. Extended mode retains five stable three-dimensional
+representatives and selects Auto by default.
 
-In Stage 2, clusters are sorted by decreasing demand and assigned to shelves in
+With zone-aware search disabled, Stage 2 sorts clusters by decreasing demand and assigns them to shelves in
 increasing average workstation distance. Load order within a shelf is randomized
 with a recorded seed. Chilled inventory uses a separate feasibility stratum;
 oversize, overweight, multi-slot, or incomplete-data exception shelves remain
 fixed so each exceptional load retains its required physical footprint.
 
-Expected lane load is calculated only after placement. It is a static diagnostic
-and does not affect either paper objective. No picking-delay, collision, queue,
+With zone-aware search enabled, Stage 2 preserves the zone selected by the
+chromosome and assigns hotter clusters to lower-flow compatible racks within
+that zone. It never moves a cluster across zones after Pareto selection.
+
+Expected lane load is calculated after placement. Extended mode uses expected
+route flow and travel only to order racks inside an already selected zone; the
+values are also reported as static diagnostics and are not Pareto objectives.
+No picking-delay, collision, queue,
 or throughput result is claimed without simulation.
 
 The preview overlays lane traffic and handling-unit visits. Lanes use a
 blue-to-red load scale. Rack markers use the same scale based on visits generated
 at that location. Reassigned racks remain outlined in both Before and After views.
+
+Use **Load saved run…** to reopen a generated traffic-aware slotting layout
+without rerunning C&TBSA. The loader restores assignments, zone and Pareto
+details, and saved final visit allocation. It rebuilds the embedded RMF network
+(or loads the recorded external network) and deterministically reroutes those
+visits to restore the expected movement-resource heatmap. A missing external
+network is reported instead of silently substituting a different graph.
 
 ## Outputs
 

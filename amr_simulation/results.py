@@ -82,6 +82,32 @@ def summarize(layout_name: str, results: list[DayResult]) -> dict:
         "total_dram_conflict_wait_seconds": sum(
             result.metrics["dram_conflict_wait_seconds"] for result in results
         ),
+        "total_loaded_priority_grants": sum(
+            result.metrics["loaded_priority_grants"] for result in results
+        ),
+        "total_loaded_protected_waits": sum(
+            result.metrics["loaded_protected_waits"] for result in results
+        ),
+        "total_following_wait_seconds": sum(
+            result.metrics["following_wait_seconds"] for result in results
+        ),
+        "total_following_avoided_reroutes": sum(
+            result.metrics["following_avoided_reroutes"] for result in results
+        ),
+        "total_wait_for_cycles": sum(result.metrics["wait_for_cycles"] for result in results),
+        "total_cycle_breaking_reroutes": sum(
+            result.metrics["cycle_breaking_reroutes"] for result in results
+        ),
+        "total_corridor_conflicts": sum(result.metrics["corridor_conflicts"] for result in results),
+        "total_corridor_ownership_changes": sum(
+            result.metrics["corridor_ownership_changes"] for result in results
+        ),
+        "total_corridor_yielding_amrs": sum(
+            result.metrics["corridor_yielding_amrs"] for result in results
+        ),
+        "total_corridor_wait_seconds": sum(
+            result.metrics["corridor_wait_seconds"] for result in results
+        ),
         "mean_daily_throughput_lines_per_hour": fmean(throughputs),
         "weighted_throughput_lines_per_hour": total_lines / total_hours if total_hours else 0.0,
         "mean_amr_utilization": fmean(result.metrics["amr_utilization"] for result in results),

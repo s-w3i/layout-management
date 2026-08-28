@@ -123,7 +123,7 @@ Optimize an existing layout:
 ```bash
 python3 global_traffic_slotting.py \
   --mode existing \
-  --layout resources/data/basic_slotting_layout.slotting.json \
+  --layout resources/map/basic_slotting_layout.slotting.json \
   --orders "resources/data/Sample Data.xlsx" \
   --network resources/map/warehouse_grid.grid.json \
   --time-limit 300 \
@@ -131,7 +131,7 @@ python3 global_traffic_slotting.py \
   --max-travel-increase-percent 0 \
   --max-controllable-p95-increase-percent 0 \
   --max-relocated-percent 50 \
-  --output resources/data/global_traffic_layout.slotting.json
+  --output resources/map/global_traffic_layout.slotting.json
 ```
 
 Run the full basic-to-global pipeline:
@@ -144,7 +144,7 @@ python3 global_traffic_slotting.py \
   --orders "resources/data/Sample Data.xlsx" \
   --initial-strategy basic \
   --time-limit 300 \
-  --output resources/data/global_traffic_layout.slotting.json
+  --output resources/map/global_traffic_layout.slotting.json
 ```
 
 For an affinity baseline, use `--initial-strategy abc_affinity` and set
