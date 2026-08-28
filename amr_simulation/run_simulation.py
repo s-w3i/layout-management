@@ -97,6 +97,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--output", type=Path)
     value.add_argument("--event-log", action="store_true")
     value.add_argument(
+        "--amrs", type=int,
+        help="override fleet size using the first N configured spawn nodes",
+    )
+    value.add_argument(
         "--workers", type=int, default=min(4, os.cpu_count() or 1),
         help="parallel batch processes (default: up to 4)",
     )
@@ -109,6 +113,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.amrs is not None and args.amrs < 1:
+        parser().error("--amrs must be positive")
     if args.workers < 1:
         parser().error("--workers must be positive")
     if args.mode == "debug":
@@ -128,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     output.mkdir(parents=True, exist_ok=True)
     try:
         config = SimulationConfig.load(args.config)
+        if args.amrs is not None:
+            config = config.with_amr_count(args.amrs)
         project = RmfMapService().load_project(args.grid)
         workload = load_workload(args.orders)
         tasks = workload.select(start, end)

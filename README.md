@@ -32,6 +32,7 @@ python3 amr_simulation/run_simulation.py \
   --layout resources/map/map1_pure_affinity.slotting.json \
   --layout resources/map/map1_traffic_zone_balance_off.slotting.json \
   --layout resources/map/map1_traffic_zone_balance_on.slotting.json \
+  --amrs 40 \
   --workers 4 \
   --output amr_simulation/results/all_layouts_40_amrs
 ```
@@ -45,6 +46,7 @@ amr_simulation/results/all_layouts_40_amrs/layout_comparison.csv
 Useful batch options:
 
 - `--workers N`: maximum parallel layout workers.
+- `--amrs N`: fleet size from 1 to 40 using configured spawn nodes.
 - `--start-date YYYY-MM-DD --end-date YYYY-MM-DD`: limit the date range.
 - `--event-log`: export detailed events; omit it for faster runs.
 
@@ -76,13 +78,15 @@ The window includes play/pause, next-event, restart, and speed controls. Use
 ## Simulator behavior
 
 - Directed and bidirectional lanes are honored by deterministic A* routing.
+- A* plans only the active pickup, delivery, or rack-return stage.
 - Every workstation processes one robot at a time; arrivals queue physically.
+- AMRs reserve available straight-path nodes and release each node after crossing.
+- Blocked AMRs reroute after five simulated seconds using stage-local tabu nodes.
 - A rack stays reserved until it returns home and jack-down finishes.
 - Original order lines complete at jack-down; quantities do not multiply lines.
 - All tasks for a selected date start at simulation time zero.
 
-V1 allows AMR overlap and does not model collision avoidance, path reservation,
-or replanning.
+V1 uses node ownership rather than a time-expanded reservation table.
 
 ## Outputs
 

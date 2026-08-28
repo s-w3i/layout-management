@@ -61,11 +61,32 @@ def summarize(layout_name: str, results: list[DayResult]) -> dict:
         "total_rack_presentations": sum(result.metrics["rack_presentations"] for result in results),
         "total_travel_distance_m": sum(result.metrics["travel_distance_m"] for result in results),
         "total_station_queue_time_seconds": sum(result.metrics["station_queue_time_seconds"] for result in results),
+        "total_node_reservation_wait_seconds": sum(
+            result.metrics["node_reservation_wait_seconds"] for result in results
+        ),
+        "total_reservation_conflicts": sum(
+            result.metrics["reservation_conflicts"] for result in results
+        ),
+        "total_node_ownership_conflicts": sum(
+            result.metrics["node_ownership_conflicts"] for result in results
+        ),
+        "total_dram_solver_conflicts": sum(
+            result.metrics["dram_solver_conflicts"] for result in results
+        ),
+        "total_reservation_reroutes": sum(
+            result.metrics["reservation_reroutes"] for result in results
+        ),
+        "total_dram_solver_reroutes": sum(
+            result.metrics["dram_solver_reroutes"] for result in results
+        ),
+        "total_dram_conflict_wait_seconds": sum(
+            result.metrics["dram_conflict_wait_seconds"] for result in results
+        ),
         "mean_daily_throughput_lines_per_hour": fmean(throughputs),
         "weighted_throughput_lines_per_hour": total_lines / total_hours if total_hours else 0.0,
         "mean_amr_utilization": fmean(result.metrics["amr_utilization"] for result in results),
         "model_limitations": [
-            "AMR overlap is permitted; paths are not reserved and collisions are not detected.",
+            "Node ownership is modeled without a time-expanded reservation table.",
             "Inventory depletion and quantity-dependent service time are not modeled.",
         ],
     }

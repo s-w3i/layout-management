@@ -5,9 +5,16 @@ import math
 from datetime import date, datetime, time
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook
 
 from amr_simulation.debugger import PlaybackController, _format_elapsed
+from amr_simulation.conflict_solver import (
+    has_extended_head_to_head,
+    has_trivial_cycle,
+    is_partial_solvable,
+    partial_conflicts,
+)
 from amr_simulation.engine import simulate_day
 from amr_simulation.run_simulation import main
 from amr_simulation.inputs import (
@@ -21,6 +28,7 @@ from amr_simulation.models import (
     SimulationConfig,
     WorkloadTask,
     grid_name,
+    grid_position,
 )
 from amr_simulation.results import summarize
 from amr_simulation.routing import GridRouter, merge_straight_runs, motion_phases
@@ -50,6 +58,38 @@ def task(store, skus, release=0.0, picked_date=date(2024, 1, 1)):
     return WorkloadTask(
         f"{picked_date.isoformat()}/{store}", picked_date, release, store, dict(skus)
     )
+
+
+def test_dram_pattern_matching_with_cycle_detection():
+    assert has_extended_head_to_head((5, 6, 7), (7, 6, 5, 1))
+    assert not has_extended_head_to_head((1, 2), (2, 3, 4))
+    assert has_trivial_cycle(((1, 2), (2, 3), (3, 1)), 0)
+    assert not has_trivial_cycle(((1, 2), (3, 4)), 0)
+    assert not is_partial_solvable(((5, 6, 7), (7, 6, 5, 1)), 0)
+    assert not is_partial_solvable(((1, 2), (2, 3), (3, 1)), 0)
+    assert is_partial_solvable(((1, 2), (3, 4)), 0)
+    head_to_head = partial_conflicts(((5, 6, 7), (7, 6, 5, 1)), 0)
+    assert head_to_head[0].kind == "head_to_head"
+    assert head_to_head[0].agent_indices == (0, 1)
+    assert head_to_head[0].overlap_node == 6
+    cycle = partial_conflicts(((1, 2), (2, 3), (3, 1)), 0)
+    assert cycle[-1].kind == "cycle"
+    assert cycle[-1].agent_indices == (0, 1, 2)
+    cases = (
+        ((1, 2, 3), (4, 5, 6)),
+        ((6, 5, 9), (5, 6, 7)),
+        ((1, 2), (2, 3, 4)),
+        ((1, 2), (2, 3), (3, 1)),
+    )
+    for paths in cases:
+        for index in range(len(paths)):
+            assert bool(partial_conflicts(paths, index)) != is_partial_solvable(paths, index)
+
+
+def test_dram_wait_configuration_is_snapshotted():
+    selected = config()
+    assert selected.dram_conflict_wait_seconds == 15.0
+    assert selected.snapshot()["dram_conflict_wait_seconds"] == 15.0
 
 
 def test_workbook_grouping_ignores_time_preserves_line_counts_and_cache(tmp_path):
@@ -113,6 +153,8 @@ def test_directed_astar_rack_obstacle_and_motion_timing():
     router = GridRouter(value)
     assert router.route((0, 0), (1, 0)) is not None
     assert router.route((1, 0), (0, 0)) is None
+    assert router.reachable((0, 0), (1, 0))
+    assert not router.reachable((1, 0), (0, 0))
 
     triangular = motion_phases(1.0, 1.5, 0.75)
     trapezoidal = motion_phases(6.0, 1.5, 0.75)
@@ -120,6 +162,26 @@ def test_directed_astar_rack_obstacle_and_motion_timing():
     assert [phase[0] for phase in trapezoidal] == ["accel", "cruise", "decel"]
     runs = merge_straight_runs(project(), ((0, 0), (1, 0), (2, 0), (2, 1)))
     assert [(run.distance_m, round(math.degrees(run.heading))) for run in runs] == [(2.0, 0), (1.0, 90)]
+
+
+def test_astar_prefers_fewer_turns_for_equal_distance():
+    value = GridProject(GridSpec(width_m=3, length_m=2, spacing_m=1))
+    router = GridRouter(value)
+    edges = (
+        ((0, 0), (1, 0)), ((1, 0), (1, 1)), ((1, 1), (2, 1)),
+        ((2, 1), (2, 2)), ((2, 2), (3, 2)),
+        ((0, 0), (0, 1)), ((0, 1), (0, 2)), ((0, 2), (1, 2)),
+        ((1, 2), (2, 2)),
+    )
+    router.graph = {position: [] for position in router.positions}
+    for start, end in edges:
+        router.graph[start].append((end, 1.0))
+    for neighbours in router.graph.values():
+        neighbours.sort()
+    route = router.route((0, 0), (3, 2))
+    assert route.distance_m == 5.0
+    assert route.positions == ((0, 0), (0, 1), (0, 2), (1, 2), (2, 2), (3, 2))
+    assert len(merge_straight_runs(value, route.positions)) == 2
 
 
 def test_greedy_rack_coverage_and_completion_at_jack_down():
@@ -141,6 +203,13 @@ def test_greedy_rack_coverage_and_completion_at_jack_down():
     assert result.metrics["first_release_seconds"] == 0.0
     assert result.metrics["final_completion_seconds"] == jack_down["time_seconds"]
     assert result.metrics["makespan_seconds"] == jack_down["time_seconds"]
+
+    planned = [event for event in result.events if event["event"] == "stage_path_planned"]
+    assert [event["stage"] for event in planned] == ["to_pickup", "to_station", "return_rack"]
+    event_times = {event["event"]: event["time_seconds"] for event in result.events}
+    assert planned[0]["time_seconds"] == event_times["dispatch"]
+    assert planned[1]["time_seconds"] == event_times["jack_up_done"]
+    assert planned[2]["time_seconds"] == event_times["service_done"]
 
 
 def test_parallel_jobs_replica_fallback_station_fifo_and_reservation():
@@ -165,8 +234,29 @@ def test_parallel_jobs_replica_fallback_station_fifo_and_reservation():
     ordered = sorted(result.jobs, key=lambda job: job["service_start"])
     assert ordered[1]["station_admitted"] >= ordered[0]["service_start"] + two_amrs.service_seconds
     assert result.metrics["station_queue_time_seconds"] > 0
-    assert {job["station_queue_position"] for job in result.jobs} == {"G2_1"}
+    assert len({job["station_queue_position"] for job in result.jobs}) == 2
+    assert "G2_2" not in {job["station_queue_position"] for job in result.jobs}
     assert all(job["station_queue_enter"] <= job["station_admitted"] < job["station_arrival"] for job in result.jobs)
+    assert result.metrics["reservation_conflicts"] > 0
+    assert result.metrics["reservation_conflicts"] == (
+        result.metrics["node_ownership_conflicts"]
+        + result.metrics["dram_solver_conflicts"]
+    )
+    assert result.metrics["node_reservation_wait_seconds"] > 0
+
+    owners = {
+        (0, 0): "AMR_01",
+        (4, 0): "AMR_02",
+    }
+    for event in result.events:
+        if event["event"] == "reservation_granted":
+            for node_name in event["nodes"]:
+                node = grid_position(node_name)
+                assert owners.get(node, event["amr_id"]) == event["amr_id"]
+                owners[node] = event["amr_id"]
+        elif event["event"] == "node_released":
+            node = grid_position(event["node"])
+            assert owners.pop(node) == event["amr_id"]
 
     same_rack = {"G2_0": Rack("G2_0", (2, 0), frozenset({"A"}))}
     sequential = simulate_day(
@@ -196,6 +286,23 @@ def test_workstation_queue_uses_arrival_time_not_task_sequence():
     later_task = by_task["2024-01-01/S2"]
     assert later_task["station_queue_enter"] < earlier_task["station_queue_enter"]
     assert later_task["service_start"] < earlier_task["service_start"]
+
+
+def test_dynamic_tabu_route_and_continuous_node_crossings():
+    value = project()
+    router = GridRouter(value)
+    direct = router.route((0, 1), (4, 1))
+    detour = router.route((0, 1), (4, 1), frozenset({(2, 1)}))
+    assert direct is not None and (2, 1) in direct.positions
+    assert detour is not None and (2, 1) not in detour.positions
+
+    route = router.route((0, 1), (2, 1))
+    end, _heading, segments = router.motion(
+        "J", "AMR", route, 0.0, 0.0, MotionProfile(), False
+    )
+    crossings = router.crossing_times(route, segments)
+    assert [node for node, _time in crossings] == [(1, 1), (2, 1)]
+    assert 0 < crossings[0][1] < crossings[1][1] == pytest.approx(end)
 
 
 def test_daily_reset_batch_debug_parity_and_summary_math():
@@ -249,6 +356,16 @@ def test_cli_rejects_debug_without_one_date():
         assert exc.code == 2
     else:
         raise AssertionError("invalid debug arguments were accepted")
+
+
+def test_amr_count_override_uses_configured_spawns():
+    base = config(spawns=("G0_0", "G1_0", "G2_0"))
+    selected = base.with_amr_count(2)
+    assert selected.amr_count == 2
+    assert selected.spawn_nodes == ("G0_0", "G1_0")
+
+    with pytest.raises(ValueError, match="between 1 and 3"):
+        base.with_amr_count(4)
 
 
 def test_map1_regression_reports_42_inaccessible_racks():

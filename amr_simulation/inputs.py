@@ -316,8 +316,8 @@ def validate_inputs(
             continue
         station = marker_stations[station_id]
         if not any(
-            router.route(spawn, station) is not None
-            and router.route(station, spawn) is not None
+            router.reachable(spawn, station)
+            and router.reachable(station, spawn)
             for spawn in spawn_positions
         ):
             report.error(
@@ -328,14 +328,14 @@ def validate_inputs(
     for rack_id, rack in racks.items():
         if rack_id in absent_racks:
             continue
-        pickup_ok = any(router.route(spawn, rack.position) is not None for spawn in spawn_positions)
+        pickup_ok = any(router.reachable(spawn, rack.position) for spawn in spawn_positions)
         failed_stations = [
             station
             for station in config.workstations
             if station in marker_stations
             and (
-                router.route(rack.position, marker_stations[station]) is None
-                or router.route(marker_stations[station], rack.position) is None
+                not router.reachable(rack.position, marker_stations[station])
+                or not router.reachable(marker_stations[station], rack.position)
             )
         ]
         if not pickup_ok or failed_stations:
@@ -347,11 +347,12 @@ def validate_inputs(
             )
     for node, spawn in zip(config.spawn_nodes, spawn_positions):
         if active_stations and not any(
-            router.route(spawn, station) is not None and router.route(station, spawn) is not None
+            router.reachable(spawn, station) and router.reachable(station, spawn)
             for station in active_stations
         ):
             report.error("disconnected_spawn", f"spawn node {node} has no workstation round trip", node=node)
     report.warning(
-        "amr_overlap", "v1 permits AMR overlap and does not reserve paths, detect collisions, or replan"
+        "reservation_model",
+        "node ownership prevents overlap but does not use time-expanded reservations",
     )
     return report

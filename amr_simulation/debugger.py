@@ -78,6 +78,7 @@ def run_debugger(
     """Render continuous frames; playback never mutates simulation results."""
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
+    from matplotlib.collections import LineCollection
     from matplotlib.widgets import Button, Slider
 
     controller = PlaybackController.from_result(result)
@@ -126,6 +127,8 @@ def run_debugger(
     )
     amr_ids = sorted(result.metrics["amrs"])
     amr_artist = axis.scatter([], [], s=35, zorder=4)
+    reservation_artist = LineCollection([], linewidths=4, alpha=0.8, zorder=3)
+    axis.add_collection(reservation_artist)
     headings = [axis.plot([], [], color="#222222", linewidth=1.5, zorder=5)[0] for _ in amr_ids]
     paths = [axis.plot([], [], color="#4895ef", alpha=0.35, zorder=2)[0] for _ in amr_ids]
     status = axis.text(
@@ -174,6 +177,39 @@ def run_debugger(
     )
     initial_heading = math.radians(initial_heading_degrees)
     last_frame_time = time.monotonic()
+    reservation_events = sorted(
+        (
+            event for event in result.events
+            if event["event"] in {"reservation_granted", "node_released"}
+        ),
+        key=lambda event: float(event["time_seconds"]),
+    )
+    reservation_times = [float(event["time_seconds"]) for event in reservation_events]
+    initial_owners = {
+        grid_position(spawn): amr_id for amr_id, spawn in zip(amr_ids, spawn_nodes)
+    }
+    owner_colors = {
+        amr_id: plt.get_cmap("tab20")(index % 20)
+        for index, amr_id in enumerate(amr_ids)
+    }
+    reservation_state = {"index": 0, "owners": dict(initial_owners)}
+
+    def reservation_owners(when):
+        target = bisect.bisect_right(reservation_times, when)
+        if target < reservation_state["index"]:
+            reservation_state["index"] = 0
+            reservation_state["owners"] = dict(initial_owners)
+        while reservation_state["index"] < target:
+            event = reservation_events[reservation_state["index"]]
+            if event["event"] == "reservation_granted":
+                for node in event["nodes"]:
+                    reservation_state["owners"][grid_position(node)] = event["amr_id"]
+            else:
+                node = grid_position(event["node"])
+                if reservation_state["owners"].get(node) == event["amr_id"]:
+                    del reservation_state["owners"][node]
+            reservation_state["index"] += 1
+        return reservation_state["owners"]
 
     def active_job(amr_id):
         index = bisect.bisect_right(job_starts[amr_id], controller.time) - 1
@@ -188,6 +224,17 @@ def run_debugger(
         controller.advance(now - last_frame_time)
         last_frame_time = now
         active = {amr_id: active_job(amr_id) for amr_id in amr_ids}
+        owners = reservation_owners(controller.time)
+        reserved_segments, reserved_colors = [], []
+        for start, end in project.iter_traversable_lane_positions():
+            owner = owners.get(start)
+            if owner is not None and owners.get(end) == owner:
+                reserved_segments.append(
+                    (project.coordinates(*start), project.coordinates(*end))
+                )
+                reserved_colors.append(owner_colors[owner])
+        reservation_artist.set_segments(reserved_segments)
+        reservation_artist.set_colors(reserved_colors)
         reserved = {job["rack_id"] for job in active.values() if job}
         away = {
             job["rack_id"]
@@ -239,7 +286,9 @@ def run_debugger(
             f"Order lines   {completed_lines:,} / {result.metrics['completed_lines']:,}\n"
             f"Throughput    {throughput:,.2f} lines/h"
         )
-        return (rack_artist, amr_artist, status, *headings, *paths)
+        return (
+            rack_artist, reservation_artist, amr_artist, status, *headings, *paths
+        )
 
     animation = FuncAnimation(
         figure, draw, interval=50, cache_frame_data=False, blit=False

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -52,6 +52,8 @@ class SimulationConfig:
     service_seconds: float
     motion: MotionProfile
     detailed_event_log: bool = False
+    reservation_wait_seconds: float = 5.0
+    dram_conflict_wait_seconds: float = 15.0
     schema: str = CONFIG_SCHEMA
 
     @classmethod
@@ -77,6 +79,8 @@ class SimulationConfig:
             service_seconds=float(raw.get("service_seconds", 10.0)),
             motion=motion,
             detailed_event_log=bool(raw.get("detailed_event_log", False)),
+            reservation_wait_seconds=float(raw.get("reservation_wait_seconds", 5.0)),
+            dram_conflict_wait_seconds=float(raw.get("dram_conflict_wait_seconds", 15.0)),
         )
         config.validate()
         return config
@@ -98,10 +102,19 @@ class SimulationConfig:
                 self.jack_up_seconds,
                 self.jack_down_seconds,
                 self.service_seconds,
+                self.reservation_wait_seconds,
+                self.dram_conflict_wait_seconds,
             )
         ):
             raise ValueError("handling and service times must be finite and non-negative")
         self.motion.validate()
+
+    def with_amr_count(self, count: int) -> "SimulationConfig":
+        if not 1 <= count <= len(self.spawn_nodes):
+            raise ValueError(
+                f"AMR count must be between 1 and {len(self.spawn_nodes)}"
+            )
+        return replace(self, amr_count=count, spawn_nodes=self.spawn_nodes[:count])
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -116,6 +129,8 @@ class SimulationConfig:
             "service_seconds": self.service_seconds,
             "motion": asdict(self.motion),
             "detailed_event_log": self.detailed_event_log,
+            "reservation_wait_seconds": self.reservation_wait_seconds,
+            "dram_conflict_wait_seconds": self.dram_conflict_wait_seconds,
         }
 
 
