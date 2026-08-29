@@ -16,7 +16,6 @@ from .affinity import AffinityCancelledError
 from .config import (
     DEFAULT_GLOBAL_TRAFFIC_OUTPUT,
     DEFAULT_GRID_INPUT,
-    DEFAULT_MAP_DIR,
     DEFAULT_SLOTTING_OUTPUT,
     DEFAULT_TRAFFIC_INPUT,
     DEFAULT_VELOCITY_INPUT,
@@ -520,11 +519,7 @@ class GlobalTrafficOptimizerTab:
         self.network_button.configure(state=network_state)
 
     def _browse(self, variable, filetypes):
-        current = Path(variable.get()).expanduser()
-        initialdir = current.parent if variable.get().strip() else DEFAULT_MAP_DIR
-        path = filedialog.askopenfilename(
-            initialdir=str(initialdir), filetypes=filetypes
-        )
+        path = filedialog.askopenfilename(filetypes=filetypes)
         if path:
             variable.set(path)
 

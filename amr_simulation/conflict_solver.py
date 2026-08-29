@@ -25,7 +25,7 @@ def has_extended_head_to_head(path1: Sequence[Node], path2: Sequence[Node]) -> b
     return False
 
 
-def head_to_head_overlap(path1: Sequence[Node], path2: Sequence[Node]):
+def _head_to_head_overlap(path1: Sequence[Node], path2: Sequence[Node]):
     limit = min(len(path1), len(path2))
     first1, first2 = path1[0], path2[0]
     for length in range(1, limit):
@@ -70,7 +70,7 @@ def partial_conflict(
     for index, path in enumerate(paths):
         if index == agent_index:
             continue
-        overlap = head_to_head_overlap(selected, path)
+        overlap = _head_to_head_overlap(selected, path)
         if overlap is not None:
             return DramConflict("head_to_head", (agent_index, index), overlap)
 
@@ -98,21 +98,17 @@ def partial_conflict(
 
 
 def partial_conflicts(
-    paths: Sequence[Sequence[Node]],
-    agent_index: int,
-    candidate_indices: Sequence[int] | None = None,
+    paths: Sequence[Sequence[Node]], agent_index: int
 ) -> tuple[DramConflict, ...]:
     """Return every pairwise conflict, followed by any cycle conflict."""
     selected = paths[agent_index]
     conflicts = []
-    indices = candidate_indices if candidate_indices is not None else range(len(paths))
-    for index in indices:
-        path = paths[index]
+    for index, path in enumerate(paths):
         if index == agent_index:
             continue
         if selected[0] not in path[1:] or path[0] not in selected[1:]:
             continue
-        overlap = head_to_head_overlap(selected, path)
+        overlap = _head_to_head_overlap(selected, path)
         if overlap is not None:
             conflicts.append(
                 DramConflict("head_to_head", (agent_index, index), overlap)

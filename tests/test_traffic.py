@@ -264,44 +264,18 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             sorted(row["inventory_load_ids"])
             for row in result.parameters["clusters"]
         )
-        self.assertEqual(
-            sorted(load for cluster in before_clusters for load in cluster),
-            sorted(load for cluster in after_clusters for load in cluster),
-        )
-        self.assertNotEqual(before_clusters, after_clusters)
-        rack_zones = pipeline.pretraffic_payload["zone_assignments"]
-        self.assertTrue(all(
-            row["selected_zone"] == rack_zones.get(row["rack_id"], "Z01")
-            for row in result.parameters["clusters"]
-        ))
-        selected_zone_by_load = {
-            load_id: row["selected_zone"]
-            for row in result.parameters["clusters"]
-            for load_id in row["inventory_load_ids"]
-        }
-        self.assertTrue(all(
-            selected_zone_by_load.get(row.get("inventory_load_id"))
-            == rack_zones.get(row.get("rack_id"), "Z01")
-            for row in result.assignments
-            if row.get("inventory_load_id") in selected_zone_by_load
-        ))
-        self.assertEqual(
-            result.parameters["objective_mode"],
-            "three_objective_affinity_shelf_zone",
-        )
-        self.assertEqual(
-            result.parameters["extended_selection"][0]["mode"],
-            "automatic_knee",
-        )
-        self.assertTrue(result.parameters["pareto_frontier"])
-        self.assertTrue(any(
-            row["selected"] for row in result.parameters["pareto_frontier"]
-        ))
+        self.assertEqual(before_clusters, after_clusters)
         baseline_metrics = baseline.optimization.after.zone_analysis["metrics"]
         result_metrics = result.after.zone_analysis["metrics"]
         self.assertLessEqual(
-            result_metrics["peak_normalized_zone_demand"],
-            baseline_metrics["peak_normalized_zone_demand"],
+            (
+                result_metrics["peak_normalized_zone_demand"],
+                result_metrics["peak_normalized_zone_traffic"],
+            ),
+            (
+                baseline_metrics["peak_normalized_zone_demand"],
+                baseline_metrics["peak_normalized_zone_traffic"],
+            ),
         )
         positions = lambda value: sorted(
             (
@@ -311,47 +285,6 @@ class TrafficAwareSlottingTests(unittest.TestCase):
             for row in value.optimization.assignments
         )
         self.assertEqual(positions(pipeline), positions(repeated))
-
-    def test_saved_run_restores_expected_resource_view_without_slotting(self):
-        with tempfile.TemporaryDirectory() as directory:
-            pipeline, network, _orders = self.run_small_ctbsa(
-                Path(directory), zone_workload_enabled=True, with_zones=True
-            )
-        restored = self.service.restore_saved_result(
-            pipeline.output_payload, network
-        )
-        self.assertTrue(restored.parameters["restored_saved_run"])
-        self.assertEqual(
-            restored.after.demand.unit_visits,
-            pipeline.optimization.after.demand.unit_visits,
-        )
-        self.assertEqual(
-            restored.after.metrics,
-            pipeline.optimization.after.metrics,
-        )
-        self.assertEqual(
-            restored.after.zone_analysis,
-            pipeline.optimization.after.zone_analysis,
-        )
-        self.assertEqual(
-            restored.assignments, pipeline.output_payload["assignments"]
-        )
-        self.assertTrue(restored.after.resources)
-
-    def test_saved_run_requires_traffic_metadata(self):
-        with self.assertRaisesRegex(ValueError, "no traffic analysis"):
-            self.service.restore_saved_result(
-                {"assignments": [{"sku": "A"}]},
-                self.service.network_from_rmf(
-                    GridProject(
-                        GridSpec(1, 1, 1, "restore-invalid", "L1"),
-                        {
-                            (0, 0): Marker("rack", "RACK_01"),
-                            (1, 1): Marker("workstation", "PACK_01"),
-                        },
-                    ).to_building_dict()
-                ),
-            )
 
     def test_ctbsa_uses_all_map_active_csv_attribute_profiles(self):
         project = GridProject(

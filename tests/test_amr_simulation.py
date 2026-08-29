@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import replace
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -10,12 +9,6 @@ import pytest
 from openpyxl import Workbook
 
 from amr_simulation.debugger import PlaybackController, _format_elapsed
-from amr_simulation.coordination import (
-    following_queue,
-    reversed_passage,
-    same_direction_following,
-    wait_cycle,
-)
 from amr_simulation.conflict_solver import (
     has_extended_head_to_head,
     has_trivial_cycle,
@@ -23,7 +16,7 @@ from amr_simulation.conflict_solver import (
     partial_conflicts,
 )
 from amr_simulation.engine import simulate_day
-from amr_simulation.run_simulation import _duration, main
+from amr_simulation.run_simulation import main
 from amr_simulation.inputs import (
     assign_workstations,
     load_workload,
@@ -93,33 +86,10 @@ def test_dram_pattern_matching_with_cycle_detection():
             assert bool(partial_conflicts(paths, index)) != is_partial_solvable(paths, index)
 
 
-def test_dram_candidate_filter_preserves_conflicts():
-    paths = ((1, 2, 3, 4), (4, 3, 2, 1), (9, 10), (10, 11, 9))
-    candidates = tuple(
-        index for index, path in enumerate(paths) if paths[0][0] in path[1:]
-    )
-    assert partial_conflicts(paths, 0, candidates) == partial_conflicts(paths, 0)
-
-
 def test_dram_wait_configuration_is_snapshotted():
     selected = config()
     assert selected.dram_conflict_wait_seconds == 15.0
     assert selected.snapshot()["dram_conflict_wait_seconds"] == 15.0
-    assert selected.loaded_priority_enabled
-    assert selected.mutex_passage_enabled
-    assert selected.corridor_coordination_enabled
-
-
-def test_passage_following_queue_and_transitive_cycle_helpers():
-    east = ((0, 0), (1, 0), (2, 0), (3, 0))
-    west = tuple(reversed(east))
-    leader = ((1, 0), (2, 0), (3, 0))
-    assert reversed_passage(east, west) == east
-    assert same_direction_following(east, leader, (1, 0))
-    assert not same_direction_following(east, west, (1, 0))
-    dependencies = {"B": {"A"}, "C": {"B"}, "A": set()}
-    assert following_queue("A", dependencies) == ("A", "B", "C")
-    assert wait_cycle({"A": {"B"}, "B": {"C"}, "C": {"A"}}) == ("A", "B", "C")
 
 
 def test_workbook_grouping_ignores_time_preserves_line_counts_and_cache(tmp_path):
@@ -325,11 +295,6 @@ def test_dynamic_tabu_route_and_continuous_node_crossings():
     detour = router.route((0, 1), (4, 1), frozenset({(2, 1)}))
     assert direct is not None and (2, 1) in direct.positions
     assert detour is not None and (2, 1) not in detour.positions
-    edge_detour = router.route(
-        (0, 1), (4, 1), frozenset(), frozenset({((1, 1), (2, 1))})
-    )
-    assert edge_detour is not None
-    assert ((1, 1), (2, 1)) not in set(zip(edge_detour.positions, edge_detour.positions[1:]))
 
     route = router.route((0, 1), (2, 1))
     end, _heading, segments = router.motion(
@@ -353,7 +318,6 @@ def test_daily_reset_batch_debug_parity_and_summary_math():
     controller.restart()
     assert controller.time == traced.metrics["first_release_seconds"]
     assert _format_elapsed(3661.25) == "01h 01m 01.25s"
-    assert _duration(3661.25) == "01:01:01.25"
 
     second_task = task("S", {"A": 4}, picked_date=date(2024, 1, 2))
     second = simulate_day(value, GridRouter(value), racks, [second_task], {"S": "WS"}, config())
@@ -362,26 +326,6 @@ def test_daily_reset_batch_debug_parity_and_summary_math():
         first.metrics["completed_lines"] + second.metrics["completed_lines"]
     ) / (first.metrics["makespan_hours"] + second.metrics["makespan_hours"])
     assert math.isclose(summary["weighted_throughput_lines_per_hour"], expected_weighted)
-
-
-def test_coordination_switches_off_preserve_motion_results():
-    value, racks = project(), {"G2_0": Rack("G2_0", (2, 0), frozenset({"A"}))}
-    enabled = simulate_day(
-        value, GridRouter(value), racks, [task("S", {"A": 1})], {"S": "WS"}, config()
-    )
-    disabled_config = replace(
-        config(), loaded_priority_enabled=False, mutex_passage_enabled=False,
-        corridor_coordination_enabled=False,
-    )
-    disabled = simulate_day(
-        value, GridRouter(value), racks, [task("S", {"A": 1})],
-        {"S": "WS"}, disabled_config,
-    )
-    keys = ("makespan_seconds", "travel_distance_m", "travel_time_seconds", "completed_lines")
-    assert {key: enabled.metrics[key] for key in keys} == {
-        key: disabled.metrics[key] for key in keys
-    }
-    assert enabled.jobs == disabled.jobs
 
 
 def test_two_layout_hand_calculated_comparison():

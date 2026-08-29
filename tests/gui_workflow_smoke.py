@@ -578,7 +578,6 @@ def main() -> None:
         app.traffic_ctbsa_generations.set("5")
         assert app.traffic_zone_workload_enabled.get() is False
         app.traffic_zone_workload_enabled.set(True)
-        assert app.traffic_ctbsa_extended_solution.get() == "Auto"
         app.traffic_output_path.set(str(temp / "workflow-traffic.slotting.json"))
         assert app.load_traffic_area_map()
         root.update_idletasks()
@@ -614,15 +613,8 @@ def main() -> None:
         assert "Groups" in app.traffic_kpis.get()
         assert app.traffic_resource_tree.get_children()
         assert app.traffic_zone_tree.get_children()
-        assert app.traffic_pareto_tree.get_children()
         assert "Zone demand peak" in app.traffic_kpis.get()
         assert app.traffic_result.parameters["zone_workload_enabled"] is True
-        assert app.traffic_result.parameters["objective_mode"] == (
-            "three_objective_affinity_shelf_zone"
-        )
-        assert app.traffic_result.parameters["extended_selection"][0]["mode"] == (
-            "automatic_knee"
-        )
         app.traffic_zone_overlay.set("Normalized demand")
         app.draw_traffic_map()
         traffic_links = app.traffic_canvas.find_withtag("traffic_link")
@@ -684,17 +676,6 @@ def main() -> None:
         assert len(saved_traffic_layout["buffers"]) == len(
             app.project.storage_layout.buffers
         )
-        app.traffic_result = None
-        app.traffic_analysis = None
-        app.traffic_network = None
-        assert app.load_saved_traffic_layout(traffic_layout_path)
-        assert app.traffic_view_mode.get() == "Saved result"
-        assert app.traffic_result.parameters["restored_saved_run"] is True
-        assert app.traffic_resource_tree.get_children()
-        assert app.traffic_zone_tree.get_children()
-        assert app.traffic_pareto_tree.get_children()
-        assert app.traffic_canvas.find_withtag("traffic_link")
-        assert "no slotting rerun" in app.traffic_status.get()
         traffic_export = temp / "workflow-traffic.traffic.json"
         gui.filedialog.asksaveasfilename = lambda **_kwargs: str(traffic_export)
         app.export_traffic_report()

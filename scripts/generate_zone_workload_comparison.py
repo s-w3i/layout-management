@@ -66,10 +66,6 @@ def main() -> None:
             "occupied_racks": optimization.parameters["selected_rack_count"],
             "movement_resources": optimization.after.metrics,
             "zone_workload": optimization.after.zone_analysis["metrics"],
-            "objective_mode": optimization.parameters["objective_mode"],
-            "extended_selection": optimization.parameters.get(
-                "extended_selection", []
-            ),
         }
     SUMMARY.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     off = results["zone_off"]
@@ -99,11 +95,10 @@ def main() -> None:
         lines.append(f"| {label} | {first:.4f} | {second:.4f} |")
     lines += [
         "", "## Interpretation", "",
-        "Zone ON uses the equal-weight normalized knee of affinity, maximum "
-        "shelf workload, and maximum normalized zone demand. No degradation "
-        "guardrail is imposed, so an individual post-routing metric may be "
-        "higher even when the selected Pareto compromise improves another "
-        "objective or distribution statistic.",
+        "The configured objective is lexicographic: zone-demand peak, "
+        "zone-traffic peak, zone-demand P95, zone-traffic P95, then travel. "
+        "A lower-priority metric may therefore increase when zone-demand peak "
+        "improves.",
     ]
     REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(json.dumps(results, indent=2))

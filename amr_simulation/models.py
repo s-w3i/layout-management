@@ -54,9 +54,6 @@ class SimulationConfig:
     detailed_event_log: bool = False
     reservation_wait_seconds: float = 5.0
     dram_conflict_wait_seconds: float = 15.0
-    loaded_priority_enabled: bool = True
-    mutex_passage_enabled: bool = True
-    corridor_coordination_enabled: bool = True
     schema: str = CONFIG_SCHEMA
 
     @classmethod
@@ -84,9 +81,6 @@ class SimulationConfig:
             detailed_event_log=bool(raw.get("detailed_event_log", False)),
             reservation_wait_seconds=float(raw.get("reservation_wait_seconds", 5.0)),
             dram_conflict_wait_seconds=float(raw.get("dram_conflict_wait_seconds", 15.0)),
-            loaded_priority_enabled=bool(raw.get("loaded_priority_enabled", True)),
-            mutex_passage_enabled=bool(raw.get("mutex_passage_enabled", True)),
-            corridor_coordination_enabled=bool(raw.get("corridor_coordination_enabled", True)),
         )
         config.validate()
         return config
@@ -137,9 +131,6 @@ class SimulationConfig:
             "detailed_event_log": self.detailed_event_log,
             "reservation_wait_seconds": self.reservation_wait_seconds,
             "dram_conflict_wait_seconds": self.dram_conflict_wait_seconds,
-            "loaded_priority_enabled": self.loaded_priority_enabled,
-            "mutex_passage_enabled": self.mutex_passage_enabled,
-            "corridor_coordination_enabled": self.corridor_coordination_enabled,
         }
 
 

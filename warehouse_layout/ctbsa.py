@@ -36,7 +36,6 @@ class CtbsaParameters:
     generations: int = 50_000
     random_seed: int = 0
     selected_solution: int = 3
-    extended_selected_solution: int | None = None
 
     def validate(self) -> None:
         if self.population_size < 2:
@@ -49,13 +48,6 @@ class CtbsaParameters:
             raise ValueError("C&TBSA mutation probability must be between 0 and 1")
         if not 1 <= self.selected_solution <= 5:
             raise ValueError("C&TBSA selected solution must be between 1 and 5")
-        if (
-            self.extended_selected_solution is not None
-            and not 1 <= self.extended_selected_solution <= 5
-        ):
-            raise ValueError(
-                "extended C&TBSA selected solution must be Auto or between 1 and 5"
-            )
 
 
 @dataclass(slots=True)
@@ -67,7 +59,6 @@ class CtbsaSearchResult:
     pareto: list[dict]
     representative_solutions: list[dict]
     parameters: CtbsaParameters
-    selection: dict
 
 
 @dataclass(slots=True)
@@ -97,8 +88,6 @@ class CtbsaNsga2:
         cluster_capacities: list[int] | tuple[int, ...],
         *,
         real_item_count: int | None = None,
-        cluster_zone_ids: list[str] | tuple[str, ...] | None = None,
-        zone_capacities: dict[str, int] | None = None,
     ):
         self.demands = np.asarray(demands, dtype=np.int64)
         self.correlations = np.asarray(correlations, dtype=np.int64)
@@ -116,24 +105,6 @@ class CtbsaNsga2:
         if self.correlations.shape != (self.real_item_count, self.real_item_count):
             raise ValueError("C&TBSA correlation matrix has the wrong shape")
         self.boundaries = np.cumsum((0, *self.capacities), dtype=np.int64)
-        self.cluster_zone_ids = (
-            tuple(str(value or "Z01") for value in cluster_zone_ids)
-            if cluster_zone_ids is not None else None
-        )
-        if (
-            self.cluster_zone_ids is not None
-            and len(self.cluster_zone_ids) != len(self.capacities)
-        ):
-            raise ValueError("C&TBSA cluster zone count must match cluster count")
-        self.zone_capacities = {
-            str(zone): int(value) for zone, value in (zone_capacities or {}).items()
-        }
-        if self.cluster_zone_ids is not None:
-            for zone in self.cluster_zone_ids:
-                if self.zone_capacities.get(zone, 0) <= 0:
-                    raise ValueError(
-                        f"C&TBSA zone {zone} must have positive compatible capacity"
-                    )
         first, second = np.triu_indices(self.real_item_count, 1)
         weights = self.correlations[first, second]
         positive = weights > 0
@@ -147,7 +118,7 @@ class CtbsaNsga2:
             for start, end in zip(self.boundaries[:-1], self.boundaries[1:])
         ]
 
-    def evaluate(self, chromosome: np.ndarray) -> tuple[int, int] | tuple[int, int, float]:
+    def evaluate(self, chromosome: np.ndarray) -> tuple[int, int]:
         cluster_by_item = np.empty(self.real_item_count, dtype=np.int32)
         cluster_demands = np.zeros(len(self.capacities), dtype=np.int64)
         for cluster, (start, end) in enumerate(
@@ -161,34 +132,17 @@ class CtbsaNsga2:
             cluster_by_item[self.edge_first] == cluster_by_item[self.edge_second]
         ].sum(dtype=np.int64))
         maximum_demand = int(cluster_demands.max(initial=0))
-        if self.cluster_zone_ids is None:
-            return correlation, maximum_demand
-        zone_demands = {zone: 0 for zone in self.zone_capacities}
-        for index, demand in enumerate(cluster_demands):
-            zone = self.cluster_zone_ids[index]
-            zone_demands[zone] = zone_demands.get(zone, 0) + int(demand)
-        maximum_zone_demand = max(
-            (
-                zone_demands.get(zone, 0) / capacity
-                for zone, capacity in self.zone_capacities.items()
-                if capacity > 0
-            ),
-            default=0.0,
-        )
-        return correlation, maximum_demand, float(maximum_zone_demand)
+        return correlation, maximum_demand
 
     @staticmethod
-    def _dominates(first: tuple, second: tuple) -> bool:
-        # Affinity is maximized; shelf and optional zone workload are minimized.
-        no_worse = first[0] >= second[0] and all(
-            left <= right for left, right in zip(first[1:], second[1:])
+    def _dominates(first: tuple[int, int], second: tuple[int, int]) -> bool:
+        # f1 is maximized and f2 is minimized.
+        return (
+            first[0] >= second[0] and first[1] <= second[1]
+            and (first[0] > second[0] or first[1] < second[1])
         )
-        strictly_better = first[0] > second[0] or any(
-            left < right for left, right in zip(first[1:], second[1:])
-        )
-        return no_worse and strictly_better
 
-    def _fronts(self, objectives: list[tuple]) -> list[list[int]]:
+    def _fronts(self, objectives: list[tuple[int, int]]) -> list[list[int]]:
         dominates = [[] for _ in objectives]
         dominated_count = [0] * len(objectives)
         first_front = []
@@ -217,11 +171,11 @@ class CtbsaNsga2:
         return fronts
 
     @staticmethod
-    def _crowding(front: list[int], objectives: list[tuple]) -> dict[int, float]:
+    def _crowding(front: list[int], objectives: list[tuple[int, int]]) -> dict[int, float]:
         distances = {index: 0.0 for index in front}
         if len(front) <= 2:
             return {index: float("inf") for index in front}
-        for objective_index in range(len(objectives[0])):
+        for objective_index in range(2):
             ordered = sorted(front, key=lambda index: objectives[index][objective_index])
             distances[ordered[0]] = distances[ordered[-1]] = float("inf")
             low = objectives[ordered[0]][objective_index]
@@ -289,129 +243,6 @@ class CtbsaNsga2:
             used.add(index)
             selected.append(ordered[index])
         return selected
-
-    @staticmethod
-    def _extended_selection(pareto: list[dict]) -> tuple[list[dict], dict]:
-        """Return five stable 3-D representatives and normalized knee metadata."""
-        correlation_values = [float(row["correlation"]) for row in pareto]
-        shelf_values = [float(row["maximum_cluster_demand"]) for row in pareto]
-        zone_values = [float(row["maximum_zone_demand"]) for row in pareto]
-        best_correlation = max(correlation_values, default=0.0)
-        lowest_correlation = min(correlation_values, default=best_correlation)
-        best_shelf = min(shelf_values, default=0.0)
-        worst_shelf = max(shelf_values, default=best_shelf)
-        best_zone = min(zone_values, default=0.0)
-        worst_zone = max(zone_values, default=best_zone)
-
-        def normalized(row):
-            correlation_range = best_correlation - lowest_correlation
-            shelf_range = worst_shelf - best_shelf
-            zone_range = worst_zone - best_zone
-            return (
-                (best_correlation - row["correlation"]) / correlation_range
-                if correlation_range else 0.0,
-                (row["maximum_cluster_demand"] - best_shelf) / shelf_range
-                if shelf_range else 0.0,
-                (row["maximum_zone_demand"] - best_zone) / zone_range
-                if zone_range else 0.0,
-            )
-
-        def signature(row):
-            return tuple(int(value) for value in row["chromosome"])
-
-        for row in pareto:
-            vector = normalized(row)
-            row["normalized_objectives"] = vector
-            row["normalized_knee_score"] = float(
-                np.sqrt(sum(value * value for value in vector))
-            )
-            row["degradation_from_ideal"] = {
-                "affinity_percent": (
-                    100.0 * (best_correlation - row["correlation"]) / best_correlation
-                    if best_correlation else 0.0
-                ),
-                "shelf_workload_percent": (
-                    100.0 * (row["maximum_cluster_demand"] - best_shelf) / best_shelf
-                    if best_shelf else 0.0
-                ),
-                "zone_workload_percent": (
-                    100.0 * (row["maximum_zone_demand"] - best_zone) / best_zone
-                    if best_zone else 0.0
-                ),
-            }
-        affinity = min(
-            pareto,
-            key=lambda row: (-row["correlation"], row["maximum_cluster_demand"],
-                             row["maximum_zone_demand"], signature(row)),
-        )
-        shelf = min(
-            pareto,
-            key=lambda row: (row["maximum_cluster_demand"],
-                             row["maximum_zone_demand"], -row["correlation"],
-                             signature(row)),
-        )
-        knee = min(
-            pareto,
-            key=lambda row: (row["normalized_knee_score"],
-                             row["maximum_cluster_demand"],
-                             row["maximum_zone_demand"], -row["correlation"],
-                             signature(row)),
-        )
-        zone = min(
-            pareto,
-            key=lambda row: (row["maximum_zone_demand"],
-                             row["maximum_cluster_demand"], -row["correlation"],
-                             signature(row)),
-        )
-        representatives = []
-        roles = []
-        for role, row in (
-            ("affinity_extreme", affinity), ("shelf_extreme", shelf),
-            ("normalized_knee", knee), ("zone_extreme", zone),
-        ):
-            if row not in representatives:
-                representatives.append(row)
-                roles.append(role)
-        if len(representatives) < min(5, len(pareto)):
-            remaining = [row for row in pareto if row not in representatives]
-
-            def separation(row):
-                vector = row["normalized_objectives"]
-                return min(
-                    np.sqrt(sum(
-                        (left - right) ** 2
-                        for left, right in zip(
-                            vector, selected["normalized_objectives"]
-                        )
-                    ))
-                    for selected in representatives
-                )
-
-            diverse = max(
-                remaining,
-                key=lambda row: (separation(row), -row["normalized_knee_score"],
-                                 -row["maximum_cluster_demand"],
-                                 -row["maximum_zone_demand"], row["correlation"],
-                                 tuple(-value for value in signature(row))),
-            )
-            representatives.append(diverse)
-            roles.append("maximum_spread")
-        for role, row in zip(roles, representatives):
-            row["representative_role"] = role
-        return representatives, {
-            "automatic_rule": "equal_weight_normalized_euclidean_knee",
-            "ideal": {
-                "maximum_correlation": best_correlation,
-                "minimum_shelf_workload": best_shelf,
-                "minimum_zone_workload": best_zone,
-            },
-            "knee_score": knee["normalized_knee_score"],
-            "knee_objectives": {
-                "correlation": knee["correlation"],
-                "maximum_cluster_demand": knee["maximum_cluster_demand"],
-                "maximum_zone_demand": knee["maximum_zone_demand"],
-            },
-        }
 
     def run(
         self,
@@ -482,70 +313,31 @@ class CtbsaNsga2:
         front = self._fronts(objectives)[0]
         unique = {}
         for index in front:
-            objective = objectives[index]
-            unique.setdefault(objective, population[index].copy())
-        pareto = []
-        for objective, chromosome in unique.items():
-            row = {
-                "correlation": objective[0],
-                "maximum_cluster_demand": objective[1],
+            correlation, maximum_demand = objectives[index]
+            key = (correlation, maximum_demand)
+            unique.setdefault(key, population[index].copy())
+        pareto = [
+            {
+                "correlation": correlation,
+                "maximum_cluster_demand": maximum_demand,
                 "chromosome": chromosome,
             }
-            if len(objective) == 3:
-                row["maximum_zone_demand"] = objective[2]
-            pareto.append(row)
-        if self.cluster_zone_ids is None:
-            representatives = self._five_representatives(pareto)
-            selected_index = min(parameters.selected_solution, len(representatives)) - 1
-            selected = representatives[selected_index]
-            selection = {
-                "mode": "legacy_representative",
-                "selected_representative": selected_index + 1,
-                "selection_reason": "paper two-objective representative",
-            }
-        else:
-            representatives, selection = self._extended_selection(pareto)
-            override = parameters.extended_selected_solution
-            if override is None:
-                selected = min(
-                    pareto,
-                    key=lambda row: (
-                        row["normalized_knee_score"],
-                        row["maximum_cluster_demand"],
-                        row["maximum_zone_demand"], -row["correlation"],
-                        tuple(int(value) for value in row["chromosome"]),
-                    ),
-                )
-                selection.update({
-                    "mode": "automatic_knee",
-                    "selected_representative": None,
-                    "selection_reason": "minimum equal-weight normalized distance to ideal",
-                })
-            else:
-                selected_index = min(override, len(representatives)) - 1
-                selected = representatives[selected_index]
-                selection.update({
-                    "mode": "manual_representative",
-                    "selected_representative": selected_index + 1,
-                    "selection_reason": f"manual extended representative {selected_index + 1}",
-                })
-            selection["selected_knee_score"] = selected["normalized_knee_score"]
-            selection["selected_degradation_from_ideal"] = dict(
-                selected["degradation_from_ideal"]
-            )
+            for (correlation, maximum_demand), chromosome in unique.items()
+        ]
+        representatives = self._five_representatives(pareto)
+        selected_index = min(parameters.selected_solution, len(representatives)) - 1
+        selected = representatives[selected_index]
         return CtbsaSearchResult(
             selected_chromosome=selected["chromosome"].copy(),
             selected_clusters=self.clusters(selected["chromosome"]),
             pareto=sorted(
                 pareto,
                 key=lambda row: (
-                    row["maximum_cluster_demand"],
-                    row.get("maximum_zone_demand", 0.0), -row["correlation"]
+                    row["maximum_cluster_demand"], -row["correlation"]
                 ),
             ),
             representative_solutions=representatives,
             parameters=parameters,
-            selection=selection,
         )
 
 
@@ -557,19 +349,11 @@ class CtbsaPlacementPlanner:
 
     @staticmethod
     def _serializable_solution(row: dict, solution_number: int) -> dict:
-        result = {
+        return {
             "solution": solution_number,
             "correlation": int(row["correlation"]),
             "maximum_cluster_demand": int(row["maximum_cluster_demand"]),
         }
-        if "maximum_zone_demand" in row:
-            result.update({
-                "maximum_zone_demand": float(row["maximum_zone_demand"]),
-                "normalized_knee_score": float(row["normalized_knee_score"]),
-                "degradation_from_ideal": dict(row["degradation_from_ideal"]),
-                "representative_role": row.get("representative_role", "tradeoff"),
-            })
-        return result
 
     def build(
         self,
@@ -720,8 +504,6 @@ class CtbsaPlacementPlanner:
         rank_by_sku = {}
         cluster_rows = []
         pareto_rows = []
-        pareto_frontier_rows = []
-        extended_selection_rows = []
         rank = 0
         active_groups = sorted(
             (
@@ -756,8 +538,6 @@ class CtbsaPlacementPlanner:
             group_racks = sorted(
                 group_racks,
                 key=lambda rack: (
-                    *((str(rack.get("zone_id") or "Z01"),)
-                      if zone_workload_enabled else ()),
                     not np.isfinite(float(rack["distance_m"])),
                     float(rack["distance_m"]),
                     str(rack["rack_id"]),
@@ -823,20 +603,11 @@ class CtbsaPlacementPlanner:
                     if group_skus[first] == group_skus[second]:
                         correlations[first, second] = 0
                         correlations[second, first] = 0
-            zone_capacities: dict[str, int] = {}
-            for rack in group_racks:
-                zone = str(rack.get("zone_id") or "Z01")
-                zone_capacities[zone] = zone_capacities.get(zone, 0) + capacity
             optimizer = CtbsaNsga2(
                 demands,
                 correlations,
                 [capacity] * len(group_racks),
                 real_item_count=len(group_loads),
-                cluster_zone_ids=(
-                    [str(rack.get("zone_id") or "Z01") for rack in group_racks]
-                    if zone_workload_enabled else None
-                ),
-                zone_capacities=(zone_capacities if zone_workload_enabled else None),
             )
 
             def group_progress(current: int, total: int, message: str) -> None:
@@ -857,88 +628,87 @@ class CtbsaPlacementPlanner:
                     "storage_class": profile_label,
                     "attribute_profile": dict(attribute_profile),
                 })
-            representative_by_objective = {
-                (
-                    row["correlation"], row["maximum_cluster_demand"],
-                    row.get("maximum_zone_demand"),
-                ): index
-                for index, row in enumerate(
-                    result.representative_solutions, start=1
-                )
-            }
-            for row in result.pareto:
-                objective = (
-                    row["correlation"], row["maximum_cluster_demand"],
-                    row.get("maximum_zone_demand"),
-                )
-                pareto_frontier_rows.append({
-                    "storage_class": profile_label,
-                    "attribute_profile": dict(attribute_profile),
-                    "correlation": int(row["correlation"]),
-                    "maximum_cluster_demand": int(
-                        row["maximum_cluster_demand"]
-                    ),
-                    **({
-                        "maximum_zone_demand": float(row["maximum_zone_demand"]),
-                        "normalized_knee_score": float(
-                            row["normalized_knee_score"]
-                        ),
-                        "degradation_from_ideal": dict(
-                            row["degradation_from_ideal"]
-                        ),
-                    } if "maximum_zone_demand" in row else {}),
-                    "representative_solution": representative_by_objective.get(
-                        objective
-                    ),
-                    "representative_role": row.get("representative_role"),
-                    "selected": bool(np.array_equal(
-                        row["chromosome"], result.selected_chromosome
-                    )),
-                })
-            if zone_workload_enabled:
-                extended_selection_rows.append({
-                    "storage_class": profile_label,
-                    "attribute_profile": dict(attribute_profile),
-                    **result.selection,
-                })
             cluster_records = []
             for index, items in enumerate(result.selected_clusters):
                 cluster_demand = int(demands[items].sum(dtype=np.int64)) if items else 0
                 cluster_records.append((cluster_demand, index, items))
-            if zone_workload_enabled:
-                # The chromosome fixes each cluster's zone. Within that zone,
-                # pair hotter clusters with lower-flow racks; never cross zones.
+            cluster_records.sort(key=lambda value: (-value[0], value[1]))
+            rack_targets = list(group_racks)
+            if zone_workload_enabled and len(group_racks) > 1:
+                zone_capacities: dict[str, int] = {}
+                for rack in group_racks:
+                    zone = str(rack.get("zone_id") or "Z01")
+                    zone_capacities[zone] = zone_capacities.get(zone, 0) + capacity
+
+                def assignment_objective(pairs):
+                    demand_by_zone = {zone: 0.0 for zone in zone_capacities}
+                    traffic_by_zone = {zone: 0.0 for zone in zone_capacities}
+                    travel = 0.0
+                    for (cluster_demand, _source, _items), rack in pairs:
+                        zone = str(rack.get("zone_id") or "Z01")
+                        costs = rack_traffic_costs.get(str(rack["rack_id"]), {})
+                        demand_by_zone[zone] += cluster_demand
+                        traffic_by_zone[zone] += cluster_demand * float(
+                            costs.get("resource_flow_per_visit", 0.0)
+                        )
+                        travel += cluster_demand * float(
+                            costs.get("travel_per_visit", rack.get("distance_m", 0.0))
+                        )
+                    demand_values = np.array([
+                        demand_by_zone[zone] / zone_capacities[zone]
+                        for zone in sorted(zone_capacities)
+                    ])
+                    traffic_values = np.array([
+                        traffic_by_zone[zone] / zone_capacities[zone]
+                        for zone in sorted(zone_capacities)
+                    ])
+                    return (
+                        float(demand_values.max(initial=0.0)),
+                        float(traffic_values.max(initial=0.0)),
+                        float(np.percentile(demand_values, 95)),
+                        float(np.percentile(traffic_values, 95)),
+                        float(travel),
+                    )
+
+                # Greedily spread the highest-demand complete shelf clusters,
+                # then improve that deterministic seed with compatible rack swaps.
                 selected_pairs = []
-                for zone in sorted(zone_capacities):
-                    zone_records = sorted(
-                        (
-                            record for record in cluster_records
-                            if str(group_racks[record[1]].get("zone_id") or "Z01")
-                            == zone
-                        ),
-                        key=lambda record: (-record[0], record[1]),
-                    )
-                    zone_racks = sorted(
-                        (
-                            rack for rack in group_racks
-                            if str(rack.get("zone_id") or "Z01") == zone
-                        ),
-                        key=lambda rack: (
-                            float(rack_traffic_costs.get(
-                                str(rack["rack_id"]), {}
-                            ).get("resource_flow_per_visit", 0.0)),
-                            float(rack_traffic_costs.get(
-                                str(rack["rack_id"]), {}
-                            ).get("travel_per_visit", rack.get("distance_m", 0.0))),
-                            str(rack["rack_id"]),
+                remaining = list(group_racks)
+                for record in cluster_records:
+                    rack = min(
+                        remaining,
+                        key=lambda candidate: (
+                            assignment_objective(
+                                selected_pairs + [(record, candidate)]
+                            ),
+                            str(candidate["rack_id"]),
                         ),
                     )
-                    selected_pairs.extend(zip(zone_records, zone_racks))
+                    selected_pairs.append((record, rack))
+                    remaining.remove(rack)
+                current = assignment_objective(selected_pairs)
+                for _pass in range(5):
+                    improved = False
+                    for first in range(len(selected_pairs)):
+                        for second in range(first + 1, len(selected_pairs)):
+                            if (
+                                str(selected_pairs[first][1].get("zone_id") or "Z01")
+                                == str(selected_pairs[second][1].get("zone_id") or "Z01")
+                            ):
+                                continue
+                            candidate = list(selected_pairs)
+                            first_record, first_rack = candidate[first]
+                            second_record, second_rack = candidate[second]
+                            candidate[first] = (first_record, second_rack)
+                            candidate[second] = (second_record, first_rack)
+                            value = assignment_objective(candidate)
+                            if value < current:
+                                selected_pairs, current = candidate, value
+                                improved = True
+                    if not improved:
+                        break
                 cluster_records = [record for record, _rack in selected_pairs]
                 rack_targets = [rack for _record, rack in selected_pairs]
-            else:
-                cluster_records.sort(key=lambda value: (-value[0], value[1]))
-                rack_targets = list(group_racks)
             rng = np.random.default_rng(parameters.random_seed + group_number)
             for accessible_rank, ((cluster_demand, source_cluster, items), rack) in enumerate(
                 zip(cluster_records, rack_targets), start=1
@@ -959,7 +729,6 @@ class CtbsaPlacementPlanner:
                     "source_cluster": source_cluster + 1,
                     "accessible_rank": accessible_rank,
                     "rack_id": str(rack["rack_id"]),
-                    "selected_zone": str(rack.get("zone_id") or "Z01"),
                     "rack_distance": float(rack["distance_m"]),
                     "sku_count": len(skus),
                     "cluster_demand": cluster_demand,
@@ -987,7 +756,6 @@ class CtbsaPlacementPlanner:
                 "generations": parameters.generations,
                 "random_seed": parameters.random_seed,
                 "selected_solution": parameters.selected_solution,
-                "extended_selected_solution": parameters.extended_selected_solution,
                 "cluster_unit": "AMR shelf",
                 "storage_locations_per_cluster": capacity,
                 "active_zone_attribute_keys": active_attribute_keys,
@@ -999,8 +767,7 @@ class CtbsaPlacementPlanner:
                 "multi_rack_sku_extension": (
                     "logical SKU demand is quantity-weighted across independent "
                     "inventory loads; original correlation and maximum-cluster-"
-                    "demand objectives are preserved, with optional normalized "
-                    "zone demand as objective three"
+                    "demand objectives are unchanged"
                 ),
                 "warehouse_hard_constraints": (
                     "AMR shelf only; unique occupied addresses; map-active SKU "
@@ -1010,25 +777,14 @@ class CtbsaPlacementPlanner:
                 "simulation_validation": False,
                 "zone_workload_enabled": bool(zone_workload_enabled),
                 "zone_workload_objective_order": (
-                    "pareto: maximize affinity, minimize maximum shelf demand, "
-                    "minimize maximum normalized zone demand; post-assignment: "
-                    "minimize attributed zone traffic, expected travel, stable rack ID"
+                    "peak_normalized_zone_demand, peak_normalized_zone_traffic, "
+                    "p95_normalized_zone_demand, p95_normalized_zone_traffic, "
+                    "expected_travel, stable_rack_id"
                 ),
                 "zone_workload_normalization": "compatible_usable_rack_slot_capacity",
                 "zone_traffic_attribution": "destination_rack_zone",
                 "zone_optimization_status": (
                     "ENABLED" if zone_workload_enabled else "DISABLED_COMPATIBILITY_PATH"
-                ),
-                "objective_mode": (
-                    "three_objective_affinity_shelf_zone"
-                    if zone_workload_enabled else "paper_two_objective"
-                ),
-                "extended_selection": extended_selection_rows,
-                "pareto_frontier": pareto_frontier_rows,
-                "post_assignment_policy": (
-                    "preserve_pareto_zone_then_minimize_zone_traffic_and_travel"
-                    if zone_workload_enabled
-                    else "demand_ranked_accessible_racks"
                 ),
             },
         )

@@ -4,15 +4,14 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MAP_DIR = PROJECT_ROOT / "resources/map"
 LEGACY_PROJECT_SCHEMA = "rmf_grid_map_editor/v1"
 PROJECT_SCHEMA = "rmf_grid_map_editor/v2"
 LEGACY_SLOTTING_SCHEMA = "inventory_slotting_layout/v1"
 SLOTTING_SCHEMA = "inventory_slotting_layout/v2"
 
-DEFAULT_BUILDING_INPUT = DEFAULT_MAP_DIR / "demo.building.yaml"
-DEFAULT_BUILDING_OUTPUT = DEFAULT_MAP_DIR / "v6.building.yaml"
-DEFAULT_GRID_INPUT = DEFAULT_MAP_DIR / "map1.grid.json"
+DEFAULT_BUILDING_INPUT = PROJECT_ROOT / "resources/map/demo.building.yaml"
+DEFAULT_BUILDING_OUTPUT = PROJECT_ROOT / "resources/map/v6.building.yaml"
+DEFAULT_GRID_INPUT = PROJECT_ROOT / "resources/map/map1.grid.json"
 DEFAULT_AFFINITY_INPUT = PROJECT_ROOT / "resources/data/Sample Data.xlsx"
 DEFAULT_AFFINITY_CACHE = PROJECT_ROOT / ".cache/rmf_grid_map_editor/affinity"
 DEFAULT_AFFINITY_OUTPUT = PROJECT_ROOT / "resources/data/sku_affinity"
@@ -21,13 +20,13 @@ DEFAULT_CHILLED_INPUT = PROJECT_ROOT / "resources/data/demo_chilled_requirements
 DEFAULT_SKU_ATTRIBUTES_INPUT = (
     PROJECT_ROOT / "resources/data/medicine_sku_attributes.csv"
 )
-DEFAULT_SLOTTING_OUTPUT = DEFAULT_MAP_DIR / "basic_slotting_layout.slotting.json"
+DEFAULT_SLOTTING_OUTPUT = PROJECT_ROOT / "resources/data/basic_slotting_layout.slotting.json"
 DEFAULT_TRAFFIC_INPUT = DEFAULT_AFFINITY_INPUT
 DEFAULT_TRAFFIC_CACHE = PROJECT_ROOT / ".cache/rmf_grid_map_editor/traffic"
-DEFAULT_TRAFFIC_OUTPUT = DEFAULT_MAP_DIR / "traffic_aware_layout.slotting.json"
+DEFAULT_TRAFFIC_OUTPUT = PROJECT_ROOT / "resources/data/traffic_aware_layout.slotting.json"
 DEFAULT_TRAFFIC_REPORT = PROJECT_ROOT / "resources/data/traffic_analysis"
 DEFAULT_GLOBAL_TRAFFIC_OUTPUT = (
-    DEFAULT_MAP_DIR / "global_traffic_layout.slotting.json"
+    PROJECT_ROOT / "resources/data/global_traffic_layout.slotting.json"
 )
 
 # Warehouse dimensions are metres and weights are kilograms. A rack contains

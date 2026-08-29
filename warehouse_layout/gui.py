@@ -29,7 +29,6 @@ from .config import (
     DEFAULT_AFFINITY_INPUT,
     DEFAULT_AFFINITY_OUTPUT,
     DEFAULT_GRID_INPUT,
-    DEFAULT_MAP_DIR,
     DEFAULT_BUILDING_OUTPUT,
     DEFAULT_SKU_ATTRIBUTES_INPUT,
     DEFAULT_SLOTTING_OUTPUT,
@@ -40,7 +39,7 @@ from .config import (
     DEFAULT_MACHINE_CAPACITY_BY_SYSTEM,
 )
 from .ctbsa import CtbsaParameters
-from .domain import GridLane, GridPosition, GridProject, GridSpec, Marker, StorageLayout
+from .domain import GridPosition, GridProject, GridSpec, Marker, StorageLayout
 from .inventory import InventoryService
 from .global_traffic_gui import GlobalTrafficOptimizerTab
 from .rmf import RmfMapService
@@ -143,12 +142,8 @@ class GridMapEditorApp:
             self.project.warehouse_storage_defaults
         )
         self.selected: GridPosition | None = None
-        self.selected_lane: GridLane | None = None
         self.bulk_anchor: GridPosition | None = None
         self.bulk_drag_position: GridPosition | None = None
-        self.lane_draw_anchor: GridPosition | None = None
-        self.lane_direction_path: list[GridPosition] = []
-        self.lane_direction_before_snapshot: dict | None = None
         self.undo_stack: list[dict] = []
         self.redo_stack: list[dict] = []
         self.drag_undo_started = False
@@ -182,8 +177,6 @@ class GridMapEditorApp:
         self.spacing = tk.StringVar(value=str(self.project.grid.spacing_m))
         self.spacing_y = tk.StringVar(value=str(self.project.grid.spacing_y_m))
         self.selected_coordinate = tk.StringVar(value="No grid point selected")
-        self.selected_lane_text = tk.StringVar(value="No lane selected")
-        self.lane_direction_choice = tk.StringVar(value="Bidirectional")
         self.selected_x = tk.StringVar()
         self.selected_y = tk.StringVar()
         self.role = tk.StringVar(value="none")
@@ -284,16 +277,6 @@ class GridMapEditorApp:
         canvas.configure(cursor="")
         return "break"
 
-    def reset_grid_view(self):
-        """Return the warehouse map canvas to its default zoom and position."""
-        canvas = getattr(self, "canvas", None)
-        state = self.canvas_viewports.get(canvas)
-        if state is None:
-            return
-        state.update(scale=1.0, offset_x=0.0, offset_y=0.0, pan=None)
-        self.redraw()
-        self.status.set("Warehouse grid view reset.")
-
     def canvas_wheel_zoom(self, canvas, event):
         state = self.canvas_viewports[canvas]
         zoom_in = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
@@ -357,19 +340,7 @@ class GridMapEditorApp:
     def update_canvas_scrollregion(canvas):
         bounds = canvas.bbox("all")
         if bounds:
-            # Keep a generous empty margin around the content.  Using the
-            # exact item bounding box makes Tk clamp panning at the outermost
-            # grid point, which can leave rack/zone overlays under the viewport
-            # edge after zooming.
-            left, top, right, bottom = bounds
-            margin_x = max(200, canvas.winfo_width() * 1.5)
-            margin_y = max(200, canvas.winfo_height() * 1.5)
-            canvas.configure(
-                scrollregion=(
-                    left - margin_x, top - margin_y,
-                    right + margin_x, bottom + margin_y,
-                )
-            )
+            canvas.configure(scrollregion=bounds)
 
     @staticmethod
     def bind_mousewheel_tree(widget, callback):
@@ -516,14 +487,10 @@ class GridMapEditorApp:
         ttk.Entry(spacing_frame, textvariable=self.spacing, width=8).pack(side="left")
         ttk.Label(spacing_frame, text="/").pack(side="left", padx=3)
         ttk.Entry(spacing_frame, textvariable=self.spacing_y, width=8).pack(side="left")
-        ttk.Button(left, text="Resize grid (keep layout)", command=self.resize_grid).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 2))
-        view_actions = ttk.Frame(left)
-        view_actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        ttk.Button(view_actions, text="Reset grid", command=self.generate_grid).pack(side="left", expand=True, fill="x")
-        ttk.Button(view_actions, text="Reset view", command=self.reset_grid_view).pack(side="left", expand=True, fill="x", padx=(4, 0))
-        ttk.Label(left, textvariable=self.summary, foreground="#4d646d").grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        ttk.Button(left, text="Generate / reset grid", command=self.generate_grid).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        ttk.Label(left, textvariable=self.summary, foreground="#4d646d").grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 14))
 
-        ttk.Separator(left).grid(row=9, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Separator(left).grid(row=8, column=0, columnspan=2, sticky="ew", pady=4)
         tools = [
             ("Select / edit", "select"),
             ("Fill racks (drag rectangle)", "rack_rectangle"),
@@ -535,58 +502,19 @@ class GridMapEditorApp:
             ttk.Radiobutton(left, text=label, variable=self.tool, value=value).grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
         delete_tools = ttk.Frame(left)
         delete_tools.grid(row=15, column=0, columnspan=2, sticky="w")
-        point_tools = ttk.Frame(delete_tools)
-        point_tools.pack(anchor="w")
         ttk.Radiobutton(
-            point_tools, text="Draw points", variable=self.tool,
-            value="draw_grid", command=self.redraw,
-        ).pack(side="left")
-        ttk.Radiobutton(
-            point_tools, text="Delete points", variable=self.tool,
+            delete_tools, text="Delete points", variable=self.tool,
             value="delete_grid",
-        ).pack(side="left", padx=(8, 0))
-        lane_tools = ttk.Frame(delete_tools)
-        lane_tools.pack(anchor="w", pady=(2, 0))
-        ttk.Radiobutton(
-            lane_tools, text="Draw lanes", variable=self.tool,
-            value="draw_lane", command=self.redraw,
         ).pack(side="left")
         ttk.Radiobutton(
-            lane_tools, text="Delete lanes", variable=self.tool,
+            delete_tools, text="Delete lanes", variable=self.tool,
             value="delete_lane",
-        ).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(
-            lane_tools, text="Set direction (drag lane)", variable=self.tool,
-            value="lane_direction",
         ).pack(side="left", padx=(8, 0))
 
         ttk.Label(left, text="Rack ID prefix").grid(row=16, column=0, sticky="w", pady=(7, 3))
         ttk.Entry(left, textvariable=self.rack_prefix, width=19).grid(row=16, column=1, sticky="ew", pady=(7, 3))
 
-        lane_editor = ttk.Frame(left)
-        lane_editor.grid(row=17, column=0, columnspan=2, sticky="ew", pady=(7, 5))
-        ttk.Label(
-            lane_editor, textvariable=self.selected_lane_text,
-            foreground="#315b66", wraplength=250,
-        ).pack(anchor="w")
-        lane_choice_row = ttk.Frame(lane_editor)
-        lane_choice_row.pack(fill="x", pady=(3, 0))
-        self.lane_direction_box = ttk.Combobox(
-            lane_choice_row,
-            textvariable=self.lane_direction_choice,
-            state="readonly",
-            values=("Bidirectional",),
-            width=22,
-        )
-        self.lane_direction_box.pack(side="left", expand=True, fill="x")
-        ttk.Button(
-            lane_choice_row, text="Apply", command=self.apply_lane_direction,
-        ).pack(side="left", padx=(4, 0))
-        ttk.Label(
-            lane_editor,
-            text="Plain lane = bidirectional · arrow = one-way",
-            foreground="#4d646d",
-        ).pack(anchor="w", pady=(2, 0))
+        ttk.Separator(left).grid(row=17, column=0, columnspan=2, sticky="ew", pady=7)
         ttk.Label(left, textvariable=self.selected_coordinate).grid(row=19, column=0, columnspan=2, sticky="w", pady=(3, 6))
         ttk.Label(left, text="Position X / Y (m)").grid(row=20, column=0, sticky="w", pady=3)
         coordinate_frame = ttk.Frame(left)
@@ -710,8 +638,8 @@ class GridMapEditorApp:
         ttk.Button(left, text="Load grid project JSON…", command=self.load_project_dialog).grid(row=48, column=0, columnspan=2, sticky="ew", pady=2)
         ttk.Button(left, text="Export RMF building YAML…", command=self.export_yaml_dialog).grid(row=49, column=0, columnspan=2, sticky="ew", pady=(5, 2))
 
-        self.add_grid_sidebar_section(left, "grid", "WAREHOUSE GRID", 0, range(1, 9))
-        self.add_grid_sidebar_section(left, "tools", "CLICK TOOLS", 9, range(10, 18))
+        self.add_grid_sidebar_section(left, "grid", "WAREHOUSE GRID", 0, range(1, 8))
+        self.add_grid_sidebar_section(left, "tools", "CLICK TOOLS", 9, range(10, 17))
         self.add_grid_sidebar_section(left, "point", "SELECTED GRID POINT", 18, range(19, 24))
         self.add_grid_sidebar_section(left, "buffers", "STORAGE BUFFERS", 25, range(26, 31))
         self.add_grid_sidebar_section(left, "settings", "WAREHOUSE SETTINGS", 32, range(33, 41))
@@ -1261,7 +1189,7 @@ class GridMapEditorApp:
                 row["sku_count"],
                 row["total_required_ea"],
                 row["required_slots"],
-                row["required_racks"],
+                f'{row["required_racks"]}{"+" if row["unresolved_skus"] else ""}',
                 row["unresolved_skus"],
             ))
         summary = copy.deepcopy(self.project.sku_attribute_summary)
@@ -2410,7 +2338,6 @@ class GridMapEditorApp:
         self.traffic_ctbsa_population = tk.StringVar(value="100")
         self.traffic_ctbsa_generations = tk.StringVar(value="50000")
         self.traffic_ctbsa_solution = tk.StringVar(value="3")
-        self.traffic_ctbsa_extended_solution = tk.StringVar(value="Auto")
         self.traffic_ctbsa_seed = tk.StringVar(value="0")
         self.traffic_zone_workload_enabled = tk.BooleanVar(value=False)
         self.traffic_zone_overlay = tk.StringVar(value="Off")
@@ -2643,14 +2570,6 @@ class GridMapEditorApp:
             text="Balance workload across zones",
             variable=self.traffic_zone_workload_enabled,
         ).pack(side="left", padx=(10, 0))
-        ttk.Label(parameters, text="Zone solution").pack(side="left", padx=(8, 3))
-        ttk.Combobox(
-            parameters,
-            textvariable=self.traffic_ctbsa_extended_solution,
-            state="readonly",
-            values=("Auto", "1", "2", "3", "4", "5"),
-            width=5,
-        ).pack(side="left")
 
         ttk.Label(traffic_settings, text="Optimized layout output").grid(
             row=5, column=0, sticky="w", pady=3
@@ -2685,16 +2604,11 @@ class GridMapEditorApp:
             text="Run Direct C&TBSA",
             command=self.start_full_traffic_pipeline,
         )
-        self.traffic_load_saved_button = ttk.Button(
-            actions,
-            text="Load saved run…",
-            command=self.load_saved_traffic_layout,
-        )
         self.traffic_cancel_button = ttk.Button(actions, text="Cancel", command=self.cancel_traffic_work, state="disabled")
         self.traffic_save_button = ttk.Button(actions, text="Save layout", command=self.save_traffic_layout, state="disabled")
         self.traffic_export_button = ttk.Button(actions, text="Export report…", command=self.export_traffic_report, state="disabled")
         for widget in (
-            self.traffic_full_button, self.traffic_load_saved_button,
+            self.traffic_full_button,
             self.traffic_cancel_button,
             self.traffic_save_button, self.traffic_export_button,
         ):
@@ -2737,7 +2651,7 @@ class GridMapEditorApp:
         view_box = ttk.Combobox(
             view_actions, textvariable=self.traffic_view_mode,
             state="readonly",
-            values=("Feasibility seed", "C&TBSA result", "Saved result"), width=17,
+            values=("Feasibility seed", "C&TBSA result"), width=17,
         )
         view_box.pack(side="left", padx=(6, 0))
         view_box.bind(
@@ -2785,13 +2699,12 @@ class GridMapEditorApp:
         details.rowconfigure(0, weight=1)
         tabs = ttk.Notebook(details)
         tabs.grid(row=0, column=0, sticky="nsew")
-        resource_tab, zone_tab, pareto_tab, relocation_tab, rejected_tab, parameter_tab = (
+        resource_tab, zone_tab, relocation_tab, rejected_tab, parameter_tab = (
             ttk.Frame(tabs), ttk.Frame(tabs), ttk.Frame(tabs), ttk.Frame(tabs),
-            ttk.Frame(tabs), ttk.Frame(tabs),
+            ttk.Frame(tabs),
         )
         tabs.add(resource_tab, text="Congested Resources")
         tabs.add(zone_tab, text="Zone Workload")
-        tabs.add(pareto_tab, text="Pareto Solutions")
         tabs.add(relocation_tab, text="Relocations")
         tabs.add(rejected_tab, text="Fixed / Rejected")
         tabs.add(parameter_tab, text="Parameters")
@@ -2808,13 +2721,6 @@ class GridMapEditorApp:
              ("traffic", "Traffic", 85), ("traffic_norm", "Traffic / cap", 95),
              ("racks", "Occupied racks", 95), ("skus", "SKUs", 65),
              ("quantity", "Quantity EA", 90)),
-        )
-        self.traffic_pareto_tree = self._traffic_tree(
-            pareto_tab,
-            (("profile", "Profile", 125), ("solution", "Solution", 65),
-             ("affinity", "Affinity", 80), ("shelf", "Shelf peak", 80),
-             ("zone", "Zone peak", 80), ("knee", "Knee score", 80),
-             ("role", "Representative", 120)),
         )
         self.traffic_relocation_tree = self._traffic_tree(
             relocation_tab,
@@ -2980,15 +2886,11 @@ class GridMapEditorApp:
                 date.fromisoformat(self.traffic_end_date.get())
                 if self.traffic_end_date.get().strip() else None
             )
-            extended_solution = self.traffic_ctbsa_extended_solution.get().strip()
             ctbsa_parameters = CtbsaParameters(
                 population_size=int(self.traffic_ctbsa_population.get()),
                 generations=int(self.traffic_ctbsa_generations.get()),
                 random_seed=int(self.traffic_ctbsa_seed.get()),
                 selected_solution=int(self.traffic_ctbsa_solution.get()),
-                extended_selected_solution=(
-                    None if extended_solution == "Auto" else int(extended_solution)
-                ),
             )
             ctbsa_parameters.validate()
             grid_project = self.rmf_maps.load_project(grid_project_path)
@@ -3105,7 +3007,6 @@ class GridMapEditorApp:
     def _set_traffic_busy(self, busy):
         state = "disabled" if busy else "normal"
         self.traffic_full_button.configure(state=state)
-        self.traffic_load_saved_button.configure(state=state)
         self.traffic_cancel_button.configure(state="normal" if busy else "disabled")
         self.traffic_save_button.configure(
             state="disabled" if busy or self.traffic_output_payload is None else "normal"
@@ -3218,10 +3119,6 @@ class GridMapEditorApp:
             self.traffic_ctbsa_population.set(str(params["population_size"]))
             self.traffic_ctbsa_generations.set(str(params["generations"]))
             self.traffic_ctbsa_solution.set(str(params["selected_solution"]))
-            self.traffic_ctbsa_extended_solution.set(
-                "Auto" if params.get("extended_selected_solution") is None
-                else str(params["extended_selected_solution"])
-            )
             self.traffic_ctbsa_seed.set(str(params["random_seed"]))
             self.traffic_parameter_status.set(
                 "Paper C&TBSA completed; zone balancing "
@@ -3238,103 +3135,9 @@ class GridMapEditorApp:
         self.populate_traffic_results()
         self.draw_traffic_map()
 
-    def load_saved_traffic_layout(self, path=None):
-        """Restore a saved run and rebuild its expected resource heatmap."""
-        if path is None:
-            path = filedialog.askopenfilename(
-                title="Load saved traffic-aware slotting layout",
-                initialdir=str(DEFAULT_TRAFFIC_OUTPUT.parent),
-                filetypes=(
-                    ("Slotting layout", "*.slotting.json"),
-                    ("JSON", "*.json"),
-                ),
-            )
-        if not path:
-            return False
-        try:
-            source = Path(path).expanduser().resolve()
-            payload = self.layouts.load(source)
-            building = payload.get("building")
-            if not isinstance(building, dict) or not building.get("levels"):
-                raise ValueError("saved traffic-aware layout has no embedded RMF map")
-            network_source = str(
-                (payload.get("sources") or {}).get("traffic_network") or ""
-            ).strip()
-            network_type = str(
-                (payload.get("traffic_configuration") or {}).get("network_type")
-                or "embedded_rmf"
-            )
-            if network_type != "embedded_rmf" and network_source not in {
-                "", "embedded_rmf"
-            }:
-                network_path = Path(network_source).expanduser()
-                if not network_path.exists():
-                    raise ValueError(
-                        "saved run requires its external movement network: "
-                        f"{network_path}"
-                    )
-                network = self.traffic.load_network(network_path)
-            else:
-                network = self.traffic.network_from_rmf(building)
-            result = self.traffic.restore_saved_result(payload, network)
-        except (OSError, ValueError, TypeError, KeyError) as exc:
-            messagebox.showerror("Load saved traffic-aware run", str(exc))
-            return False
-
-        self.traffic_baseline_payload = payload
-        self.traffic_dataset = None
-        self.traffic_network = network
-        self.traffic_demand = result.after.demand
-        self.traffic_analysis = result.after
-        self.traffic_result = result
-        self.traffic_output_payload = payload
-        self.traffic_pipeline_result = None
-        self.traffic_last_workflow = "saved_run"
-        self.traffic_building = building
-        self.traffic_grid_project = None
-        self.traffic_storage_layout = None
-        self.traffic_selected_unit = None
-        self.traffic_zone_assignments = copy.deepcopy(
-            payload.get("zone_assignments") or {}
-        )
-        self.traffic_location_attributes = copy.deepcopy(
-            payload.get("location_attributes") or {}
-        )
-        self.traffic_attribute_catalog = copy.deepcopy(
-            payload.get("attribute_catalog") or {}
-        )
-        self.traffic_output_path.set(str(source))
-        self.traffic_view_mode.set("Saved result")
-        parameters = result.parameters
-        if parameters.get("population_size") is not None:
-            self.traffic_ctbsa_population.set(str(parameters["population_size"]))
-        if parameters.get("generations") is not None:
-            self.traffic_ctbsa_generations.set(str(parameters["generations"]))
-        if parameters.get("selected_solution") is not None:
-            self.traffic_ctbsa_solution.set(str(parameters["selected_solution"]))
-        self.traffic_ctbsa_extended_solution.set(
-            "Auto" if parameters.get("extended_selected_solution") is None
-            else str(parameters["extended_selected_solution"])
-        )
-        self.traffic_zone_workload_enabled.set(bool(
-            parameters.get("zone_workload_enabled", False)
-        ))
-        self.traffic_parameter_status.set(
-            "Saved run loaded; expected resource traffic rebuilt from saved final visits."
-        )
-        self.traffic_progress_value.set(100)
-        self._set_traffic_busy(False)
-        self.populate_traffic_results()
-        self.traffic_status.set(
-            f"Loaded saved traffic-aware run from {source}; no slotting rerun performed."
-        )
-        self.draw_traffic_map()
-        return True
-
     def populate_traffic_results(self):
         for tree in (
             self.traffic_resource_tree, self.traffic_zone_tree,
-            self.traffic_pareto_tree,
             self.traffic_relocation_tree,
             self.traffic_rejected_tree, self.traffic_parameter_tree,
         ):
@@ -3475,7 +3278,7 @@ class GridMapEditorApp:
             ), tags=(f"resource:{resource}",))
         displayed_zone_analysis = (
             after.zone_analysis
-            if self.traffic_result and self.traffic_view_mode.get() != "Feasibility seed"
+            if self.traffic_result and self.traffic_view_mode.get() == "C&TBSA result"
             else before.zone_analysis
         )
         for row in displayed_zone_analysis.get("zones", []):
@@ -3489,28 +3292,6 @@ class GridMapEditorApp:
                 f"{int(row['sku_count']):,}", f"{row['quantity_ea']:g}",
             ))
         if self.traffic_result:
-            pareto_display = self.traffic_result.parameters.get(
-                "pareto_frontier"
-            ) or self.traffic_result.trials
-            for row in pareto_display:
-                self.traffic_pareto_tree.insert("", "end", values=(
-                    row.get("storage_class", ""),
-                    row.get("representative_solution", row.get("solution", "")),
-                    row.get("correlation", ""),
-                    row.get("maximum_cluster_demand", ""),
-                    (
-                        f"{float(row['maximum_zone_demand']):.4f}"
-                        if "maximum_zone_demand" in row else "—"
-                    ),
-                    (
-                        f"{float(row['normalized_knee_score']):.4f}"
-                        if "normalized_knee_score" in row else "—"
-                    ),
-                    (
-                        ("SELECTED · " if row.get("selected") else "")
-                        + str(row.get("representative_role") or "frontier")
-                    ),
-                ))
             for row in self.traffic_result.relocations:
                 self.traffic_relocation_tree.insert("", "end", values=(
                     row["handling_unit_id"], row.get("sku", ""),
@@ -3541,10 +3322,6 @@ class GridMapEditorApp:
                 "crossover_probability": "PMX crossover probability",
                 "mutation_probability": "2-opt mutation probability",
                 "selected_solution": "Selected C&TBSA solution",
-                "extended_selected_solution": "Extended zone solution",
-                "objective_mode": "C&TBSA objective mode",
-                "extended_selection": "Extended Pareto selection",
-                "post_assignment_policy": "Post-assignment policy",
                 "zone_workload_enabled": "Zone workload objective",
                 "zone_workload_objective_order": "Zone objective order",
                 "zone_workload_normalization": "Zone normalization",
@@ -3567,7 +3344,7 @@ class GridMapEditorApp:
             for key, value in self.traffic_result.parameters.items():
                 if key in {
                     "clusters", "regenerated_summary", "zone_analysis_before",
-                    "zone_analysis_after", "extended_selection", "pareto_frontier",
+                    "zone_analysis_after",
                 }:
                     continue
                 if key == "hard_rules":
@@ -3580,19 +3357,6 @@ class GridMapEditorApp:
                         f"{int(value.get('excluded_unassigned_sku_count', 0)):,}"
                     )
                 self.traffic_parameter_tree.insert("", "end", values=(labels.get(key, key), value))
-            for index, selection in enumerate(
-                self.traffic_result.parameters.get("extended_selection", []),
-                start=1,
-            ):
-                degradation = selection.get("selected_degradation_from_ideal", {})
-                self.traffic_parameter_tree.insert("", "end", values=(
-                    f"Extended Pareto profile {index}",
-                    f"{selection.get('mode', '—')} · "
-                    f"knee {float(selection.get('selected_knee_score', 0)):.4f} · "
-                    f"affinity Δ {float(degradation.get('affinity_percent', 0)):.2f}% · "
-                    f"shelf Δ {float(degradation.get('shelf_workload_percent', 0)):.2f}% · "
-                    f"zone Δ {float(degradation.get('zone_workload_percent', 0)):.2f}%",
-                ))
 
     def _traffic_geometry(self):
         nodes = list(self.traffic_network.nodes.values())
@@ -3636,7 +3400,7 @@ class GridMapEditorApp:
         """Return one readable rack marker for every storage node."""
         rows = (
             self.traffic_result.assignments
-            if self.traffic_result and self.traffic_view_mode.get() != "Feasibility seed"
+            if self.traffic_result and self.traffic_view_mode.get() == "C&TBSA result"
             else (self.traffic_baseline_payload or {}).get("assignments", [])
         )
         racks = {}
@@ -3755,7 +3519,7 @@ class GridMapEditorApp:
             return
         analysis = (
             self.traffic_result.after
-            if self.traffic_result and self.traffic_view_mode.get() != "Feasibility seed"
+            if self.traffic_result and self.traffic_view_mode.get() == "C&TBSA result"
             else self.traffic_result.before if self.traffic_result else self.traffic_analysis
         )
         resource_rows = {row["resource_id"]: row for row in analysis.resources}
@@ -3920,7 +3684,7 @@ class GridMapEditorApp:
             analysis = (
                 self.traffic_result.after
                 if self.traffic_result
-                and self.traffic_view_mode.get() != "Feasibility seed"
+                and self.traffic_view_mode.get() == "C&TBSA result"
                 else self.traffic_analysis
             )
             row = next((row for row in analysis.resources if row["resource_id"] == resource), None)
@@ -5655,7 +5419,7 @@ class GridMapEditorApp:
                 row["sku_count"],
                 row["total_required_ea"],
                 row["required_slots"],
-                row["required_racks"],
+                f'{row["required_racks"]}{"+" if row["unresolved_skus"] else ""}',
                 row["unresolved_skus"],
             ))
         summary = copy.deepcopy(self.project.sku_attribute_summary)
@@ -5695,88 +5459,11 @@ class GridMapEditorApp:
         self.sync_grid_storage_controls()
         self.sync_grid_sku_attribute_controls()
         self.selected = None
-        self.selected_lane = None
         self.bulk_anchor = None
         self.bulk_drag_position = None
-        self.lane_draw_anchor = None
         self.update_selected_editor()
-        self.update_selected_lane_editor()
         self.redraw()
         self.status.set("Grid generated. All neighbouring points are connected bidirectionally.")
-
-    def resize_grid(self):
-        """Resize the lattice while retaining the existing layout edits."""
-        try:
-            spec = self.spec_from_inputs()
-        except ValueError as exc:
-            messagebox.showerror("Invalid grid", str(exc)); return
-
-        old_spec = self.project.grid
-        if spec.spacing_m != old_spec.spacing_m or spec.spacing_y_m != old_spec.spacing_y_m:
-            messagebox.showerror(
-                "Cannot change grid spacing",
-                "Resize changes the warehouse extent only. Keep the current grid spacing to preserve the layout.",
-            )
-            return
-        if spec.width_m == old_spec.width_m and spec.length_m == old_spec.length_m:
-            self.status.set("Grid size is unchanged; existing layout preserved.")
-            return
-
-        new_columns, new_rows = spec.columns, spec.rows
-        in_bounds = lambda position: (
-            0 <= position[0] <= new_columns and 0 <= position[1] <= new_rows
-        )
-        removed_markers = [position for position in self.project.markers if not in_bounds(position)]
-        if removed_markers and not messagebox.askyesno(
-            "Shrink grid",
-            f"{len(removed_markers)} marker(s) fall outside the new size and will be removed. Continue?",
-        ):
-            return
-
-        self.push_undo()
-        self.project.grid = spec
-        self.project.markers = {
-            position: marker for position, marker in self.project.markers.items()
-            if in_bounds(position)
-        }
-        self.project.deleted_positions = {
-            position for position in self.project.deleted_positions if in_bounds(position)
-        }
-        self.project.coordinate_overrides = {
-            position: coordinates for position, coordinates in self.project.coordinate_overrides.items()
-            if in_bounds(position) and position not in self.project.deleted_positions
-        }
-        generated_lanes = set(self.project._iter_connected_lane_positions())
-        self.project.deleted_lanes &= generated_lanes
-        active_positions = set(self.project.iter_positions())
-        self.project.added_lanes = {
-            lane for lane in self.project.added_lanes
-            if lane[0] in active_positions and lane[1] in active_positions
-        }
-        active_lanes = (generated_lanes - self.project.deleted_lanes) | self.project.added_lanes
-        self.project.one_way_lanes = {
-            lane for lane in self.project.one_way_lanes if lane in active_lanes
-        }
-        rack_waypoints = {
-            self.project.vertex_name(*position)
-            for position, marker in self.project.markers.items()
-            if marker.role == "rack"
-        }
-        self.project.zone_assignments = {
-            waypoint: zone for waypoint, zone in self.project.zone_assignments.items()
-            if waypoint in rack_waypoints
-        }
-        if self.project.storage_layout is not None:
-            self.project.storage_layout.buffers = [
-                item for item in self.project.storage_layout.buffers
-                if (int(item["column"]), int(item["row"])) in self.project.markers
-            ]
-        self.selected = None
-        self.selected_lane = None
-        self.redraw()
-        self.status.set(
-            f"Grid resized to {spec.width_m:g} × {spec.length_m:g} m; existing layout preserved."
-        )
 
     def sync_grid_storage_controls(self):
         layout = self.project.storage_layout
@@ -5978,16 +5665,6 @@ class GridMapEditorApp:
             *self.project.coordinates(column, row)
         )
 
-    def grid_position_screen_point(self, position: GridPosition):
-        """Return a screen point for either an active or deleted lattice point."""
-        if position not in self.project.deleted_positions:
-            return self.screen_point(*position)
-        column, row = position
-        return self.physical_screen_point(
-            self.project.grid.x_coordinate(column),
-            self.project.grid.y_coordinate(row),
-        )
-
     def redraw(self):
         if not hasattr(self, "canvas"): return
         self._grid_geometry = self.calculate_grid_geometry()
@@ -6000,48 +5677,11 @@ class GridMapEditorApp:
             outline="#aab7bc", dash=(5, 4), width=2,
             tags=("warehouse_boundary",),
         )
-        for lane in self.project.iter_lane_positions():
-            direction = self.project.one_way_direction(lane)
-            start, end = direction or lane
+        for start, end in self.project.iter_lane_positions():
             x1, y1 = self.screen_point(*start)
             x2, y2 = self.screen_point(*end)
-            selected = (
-                self.selected_lane is not None
-                and self.project.normalized_lane(*self.selected_lane) == lane
-            )
-            options = {
-                "fill": "#7b2cbf" if selected else "#2b7bbb" if direction else "#c5d0d4",
-                "width": 3 if selected else 2 if direction else 1,
-                "tags": ("grid_lane", "one_way_lane" if direction else "bidirectional_lane"),
-            }
-            self.canvas.create_line(x1, y1, x2, y2, **options)
-            if direction is not None:
-                # Keep the direction indicator visible on long lanes by drawing
-                # a compact arrow around the physical segment midpoint.
-                arrow_start_x = x1 + (x2 - x1) * 0.40
-                arrow_start_y = y1 + (y2 - y1) * 0.40
-                arrow_end_x = x1 + (x2 - x1) * 0.60
-                arrow_end_y = y1 + (y2 - y1) * 0.60
-                self.canvas.create_line(
-                    arrow_start_x, arrow_start_y, arrow_end_x, arrow_end_y,
-                    fill=options["fill"], width=options["width"],
-                    arrow=tk.LAST, arrowshape=(8, 10, 3),
-                    tags=("grid_lane_arrow", "one_way_lane_arrow"),
-                )
-        for position in sorted(self.project.deleted_positions):
-            x, y = self.grid_position_screen_point(position)
-            self.canvas.create_oval(
-                x - 5, y - 5, x + 5, y + 5,
-                outline="#aab7bc", dash=(2, 2),
-                tags=("deleted_grid_point",),
-            )
             self.canvas.create_line(
-                x - 3, y - 3, x + 3, y + 3,
-                fill="#aab7bc", tags=("deleted_grid_point",),
-            )
-            self.canvas.create_line(
-                x - 3, y + 3, x + 3, y - 3,
-                fill="#aab7bc", tags=("deleted_grid_point",),
+                x1, y1, x2, y2, fill="#d7dfe2", tags=("grid_lane",)
             )
         radius = max(
             2,
@@ -6163,20 +5803,6 @@ class GridMapEditorApp:
                 self.canvas.create_oval(
                     x-9, y-9, x+9, y+9, outline="#7b2cbf", width=3
                 )
-        if self.lane_draw_anchor is not None:
-            x, y = self.screen_point(*self.lane_draw_anchor)
-            target = self.bulk_drag_position or self.lane_draw_anchor
-            drag_x, drag_y = self.screen_point(*target)
-            self.canvas.create_line(
-                x, y, drag_x, drag_y,
-                fill="#087f8c", width=3, dash=(6, 3),
-                tags=("lane_draw_preview",),
-            )
-            self.canvas.create_oval(
-                x - 8, y - 8, x + 8, y + 8,
-                outline="#087f8c", width=2,
-                tags=("lane_draw_preview",),
-            )
         x0, y0 = self.physical_screen_point(0, 0)
         self.canvas.create_text(x0, y0+20, text="(0, 0)", anchor="n", fill="#087f8c", font=("TkDefaultFont", 9, "bold"))
         self.apply_canvas_viewport(self.canvas)
@@ -6184,9 +5810,7 @@ class GridMapEditorApp:
         self.summary.set(
             f"{spec.columns} columns × {spec.rows} rows\n"
             f"{self.project.vertex_count:,} vertices · "
-            f"{self.project.edge_count:,} lanes · "
-            f"{self.project.one_way_lane_count:,} one-way / "
-            f"{self.project.bidirectional_lane_count:,} bidirectional"
+            f"{self.project.edge_count:,} edges"
         )
         self.update_grid_zone_summary()
 
@@ -6238,7 +5862,7 @@ class GridMapEditorApp:
             )
             unresolved = int(combination.get("unresolved_skus", 0))
             rack_text = (
-                f"{int(racks):,} racks"
+                f"{int(racks):,}{'+' if unresolved else ''} racks"
                 if racks is not None else "unresolved"
             )
             display_rows.append((
@@ -6330,30 +5954,21 @@ class GridMapEditorApp:
                 matching_racks += rack_count
         return matching_racks >= required_racks
 
-    def nearest_position(
-        self, event, *, include_deleted: bool = False
-    ) -> GridPosition | None:
+    def nearest_position(self, event) -> GridPosition | None:
         event_x, event_y = self.canvas_viewport_inverse_point(
             self.canvas, event.x, event.y
         )
-        if include_deleted:
-            positions = [
-                (column, row)
-                for row in range(self.project.grid.rows + 1)
-                for column in range(self.project.grid.columns + 1)
-            ]
-        else:
-            positions = list(self.project.iter_positions())
+        positions = list(self.project.iter_positions())
         if not positions:
             return None
         position = min(
             positions,
             key=lambda item: math.hypot(
-                event_x - self.grid_position_screen_point(item)[0],
-                event_y - self.grid_position_screen_point(item)[1],
+                event_x - self.screen_point(*item)[0],
+                event_y - self.screen_point(*item)[1],
             ),
         )
-        x, y = self.grid_position_screen_point(position)
+        x, y = self.screen_point(*position)
         scale = self.geometry()[1]
         if math.hypot(event_x-x, event_y-y) <= max(
             12,
@@ -6409,11 +6024,6 @@ class GridMapEditorApp:
         self.grid_overlay_pointer_down = False
         self.canvas.focus_set()
         action = self.tool.get()
-        if action != "draw_lane":
-            self.lane_draw_anchor = None
-        if action != "lane_direction":
-            self.lane_direction_path = []
-            self.lane_direction_before_snapshot = None
         if action == "delete_lane":
             lane = self.nearest_lane(event)
             if lane is None:
@@ -6423,70 +6033,6 @@ class GridMapEditorApp:
             self.delete_grid_lane(lane)
             self.redraw()
             return
-        if action == "lane_direction":
-            position = self.nearest_position(event)
-            lane = self.nearest_lane(event)
-            if position is None and lane is None:
-                return
-            if position is None:
-                start, end = lane
-                start_screen = self.screen_point(*start)
-                end_screen = self.screen_point(*end)
-                start_distance = math.hypot(
-                    event.x - start_screen[0], event.y - start_screen[1]
-                )
-                end_distance = math.hypot(
-                    event.x - end_screen[0], event.y - end_screen[1]
-                )
-                position = start if start_distance <= end_distance else end
-            self.lane_direction_path = [position]
-            self.lane_direction_before_snapshot = self.snapshot()
-            if lane is not None:
-                self.select_grid_lane(lane)
-            self.selected = None
-            self.update_selected_editor()
-            self.status.set(
-                f"Drag from {self.project.vertex_name(*position)} along the corridor; release to set directions."
-            )
-            self.redraw()
-            return
-        if action == "draw_grid":
-            position = self.nearest_position(event, include_deleted=True)
-            if position is None:
-                return
-            if position in self.project.deleted_positions:
-                self.push_undo()
-                self.drag_undo_started = True
-                self.draw_grid_position(position)
-            else:
-                self.status.set(
-                    f"{self.project.vertex_name(*position)} is already active."
-                )
-            self.selected = position
-            self.selected_lane = None
-            self.update_selected_editor()
-            self.update_selected_lane_editor()
-            self.redraw()
-            return
-        if action == "draw_lane":
-            position = self.nearest_position(event)
-            if position is None:
-                return
-            self.lane_draw_anchor = position
-            self.bulk_drag_position = position
-            self.selected = position
-            self.selected_lane = None
-            self.update_selected_editor()
-            self.update_selected_lane_editor()
-            self.status.set(
-                f"Drawing lane from {self.project.vertex_name(*position)}; "
-                "drag to another active point."
-            )
-            self.redraw()
-            return
-        if self.selected_lane is not None:
-            self.selected_lane = None
-            self.update_selected_lane_editor()
         position = self.nearest_position(event)
         if position is None: return
         if action == "clear":
@@ -6527,70 +6073,6 @@ class GridMapEditorApp:
         if getattr(self, "grid_overlay_pointer_down", False):
             return "break"
         action = self.tool.get()
-        if action == "draw_grid":
-            position = self.nearest_position(event, include_deleted=True)
-            if position is None or position not in self.project.deleted_positions:
-                return
-            if not self.drag_undo_started:
-                self.push_undo(); self.drag_undo_started = True
-            self.draw_grid_position(position)
-            self.selected = position
-            self.update_selected_editor()
-            self.redraw()
-            return
-        if action == "draw_lane":
-            if self.lane_draw_anchor is None:
-                return
-            position = self.nearest_position(event)
-            if position is None:
-                return
-            self.bulk_drag_position = position
-            self.selected = position
-            self.update_selected_editor()
-            self.redraw()
-            return
-        if action == "lane_direction":
-            if not self.lane_direction_path:
-                return
-            position = self.nearest_position(event)
-            previous = self.lane_direction_path[-1]
-            if position is not None and position != previous:
-                previous_path_length = len(self.lane_direction_path)
-                column_delta = position[0] - previous[0]
-                row_delta = position[1] - previous[1]
-                if column_delta == 0 and row_delta != 0:
-                    step = 1 if row_delta > 0 else -1
-                    self.lane_direction_path.extend(
-                        (position[0], row)
-                        for row in range(previous[1] + step, position[1] + step, step)
-                    )
-                elif row_delta == 0 and column_delta != 0:
-                    step = 1 if column_delta > 0 else -1
-                    self.lane_direction_path.extend(
-                        (column, position[1])
-                        for column in range(previous[0] + step, position[0] + step, step)
-                    )
-                else:
-                    self.status.set("Follow connected horizontal or vertical grid lanes.")
-                if len(self.lane_direction_path) > previous_path_length:
-                    try:
-                        for start, end in zip(
-                            self.lane_direction_path[previous_path_length - 1:-1],
-                            self.lane_direction_path[previous_path_length:],
-                        ):
-                            self.project.set_lane_direction(
-                                self.project.normalized_lane(start, end), (start, end)
-                            )
-                        self.project.validate()
-                    except ValueError:
-                        del self.lane_direction_path[previous_path_length:]
-                    else:
-                        self.redraw()
-            if position is not None:
-                self.status.set(
-                    f"{max(0, len(self.lane_direction_path) - 1)} corridor segment(s) selected."
-                )
-            return
         if action == "delete_lane":
             lane = self.nearest_lane(event)
             if lane is None:
@@ -6634,60 +6116,6 @@ class GridMapEditorApp:
             self.grid_overlay_pointer_down = False
             return "break"
         action = self.tool.get()
-        if action == "draw_lane" and self.lane_draw_anchor is not None:
-            position = self.nearest_position(event) or self.bulk_drag_position
-            start = self.lane_draw_anchor
-            self.lane_draw_anchor = None
-            self.bulk_drag_position = None
-            if position is not None and position != start:
-                self.draw_grid_lane(start, position)
-            else:
-                self.status.set("Drag to a different active point to draw a lane.")
-            self.redraw()
-        if action == "lane_direction" and self.lane_direction_path:
-            path = self.lane_direction_path
-            self.lane_direction_path = []
-            before = self.lane_direction_before_snapshot or self.snapshot()
-            self.lane_direction_before_snapshot = None
-            position = self.nearest_position(event)
-            if position is not None and position != path[-1]:
-                previous = path[-1]
-                if position[0] == previous[0] or position[1] == previous[1]:
-                    step_axis = 0 if position[0] != previous[0] else 1
-                    step = 1 if position[step_axis] > previous[step_axis] else -1
-                    values = range(
-                        previous[step_axis] + step,
-                        position[step_axis] + step,
-                        step,
-                    )
-                    if step_axis == 0:
-                        path.extend((value, position[1]) for value in values)
-                    else:
-                        path.extend((position[0], value) for value in values)
-            if len(path) < 2:
-                self.status.set("Drag across at least two connected grid points.")
-            else:
-                try:
-                    for start, end in zip(path, path[1:]):
-                        lane = self.project.normalized_lane(start, end)
-                        self.project.set_lane_direction(lane, (start, end))
-                    self.project.validate()
-                except ValueError as exc:
-                    self.restore_snapshot(before)
-                    messagebox.showerror("Lane direction", str(exc))
-                else:
-                    self.undo_stack.append(before)
-                    if len(self.undo_stack) > 100:
-                        self.undo_stack.pop(0)
-                    self.redo_stack.clear()
-                    self.selected_lane = self.project.normalized_lane(path[-2], path[-1])
-                    self.update_selected_lane_editor()
-                    self.status.set(
-                        f"Set direction on {len(path) - 1} corridor segment(s): "
-                        f"{self.project.vertex_name(path[0][0], path[0][1])} → "
-                        f"{self.project.vertex_name(path[-1][0], path[-1][1])}."
-                    )
-            self.redraw()
         if action in {"rack_rectangle", "zone_rectangle"} and self.bulk_anchor is not None:
             position = self.nearest_position(event) or self.bulk_drag_position
             if position is not None:
@@ -6710,14 +6138,7 @@ class GridMapEditorApp:
         self.project.deleted_lanes = {
             lane for lane in self.project.deleted_lanes if position not in lane
         }
-        self.project.one_way_lanes = {
-            lane for lane in self.project.one_way_lanes if position not in lane
-        }
-        if self.selected_lane is not None and position in self.selected_lane:
-            self.selected_lane = None
-            self.update_selected_lane_editor()
         self.project.deleted_positions.add(position)
-        self.project.reconcile_lane_state()
         self.prune_grid_warehouse_configuration()
         self.status.set(
             f"Deleted {self.project.vertex_name(*position)}; lanes reconnected "
@@ -6725,56 +6146,11 @@ class GridMapEditorApp:
         )
         return True
 
-    def draw_grid_position(self, position: GridPosition) -> bool:
-        """Restore one deleted point at its original grid-lattice coordinate."""
-        if position not in self.project.deleted_positions:
-            return False
-        self.project.deleted_positions.remove(position)
-        self.project.reconcile_lane_state()
-        self.project.validate()
-        self.status.set(
-            f"Restored {self.project.vertex_name(*position)} and its generated lanes."
-        )
-        return True
-
-    def draw_grid_lane(self, start: GridPosition, end: GridPosition) -> bool:
-        """Restore a deleted lane or persist a new custom connection."""
-        before = self.snapshot()
-        try:
-            result = self.project.add_lane(start, end)
-            self.project.validate()
-        except ValueError as exc:
-            self.restore_snapshot(before)
-            messagebox.showerror("Draw lane", str(exc))
-            return False
-        lane = self.project.normalized_lane(start, end)
-        self.selected_lane = lane
-        self.selected = None
-        self.update_selected_editor()
-        self.update_selected_lane_editor()
-        start_name = self.project.vertex_name(*lane[0])
-        end_name = self.project.vertex_name(*lane[1])
-        if result == "existing":
-            self.status.set(f"Lane {start_name} ↔ {end_name} already exists.")
-            return False
-        self.undo_stack.append(before)
-        if len(self.undo_stack) > 100:
-            self.undo_stack.pop(0)
-        self.redo_stack.clear()
-        verb = "Restored" if result == "restored" else "Added"
-        self.status.set(f"{verb} lane {start_name} ↔ {end_name}.")
-        return True
-
     def delete_grid_lane(self, lane) -> bool:
         lane = self.project.normalized_lane(*lane)
-        if not self.project.remove_lane(*lane):
+        if lane in self.project.deleted_lanes:
             return False
-        if (
-            self.selected_lane is not None
-            and self.project.normalized_lane(*self.selected_lane) == lane
-        ):
-            self.selected_lane = None
-            self.update_selected_lane_editor()
+        self.project.deleted_lanes.add(lane)
         start, end = lane
         self.status.set(
             f"Deleted lane {self.project.vertex_name(*start)} ↔ "
@@ -7047,10 +6423,8 @@ class GridMapEditorApp:
     def restore_snapshot(self, snapshot: dict):
         self.project = GridProject.from_project_dict(snapshot)
         self.selected = None
-        self.selected_lane = None
         self.bulk_anchor = None
         self.bulk_drag_position = None
-        self.lane_draw_anchor = None
         self.map_name.set(self.project.grid.map_name)
         self.level_name.set(self.project.grid.level_name)
         self.width.set(str(self.project.grid.width_m))
@@ -7062,7 +6436,6 @@ class GridMapEditorApp:
         self.sync_grid_sku_attribute_controls()
         self.update_grid_zone_summary()
         self.update_selected_editor()
-        self.update_selected_lane_editor()
         self.redraw()
 
     def push_undo(self):
@@ -7106,75 +6479,6 @@ class GridMapEditorApp:
         self.role.set(marker.role if marker else "none")
         self.endpoint_id.set(marker.endpoint_id if marker else "")
 
-    def select_grid_lane(self, lane: GridLane) -> None:
-        lane = self.project.normalized_lane(*lane)
-        self.selected_lane = lane
-        self.update_selected_lane_editor()
-        start_name = self.project.vertex_name(*lane[0])
-        end_name = self.project.vertex_name(*lane[1])
-        self.status.set(
-            f"Selected lane {start_name} ↔ {end_name}; drag from one endpoint to the other to set direction."
-        )
-
-    def update_selected_lane_editor(self) -> None:
-        if self.selected_lane is None:
-            self.selected_lane_text.set("No lane selected")
-            self.lane_direction_choice.set("Bidirectional")
-            if hasattr(self, "lane_direction_box"):
-                self.lane_direction_box.configure(values=("Bidirectional",))
-            return
-        lane = self.project.normalized_lane(*self.selected_lane)
-        start_name = self.project.vertex_name(*lane[0])
-        end_name = self.project.vertex_name(*lane[1])
-        choices = (
-            "Bidirectional",
-            f"{start_name} → {end_name}",
-            f"{end_name} → {start_name}",
-        )
-        self.selected_lane_text.set(f"Selected: {start_name} ↔ {end_name}")
-        if hasattr(self, "lane_direction_box"):
-            self.lane_direction_box.configure(values=choices)
-        direction = self.project.one_way_direction(lane)
-        if direction is None:
-            self.lane_direction_choice.set(choices[0])
-        elif direction == lane:
-            self.lane_direction_choice.set(choices[1])
-        else:
-            self.lane_direction_choice.set(choices[2])
-
-    def apply_lane_direction(self) -> bool:
-        if self.selected_lane is None:
-            messagebox.showinfo("Select a lane", "Choose Directions, then select a lane first.")
-            return False
-        lane = self.project.normalized_lane(*self.selected_lane)
-        start_name = self.project.vertex_name(*lane[0])
-        end_name = self.project.vertex_name(*lane[1])
-        choices = {
-            "Bidirectional": None,
-            f"{start_name} → {end_name}": lane,
-            f"{end_name} → {start_name}": (lane[1], lane[0]),
-        }
-        choice = self.lane_direction_choice.get()
-        if choice not in choices:
-            messagebox.showerror("Lane direction", "Choose a valid lane direction.")
-            return False
-        before = self.snapshot()
-        try:
-            self.project.set_lane_direction(lane, choices[choice])
-            self.project.validate()
-        except ValueError as exc:
-            self.restore_snapshot(before)
-            messagebox.showerror("Lane direction", str(exc))
-            return False
-        self.undo_stack.append(before)
-        if len(self.undo_stack) > 100:
-            self.undo_stack.pop(0)
-        self.redo_stack.clear()
-        self.update_selected_lane_editor()
-        self.redraw()
-        self.status.set(f"Lane {start_name} ↔ {end_name} set to {choice}.")
-        return True
-
     def apply_edit(self):
         if self.selected is None:
             messagebox.showinfo("Select a point", "Select a grid point first."); return
@@ -7215,28 +6519,25 @@ class GridMapEditorApp:
         self.redraw(); self.status.set(f"Point edit applied at ({x:g}, {y:g}) m.")
 
     def save_project_dialog(self):
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Grid project", "*.json")], initialdir=str(DEFAULT_MAP_DIR), initialfile=f"{self.project.grid.map_name}.grid.json")
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Grid project", "*.json")], initialfile=f"{self.project.grid.map_name}.grid.json")
         if path:
             try: self.project.validate(); self.rmf_maps.save_project(self.project, Path(path)); self.status.set(f"Project saved: {path}")
             except (OSError, ValueError) as exc: messagebox.showerror("Save failed", str(exc))
 
     def load_project_dialog(self):
-        path = filedialog.askopenfilename(initialdir=str(DEFAULT_MAP_DIR), filetypes=[("Grid project", "*.json"), ("All files", "*")])
+        path = filedialog.askopenfilename(filetypes=[("Grid project", "*.json"), ("All files", "*")])
         if not path: return
         try:
             loaded_project = self.rmf_maps.load_project(Path(path))
             self.push_undo(); self.project = loaded_project
-            self.selected = None; self.selected_lane = None
-            self.bulk_anchor = None; self.bulk_drag_position = None
-            self.lane_draw_anchor = None
-            self.map_name.set(self.project.grid.map_name); self.level_name.set(self.project.grid.level_name)
+            self.selected = None; self.map_name.set(self.project.grid.map_name); self.level_name.set(self.project.grid.level_name)
             self.width.set(str(self.project.grid.width_m)); self.length.set(str(self.project.grid.length_m)); self.spacing.set(str(self.project.grid.spacing_m))
             self.spacing_y.set(str(self.project.grid.spacing_y_m))
             self.sync_grid_storage_controls()
             self.sync_grid_warehouse_storage_controls()
             self.sync_grid_sku_attribute_controls()
             self.update_grid_zone_summary()
-            self.update_selected_editor(); self.update_selected_lane_editor(); self.redraw(); self.status.set(f"Project loaded: {path}")
+            self.update_selected_editor(); self.redraw(); self.status.set(f"Project loaded: {path}")
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc: messagebox.showerror("Load failed", str(exc))
 
     def export_yaml_dialog(self):
@@ -7245,13 +6546,7 @@ class GridMapEditorApp:
             try:
                 self.project.validate(); self.rmf_maps.export_building(self.project, Path(path))
                 self.status.set(f"RMF map exported: {path}")
-                messagebox.showinfo(
-                    "Export complete",
-                    f"Generated {self.project.vertex_count:,} vertices and "
-                    f"{self.project.edge_count:,} lanes "
-                    f"({self.project.one_way_lane_count:,} one-way, "
-                    f"{self.project.bidirectional_lane_count:,} bidirectional).\n\n{path}",
-                )
+                messagebox.showinfo("Export complete", f"Generated {self.project.vertex_count:,} vertices and {self.project.edge_count:,} bidirectional edges.\n\n{path}")
             except (OSError, ValueError) as exc: messagebox.showerror("Export failed", str(exc))
 
 

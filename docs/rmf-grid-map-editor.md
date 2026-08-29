@@ -27,8 +27,7 @@ X and Y use independent positive grid distances, so cells may be rectangular.
 Click **Generate / reset grid** to create all vertices and edges. Complete
 intervals use the configured distance for their axis; a shorter final interval
 is added when needed to meet the exact width or length. Every point is connected
-to its horizontal and vertical neighbours. New lanes are bidirectional by
-default and can be changed to either one-way direction after generation.
+to its horizontal and vertical neighbours, and every lane is bidirectional.
 
 ## Mark operational points
 
@@ -42,19 +41,8 @@ Choose a placement tool:
   drag. You can also select a point and use **Delete selected** (or press the
   Delete key while the map has focus). Horizontal and vertical lanes
   automatically bridge each gap to the next remaining point.
-- **Draw points** restores deleted grid-lattice points at their original
-  coordinates. Click or drag across the faint crossed point indicators.
-- **Draw lanes** creates a lane by pressing on one active point and dragging to
-  another. It restores a deleted generated segment when the endpoints match;
-  otherwise it saves a custom connection. Drawn lanes start bidirectional and
-  can be changed with **Directions**.
 - **Delete lanes** removes the nearest lane segment when you click it. Drag
   across multiple segments to remove several lanes in one undoable action.
-- **Directions** selects the nearest lane. Choose **Bidirectional** or either
-  displayed `start → end` direction and click **Apply**. Plain grey lanes are
-  bidirectional; blue lanes with an arrow are one-way. Direction changes are
-  saved in `.grid.json`, exported through the RMF `bidirectional` lane
-  parameter, and included in undo/redo.
 - **Select / edit** exposes the selected point's X and Y coordinates. Enter new
   metre values and click **Apply point edit** to move it. Coordinates may be
   negative or extend beyond the configured total width and length; the dashed
@@ -338,7 +326,7 @@ in the JSON assignment records but are omitted from the rack-detail view.
 
 The default inputs are `map1.grid.json` and
 `sku_velocity_summary.csv`. The result defaults to
-`resources/map/basic_slotting_layout.slotting.json`.
+`resources/data/basic_slotting_layout.slotting.json`.
 
 ## Inventory operations demo tab
 

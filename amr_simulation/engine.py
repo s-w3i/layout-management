@@ -8,8 +8,7 @@ from dataclasses import dataclass
 
 from warehouse_layout.domain import GridProject
 
-from .coordination import following_queue, reversed_passage, same_direction_following, wait_cycle
-from .conflict_solver import DramConflict, head_to_head_overlap
+from .conflict_solver import DramConflict, partial_conflicts
 from .models import (
     DayResult,
     MotionSegment,
@@ -72,7 +71,6 @@ class _Job:
     stage_loaded: bool = False
     stage_arrival_kind: str = ""
     tabu: set[tuple[int, int]] | None = None
-    tabu_edges: set[tuple[tuple[int, int], tuple[int, int]]] | None = None
     request_time: float | None = None
     wait_since: float | None = None
     wait_token: int = 0
@@ -82,16 +80,7 @@ class _Job:
     conflict_amrs: tuple[str, ...] = ()
     dram_wait_seconds: float = 0.0
     dram_wait_since: float | None = None
-    following_wait_since: float | None = None
-    corridor_wait_since: float | None = None
     parking_backoff: bool = False
-    route_cursor: int = 0
-    route_suffix_distances: tuple[float, ...] = ()
-    remaining_path_cache: tuple[tuple[int, int], ...] = ()
-    remaining_path_position: tuple[int, int] | None = None
-    remaining_nodes: frozenset[tuple[int, int]] = frozenset()
-    remaining_edges: frozenset[tuple[tuple[int, int], tuple[int, int]]] = frozenset()
-    parking_continuation_distance: float = 0.0
 
 
 @dataclass(slots=True)
@@ -102,22 +91,6 @@ class _Station:
     service_seconds: float = 0.0
     queue_wait_seconds: float = 0.0
     max_queue: int = 0
-
-
-@dataclass(slots=True)
-class _Passage:
-    nodes: tuple[tuple[int, int], ...]
-    owner_front: str
-    owner_direction: tuple[tuple[int, int], tuple[int, int]]
-    yielding: tuple[str, ...]
-
-
-@dataclass(slots=True)
-class _ConflictContext:
-    active: tuple[_Job, ...]
-    paths: dict[str, tuple[tuple[int, int], ...]]
-    active_indices: dict[str, int]
-    next_edges: dict[tuple[int, int], tuple[tuple[int, int], int]]
 
 
 class _Engine:
@@ -162,11 +135,6 @@ class _Engine:
         self.paths: dict[str, list[tuple[int, int]]] = {}
         self.pending: dict[str, _Job] = {}
         self.pending_dirty: set[str] = set()
-        self.node_waiters: dict[tuple[int, int], set[str]] = {}
-        self.conflict_waiters: dict[str, set[str]] = {}
-        self.active_cache: tuple[_Job, ...] | None = None
-        self.route_future_users: dict[tuple[int, int], set[str]] = {}
-        self.coordination_generation = 0
         self.dispatch_needed = False
         self.reservation_conflicts = 0
         self.node_ownership_conflicts = 0
@@ -174,18 +142,6 @@ class _Engine:
         self.dram_solver_reroutes = 0
         self.reroute_count = 0
         self.max_reserved_nodes = len(self.node_owners)
-        self.wait_for: dict[str, set[str]] = {}
-        self.passages: dict[frozenset[tuple[int, int]], _Passage] = {}
-        self.loaded_priority_grants = 0
-        self.loaded_protected_waits = 0
-        self.following_wait_seconds = 0.0
-        self.following_avoided_reroutes = 0
-        self.wait_for_cycles = 0
-        self.cycle_breaking_reroutes = 0
-        self.corridor_conflicts = 0
-        self.corridor_ownership_changes = 0
-        self.corridor_yielding_amrs: set[str] = set()
-        self.corridor_wait_seconds = 0.0
         self.turn_cache: dict[tuple[tuple[int, int], ...], tuple[int, ...]] = {}
         self.processed_events = 0
         self.next_calendar_compaction = 50_000
@@ -211,28 +167,8 @@ class _Engine:
     def run(self) -> DayResult:
         for task in self.tasks:
             self.schedule(0.0, "task_release", task)
-        previous_time = None
-        same_time_resolutions = 0
         while self.calendar:
             now = self.calendar[0][0]
-            if previous_time is not None and abs(now - previous_time) <= 1e-9:
-                same_time_resolutions += 1
-            else:
-                previous_time = now
-                same_time_resolutions = 0
-            if same_time_resolutions > 10_000:
-                waiting = {
-                    amr_id: {
-                        "node": grid_name(job.blocked_node) if job.blocked_node else None,
-                        "reason": job.blocked_reason,
-                        "conflicts": job.conflict_amrs,
-                    }
-                    for amr_id, job in sorted(self.pending.items())
-                }
-                raise RuntimeError(
-                    f"coordination livelock at {now:.6f}s after "
-                    f"{same_time_resolutions} unchanged-time resolutions: {waiting}"
-                )
             while self.calendar and abs(self.calendar[0][0] - now) <= 1e-9:
                 when, _sequence, kind, payload = heapq.heappop(self.calendar)
                 self.processed_events += 1
@@ -286,12 +222,13 @@ class _Engine:
             if previous != position and self.node_owners.get(previous) == job.amr.amr_id:
                 del self.node_owners[previous]
                 self.record(now, "node_released", job, node=grid_name(previous))
-                self.pending_dirty.update(self.node_waiters.get(previous, ()))
+                self.pending_dirty.update(
+                    amr_id
+                    for amr_id, waiting in self.pending.items()
+                    if waiting.blocked_node == previous
+                )
             job.amr.position = position
-            self._advance_route_cache(job, position)
             self.record(now, "node_entered", job, node=grid_name(position))
-            self._clear_wait(job, now)
-            self._release_passages(now)
             self._wake_dram_waiters(job.amr.amr_id)
             return
         if kind == "movement_tail":
@@ -299,14 +236,12 @@ class _Engine:
             job.amr.heading = heading
             if job.parking_backoff:
                 job.parking_backoff = False
-                route = self.router.route(
-                    job.amr.position, job.stage_goal, frozenset(job.tabu),
-                    frozenset(job.tabu_edges),
+                job.stage_route = self.router.route(
+                    job.amr.position, job.stage_goal, frozenset(job.tabu)
                 ) or self._required_route(job.amr.position, job.stage_goal)
-                self._set_stage_route(job, route)
                 self._request_reservation(job, now)
                 return
-            self._set_stage_route(job, remaining)
+            job.stage_route = remaining
             if len(remaining.positions) == 1:
                 self.schedule(now, job.stage_arrival_kind, job)
             else:
@@ -320,10 +255,6 @@ class _Engine:
                 return
             if self._hard_station_wait(job) or job.blocked_node == job.stage_goal:
                 return
-            if self.config.loaded_priority_enabled and job.stage_loaded:
-                self.loaded_protected_waits += 1
-                self.record(now, "loaded_reroute_protected", job)
-                return
             dram_timeout = job.blocked_reason == "dram_solver"
             if dram_timeout and job.dram_wait_since is not None:
                 job.dram_wait_seconds += now - job.dram_wait_since
@@ -335,8 +266,7 @@ class _Engine:
                 self.dram_solver_reroutes += 1
             self.record(now, "tabu_added", job, node=grid_name(job.blocked_node))
             route = self.router.route(
-                job.amr.position, job.stage_goal, frozenset(job.tabu),
-                frozenset(job.tabu_edges),
+                job.amr.position, job.stage_goal, frozenset(job.tabu)
             )
             if route is None:
                 job.tabu.clear()
@@ -352,8 +282,7 @@ class _Engine:
                     )
                 else:
                     route = self._required_route(job.amr.position, job.stage_goal)
-            self._clear_block_indexes(job)
-            self._set_stage_route(job, route)
+            job.stage_route = route
             job.wait_since = now
             job.blocked_node = None
             job.blocked_reason = None
@@ -373,53 +302,11 @@ class _Engine:
             self.pending_dirty.add(job.amr.amr_id)
             self._wake_dram_waiters(job.amr.amr_id)
             return
-        if kind == "coordination_timeout":
-            job, token = payload
-            if self.pending.get(job.amr.amr_id) is not job or token != job.wait_token:
-                return
-            victim = self._break_wait_cycle(now)
-            if victim is None:
-                path = self._remaining_path(job)
-                if len(path) >= 2:
-                    if job.stage_loaded:
-                        blockers = [
-                            self.active_jobs[value]
-                            for value in job.conflict_amrs
-                            if value in self.active_jobs
-                        ]
-                        unloaded_blockers = [blocker for blocker in blockers if not blocker.stage_loaded]
-                        if unloaded_blockers:
-                            victim = max(unloaded_blockers, key=self._priority_key)
-                            victim_path = self._remaining_path(victim)
-                            if len(victim_path) >= 2 and self._coordination_reroute(
-                                victim, now, (victim_path[0], victim_path[1]),
-                                "yield_to_loaded",
-                            ):
-                                return
-                        participants = blockers + [job]
-                        victim = max(participants, key=self._priority_key)
-                        if victim is not job:
-                            victim_path = self._remaining_path(victim)
-                            if len(victim_path) >= 2 and self._coordination_reroute(
-                                victim, now, (victim_path[0], victim_path[1]),
-                                "loaded_cycle_override",
-                            ):
-                                self.record(
-                                    now, "loaded_protection_overridden", victim,
-                                    reason="loaded_cycle",
-                                )
-                                return
-                        self.record(now, "loaded_protection_overridden", job, reason="coordination_liveness")
-                    self._coordination_reroute(
-                        job, now, (path[0], path[1]), "coordination_liveness"
-                    )
-            return
 
         job = payload
         self.record(now, kind, job)
         if kind == "pickup_arrival":
             job.tabu.clear()
-            job.tabu_edges.clear()
             self._stationary(job, "jack_up", now, now + self.config.jack_up_seconds, job.rack.position, False)
             self.schedule(now + self.config.jack_up_seconds, "jack_up_done", job)
         elif kind == "jack_up_done":
@@ -434,7 +321,6 @@ class _Engine:
             )
         elif kind == "station_arrival":
             job.tabu.clear()
-            job.tabu_edges.clear()
             station = self.stations[job.workstation]
             if station.busy:
                 raise RuntimeError(f"reserved workstation {station.station_id} is already busy")
@@ -457,7 +343,6 @@ class _Engine:
             )
         elif kind == "rack_home":
             job.tabu.clear()
-            job.tabu_edges.clear()
             job.rack_return = now
             self._stationary(job, "jack_down", now, now + self.config.jack_down_seconds, job.rack.position, True)
             self.schedule(now + self.config.jack_down_seconds, "jack_down_done", job)
@@ -468,9 +353,6 @@ class _Engine:
             job.amr.busy_seconds += now - job.dispatch_time
             job.completion_time = now
             self.active_jobs.pop(job.amr.amr_id, None)
-            self.active_cache = None
-            self._update_route_membership(job, ())
-            self.coordination_generation += 1
             job.task.inflight -= 1
             completed = sum(job.lines.values())
             job.task.completed_lines += completed
@@ -500,18 +382,16 @@ class _Engine:
         )
         job.stage = stage
         job.stage_goal = route.positions[-1]
-        self._set_stage_route(job, route)
+        job.stage_route = route
         job.stage_loaded = loaded
         job.stage_arrival_kind = arrival_kind
         job.tabu = set()
-        job.tabu_edges = set()
         job.request_time = job.wait_since = None
         job.blocked_node = None
         job.blocked_reason = None
         job.conflict_signature = None
         job.conflict_amrs = ()
         job.wait_token += 1
-        self._clear_wait(job, now)
         if len(route.positions) == 1:
             self.schedule(now, arrival_kind, job)
         else:
@@ -526,82 +406,10 @@ class _Engine:
         self.pending_dirty.add(job.amr.amr_id)
         self.record(now, "reservation_requested", job)
 
-    def _set_stage_route(self, job: _Job, route: Route) -> None:
-        job.stage_route = route
-        job.route_cursor = 0
-        suffix = [0.0] * len(route.positions)
-        for index in range(len(route.positions) - 2, -1, -1):
-            suffix[index] = (
-                suffix[index + 1]
-                + self.router.edge_weights[(route.positions[index], route.positions[index + 1])]
-            )
-        job.route_suffix_distances = tuple(suffix)
-        job.remaining_path_cache = ()
-        job.remaining_path_position = None
-        self._update_route_membership(job, route.positions)
-        job.parking_continuation_distance = 0.0
-        if job.parking_backoff and route.positions[-1] != job.stage_goal:
-            continuation = self.router.route(route.positions[-1], job.stage_goal)
-            if continuation is not None:
-                job.parking_continuation_distance = continuation.distance_m
-        self.coordination_generation += 1
-
-    def _advance_route_cache(self, job: _Job, position: tuple[int, int]) -> None:
-        positions = job.stage_route.positions
-        try:
-            cursor = positions.index(position, job.route_cursor)
-        except ValueError:
-            return
-        job.route_cursor = cursor
-        self._update_route_membership(job, positions[cursor:])
-        job.remaining_path_cache = ()
-        job.remaining_path_position = None
-        self.coordination_generation += 1
-
-    def _update_route_membership(
-        self, job: _Job, remaining: tuple[tuple[int, int], ...]
-    ) -> None:
-        amr_id = job.amr.amr_id
-        for node in job.remaining_nodes:
-            users = self.route_future_users.get(node)
-            if users is None:
-                continue
-            users.discard(amr_id)
-            if not users:
-                del self.route_future_users[node]
-        job.remaining_nodes = frozenset(remaining[1:])
-        job.remaining_edges = frozenset(zip(remaining, remaining[1:]))
-        for node in job.remaining_nodes:
-            self.route_future_users.setdefault(node, set()).add(amr_id)
-
-    def _clear_block_indexes(self, job: _Job) -> None:
-        amr_id = job.amr.amr_id
-        if job.blocked_node in self.node_waiters:
-            waiters = self.node_waiters[job.blocked_node]
-            waiters.discard(amr_id)
-            if not waiters:
-                del self.node_waiters[job.blocked_node]
-        for blocker in job.conflict_amrs:
-            waiters = self.conflict_waiters.get(blocker)
-            if waiters is None:
-                continue
-            waiters.discard(amr_id)
-            if not waiters:
-                del self.conflict_waiters[blocker]
-
-    def _index_block(self, job: _Job) -> None:
-        amr_id = job.amr.amr_id
-        if job.blocked_node is not None:
-            self.node_waiters.setdefault(job.blocked_node, set()).add(amr_id)
-        for blocker in job.conflict_amrs:
-            self.conflict_waiters.setdefault(blocker, set()).add(amr_id)
-
     def _wake_dram_waiters(self, progressed_amr: str) -> None:
-        for amr_id in tuple(self.conflict_waiters.get(progressed_amr, ())):
-            waiting = self.pending.get(amr_id)
+        for amr_id, waiting in self.pending.items():
             if (
-                waiting is not None
-                and waiting.blocked_reason == "dram_solver"
+                waiting.blocked_reason == "dram_solver"
                 and progressed_amr in waiting.conflict_amrs
             ):
                 waiting.conflict_signature = None
@@ -640,314 +448,50 @@ class _Engine:
         return not turns or turns == [1]
 
     def _remaining_distance(self, job: _Job) -> float:
-        return job.stage_route.distance_m + job.parking_continuation_distance
+        distance = self.router.route_distance(job.stage_route.positions)
+        if job.parking_backoff:
+            continuation = self.router.route(job.stage_route.positions[-1], job.stage_goal)
+            if continuation is not None:
+                distance += continuation.distance_m
+        return distance
 
     def _remaining_path(self, job: _Job) -> tuple[tuple[int, int], ...]:
-        if job.remaining_path_position == job.amr.position:
-            return job.remaining_path_cache
         positions = job.stage_route.positions
         try:
-            remaining = positions[positions.index(job.amr.position):]
+            return positions[positions.index(job.amr.position):]
         except ValueError:
             route = self.router.route(
-                job.amr.position, job.stage_goal, frozenset(job.tabu),
-                frozenset(job.tabu_edges),
+                job.amr.position, job.stage_goal, frozenset(job.tabu)
             )
-            remaining = route.positions if route is not None else (job.amr.position,)
-        job.remaining_path_position = job.amr.position
-        job.remaining_path_cache = remaining
-        job.remaining_nodes = frozenset(remaining[1:])
-        job.remaining_edges = frozenset(zip(remaining, remaining[1:]))
-        return remaining
+            return route.positions if route is not None else (job.amr.position,)
 
-    def _priority_key(self, job: _Job) -> tuple[int, float, float, str]:
+    def _priority_key(self, job: _Job) -> tuple[float, float, str]:
         request_time = job.request_time
         return (
-            int(self.config.loaded_priority_enabled and not job.stage_loaded),
             self._remaining_distance(job),
             float(request_time) if request_time is not None else -math.inf,
             job.amr.amr_id,
         )
 
-    def _clear_wait(self, job: _Job, now: float) -> None:
-        self._clear_block_indexes(job)
-        previous = self.wait_for.pop(job.amr.amr_id, set())
-        if previous:
-            self.coordination_generation += 1
-            self.record(now, "wait_for_cleared", job, blockers=sorted(previous))
-        if job.following_wait_since is not None:
-            self.following_wait_seconds += now - job.following_wait_since
-            job.following_wait_since = None
-        if job.corridor_wait_since is not None:
-            self.corridor_wait_seconds += now - job.corridor_wait_since
-            job.corridor_wait_since = None
-
-    def _set_wait(self, job: _Job, blockers: tuple[str, ...], now: float) -> None:
-        if not self.config.mutex_passage_enabled or not blockers:
-            return
-        value = set(blockers)
-        if self.wait_for.get(job.amr.amr_id) != value:
-            self.wait_for[job.amr.amr_id] = value
-            self.coordination_generation += 1
-            self.record(now, "wait_for_updated", job, blockers=sorted(value))
-
-    def _following(
-        self,
-        job: _Job,
-        blocker_id: str,
-        blocked: tuple[int, int],
-        base_paths: dict[str, tuple[tuple[int, int], ...]],
-    ) -> bool:
-        blocker = self.active_jobs.get(blocker_id)
-        return bool(
-            self.config.mutex_passage_enabled
-            and blocker
-            and same_direction_following(
-                base_paths[job.job_id], base_paths[blocker.job_id], blocked
-            )
-        )
-
-    def _coordination_reroute(
-        self,
-        job: _Job,
-        now: float,
-        edge: tuple[tuple[int, int], tuple[int, int]],
-        reason: str,
-    ) -> bool:
-        if self._hard_station_wait(job):
-            return False
-        job.tabu_edges.add(edge)
-        route = self.router.route(
-            job.amr.position, job.stage_goal, frozenset(job.tabu),
-            frozenset(job.tabu_edges),
-        )
-        if route is None:
-            job.tabu_edges.remove(edge)
-            if reason not in {"wait_for_cycle", "coordination_liveness"}:
-                return False
-            route = self._parking_route(job)
-            if route is None:
-                return False
-            job.parking_backoff = True
-        self._clear_wait(job, now)
-        self._set_stage_route(job, route)
-        job.blocked_node = None
-        job.blocked_reason = None
-        job.conflict_signature = None
-        job.conflict_amrs = ()
-        job.wait_token += 1
-        job.reroutes += 1
-        self.reroute_count += 1
-        self.pending_dirty.add(job.amr.amr_id)
-        self._wake_dram_waiters(job.amr.amr_id)
-        self.record(
-            now, "coordination_reroute", job, reason=reason,
-            blocked_edge=[grid_name(edge[0]), grid_name(edge[1])],
-            path=[grid_name(node) for node in route.positions],
-        )
-        return True
-
-    def _break_wait_cycle(self, now: float) -> str | None:
-        cycle = wait_cycle(self.wait_for)
-        if not cycle:
-            return None
-        jobs = [self.active_jobs[amr_id] for amr_id in cycle if amr_id in self.active_jobs]
-        if not jobs:
-            return None
-        unloaded = [job for job in jobs if not job.stage_loaded]
-        victim = max(unloaded or jobs, key=self._priority_key)
-        path = self._remaining_path(victim)
-        if len(path) < 2:
-            return None
-        self.wait_for_cycles += 1
-        if victim.stage_loaded:
-            self.record(now, "loaded_protection_overridden", victim, cycle=list(cycle))
-        if self._coordination_reroute(victim, now, (path[0], path[1]), "wait_for_cycle"):
-            self.cycle_breaking_reroutes += 1
-            return victim.amr.amr_id
-        return None
-
-    def _release_passages(self, now: float) -> None:
-        for key, passage in list(self.passages.items()):
-            owner = self.active_jobs.get(passage.owner_front)
-            path = self._remaining_path(owner) if owner else ()
-            occupied = any(node in self.node_owners for node in passage.nodes)
-            if not occupied and len(set(path) & set(passage.nodes)) < 2:
-                del self.passages[key]
-                self.coordination_generation += 1
-                self.record(now, "corridor_released", owner, nodes=[grid_name(n) for n in passage.nodes])
-
-    def _corridor_resolution(
-        self,
-        selected: _Job,
-        involved: list[_Job],
-        base_paths: dict[str, tuple[tuple[int, int], ...]],
-        now: float,
-    ) -> str:
-        if (
-            not self.config.corridor_coordination_enabled
-            or len(involved) != 2
-            or self._hard_station_wait(selected)
-            or any(job.amr.amr_id not in self.pending for job in involved)
-        ):
-            return "deny"
-        first, second = involved
-        first_id, second_id = first.amr.amr_id, second.amr.amr_id
-        if (
-            second_id not in self.wait_for.get(first_id, set())
-            or first_id not in self.wait_for.get(second_id, set())
-        ):
-            return "deny"
-        passage_nodes = reversed_passage(base_paths[first.job_id], base_paths[second.job_id])
-        if len(passage_nodes) < 2:
-            return "deny"
-        key = frozenset(passage_nodes)
-        passage = self.passages.get(key)
-        if passage is None:
-            queues = (
-                following_queue(first.amr.amr_id, self.wait_for),
-                following_queue(second.amr.amr_id, self.wait_for),
-            )
-
-            def has_unloaded(queue):
-                return any(
-                    not self.active_jobs[amr_id].stage_loaded
-                    for amr_id in queue if amr_id in self.active_jobs
-                )
-
-            candidates = [(first, queues[0]), (second, queues[1])]
-            preferred = [item for item in candidates if has_unloaded(item[1])]
-            candidates = preferred or candidates
-            shortest = min(len(queue) for _front, queue in candidates)
-            candidates = [item for item in candidates if len(item[1]) == shortest]
-            yielding_front, yielding_queue = max(
-                candidates, key=lambda item: (self._priority_key(item[0]), item[0].amr.amr_id)
-            )
-            holding_front = second if yielding_front is first else first
-            holding_path = base_paths[holding_front.job_id]
-            ordered = sorted(passage_nodes, key=holding_path.index)
-            passage = _Passage(
-                tuple(ordered), holding_front.amr.amr_id,
-                (ordered[0], ordered[-1]), yielding_queue,
-            )
-            self.passages[key] = passage
-            self.coordination_generation += 1
-            self.corridor_conflicts += 1
-            self.corridor_ownership_changes += 1
-            self.record(
-                now, "corridor_owned", holding_front,
-                nodes=[grid_name(node) for node in passage.nodes],
-                holding_queue=list(queues[0] if holding_front is first else queues[1]),
-                yielding_queue=list(yielding_queue),
-            )
-            tail_jobs = [
-                self.active_jobs[amr_id]
-                for amr_id in reversed(yielding_queue)
-                if amr_id in self.active_jobs
-            ]
-            reroutable = [job for job in tail_jobs if not job.stage_loaded]
-            for victim in reroutable or tail_jobs:
-                path = base_paths[victim.job_id]
-                indices = [i for i, node in enumerate(path) if node in key]
-                if not indices:
-                    continue
-                index = min(indices)
-                edge = (path[index - 1], path[index]) if index else (path[0], path[1])
-                if edge in victim.tabu_edges:
-                    continue
-                if victim.stage_loaded:
-                    self.record(now, "loaded_protection_overridden", victim, reason="corridor")
-                if self._coordination_reroute(victim, now, edge, "corridor_tail_yield"):
-                    self.corridor_yielding_amrs.add(victim.amr.amr_id)
-                    if victim is selected:
-                        return "rerouted"
-                    break
-
-        selected_path = base_paths[selected.job_id]
-        indices = [i for i, node in enumerate(selected_path) if node in key]
-        if len(indices) >= 2:
-            direction = (selected_path[min(indices)], selected_path[max(indices)])
-            if direction == passage.owner_direction:
-                return "allow"
-        return "deny"
-
     def _dram_conflict_after(
         self,
         selected: _Job,
-        selected_index: int,
         position: tuple[int, int],
-        context: _ConflictContext,
+        active: tuple[_Job, ...],
+        base_paths: dict[str, tuple[tuple[int, int], ...]],
     ) -> tuple[DramConflict | None, list[_Job], _Job | None]:
-        active, base_paths = context.active, context.paths
-        original = base_paths[selected.job_id]
-        selected_path = original[original.index(position):]
-        candidates = tuple(
-            sorted(
-                (
-                    context.active_indices[amr_id]
-                    for amr_id in self.route_future_users.get(position, ())
-                    if amr_id in context.active_indices
-                )
-            )
-        )
-        for index in candidates:
-            if index == selected_index:
-                continue
-            path = base_paths[active[index].job_id]
-            if path[0] not in selected_path[1:]:
-                continue
-            overlap = head_to_head_overlap(selected_path, path)
-            if overlap is None:
-                continue
-            conflict = DramConflict("head_to_head", (selected_index, index), overlap)
-            involved = [selected, active[index]]
+        paths = []
+        for job in active:
+            path = base_paths[job.job_id]
+            if job is selected:
+                path = path[path.index(position):]
+            paths.append(path)
+        for conflict in partial_conflicts(paths, active.index(selected)):
+            involved = [active[index] for index in conflict.agent_indices]
             winner = min(involved, key=self._priority_key)
-            if winner is not selected:
-                return conflict, involved, winner
-
-        node = selected_path[0]
-        visited: dict[tuple[int, int], int] = {}
-        order: list[tuple[tuple[int, int], int]] = []
-        while True:
-            if node == selected_path[0] and len(selected_path) >= 2:
-                edge = (selected_path[1], selected_index)
-            elif node == original[0]:
-                edge = None
-            else:
-                edge = context.next_edges.get(node)
-            if edge is None:
-                break
-            if node in visited:
-                cycle = order[visited[node]:]
-                indices = tuple(sorted({index for _node, index in cycle}))
-                return (
-                    DramConflict("cycle", indices, node),
-                    [active[index] for index in indices],
-                    None,
-                )
-            visited[node] = len(order)
-            next_node, owner = edge
-            order.append((node, owner))
-            node = next_node
+            if conflict.kind == "cycle" or winner is not selected:
+                return conflict, involved, None if conflict.kind == "cycle" else winner
         return None, [], None
-
-    def _conflict_context(self) -> _ConflictContext:
-        if self.active_cache is None:
-            self.active_cache = tuple(
-                self.active_jobs[amr_id] for amr_id in sorted(self.active_jobs)
-            )
-        paths = {job.job_id: self._remaining_path(job) for job in self.active_cache}
-        next_edges = {
-            path[0]: (path[1], index)
-            for index, job in enumerate(self.active_cache)
-            if len(path := paths[job.job_id]) >= 2
-        }
-        return _ConflictContext(
-            self.active_cache,
-            paths,
-            {job.amr.amr_id: index for index, job in enumerate(self.active_cache)},
-            next_edges,
-        )
 
     def _parking_route(self, job: _Job) -> Route | None:
         candidates = []
@@ -977,12 +521,14 @@ class _Engine:
                 for amr_id in ready
                 if amr_id in self.pending
             ),
-            key=self._priority_key,
+            key=lambda job: (
+                self._remaining_distance(job),
+                float(job.request_time),
+                job.amr.amr_id,
+            ),
         )
-        context = self._conflict_context()
-        active = context.active
-        active_indices = context.active_indices
-        base_paths = context.paths
+        active = tuple(self.active_jobs[amr_id] for amr_id in sorted(self.active_jobs))
+        base_paths = {job.job_id: self._remaining_path(job) for job in active}
         for job in ordered:
             if self.pending.get(job.amr.amr_id) is not job:
                 continue
@@ -997,57 +543,30 @@ class _Engine:
             conflict = None
             conflicting_jobs = []
             winner = None
-            following_blocked = False
-            coordination_rerouted = False
-            corridor_blocked = False
             for node in desired:
                 owner = self.node_owners.get(node)
                 if owner is not None and owner != job.amr.amr_id:
                     blocker = node
                     blocking_owner = owner
-                    following_blocked = self._following(job, owner, node, base_paths)
                     break
                 available.append(node)
             if blocker is None:
                 safe = []
                 for node in available:
                     conflict, conflicting_jobs, winner = self._dram_conflict_after(
-                        job,
-                        active_indices[job.amr.amr_id],
-                        node,
-                        context,
+                        job, node, active, base_paths
                     )
                     if conflict is not None:
-                        if conflict.kind == "head_to_head":
-                            corridor = self._corridor_resolution(
-                                job, conflicting_jobs, base_paths, now
-                            )
-                            if corridor == "allow":
-                                conflict = None
-                                safe.append(node)
-                                continue
-                            if corridor == "rerouted":
-                                coordination_rerouted = True
-                            elif corridor == "deny":
-                                corridor_blocked = True
                         blocker = conflict.overlap_node
                         break
                     safe.append(node)
                 available = safe
-            if coordination_rerouted:
-                continue
             if atomic and blocker is not None:
                 available = []
             if not available:
-                self._clear_block_indexes(job)
                 job.blocked_node = blocker
                 solver_blocked = conflict is not None
-                reason = (
-                    "following" if following_blocked
-                    else "corridor" if corridor_blocked
-                    else "dram_solver" if solver_blocked
-                    else "node_owned"
-                )
+                reason = "dram_solver" if solver_blocked else "node_owned"
                 job.reservation_conflicts += 1
                 self.reservation_conflicts += 1
                 if solver_blocked:
@@ -1066,15 +585,6 @@ class _Engine:
                     winner=winner.amr.amr_id if winner else "",
                     resolution="wait",
                 )
-                self._set_wait(job, conflict_amrs, now)
-                if following_blocked:
-                    if job.following_wait_since is None:
-                        job.following_wait_since = now
-                        self.following_avoided_reroutes += 1
-                    self.record(now, "following_wait", job, leader=blocking_owner)
-                if corridor_blocked and job.corridor_wait_since is None:
-                    job.corridor_wait_since = now
-                    self.record(now, "corridor_wait", job)
                 signature = (
                     conflict.kind if conflict else "node_ownership",
                     conflict_amrs,
@@ -1095,20 +605,7 @@ class _Engine:
                         self.config.dram_conflict_wait_seconds
                         if solver_blocked else self.config.reservation_wait_seconds
                     )
-                    if (
-                        not following_blocked
-                        and not corridor_blocked
-                        and not (self.config.loaded_priority_enabled and job.stage_loaded)
-                    ):
-                        self.schedule(now + timeout, "reservation_timeout", (job, job.wait_token))
-                    else:
-                        if self.config.loaded_priority_enabled and job.stage_loaded:
-                            self.loaded_protected_waits += 1
-                        self.schedule(
-                            now + self.config.dram_conflict_wait_seconds,
-                            "coordination_timeout", (job, job.wait_token),
-                        )
-                self._index_block(job)
+                    self.schedule(now + timeout, "reservation_timeout", (job, job.wait_token))
                 if self._hard_station_wait(job):
                     station = self.stations[job.workstation]
                     if job.station_queue_enter is None:
@@ -1121,11 +618,8 @@ class _Engine:
                     station.max_queue = max(station.max_queue, waiting)
                 continue
             del self.pending[job.amr.amr_id]
-            if self.config.loaded_priority_enabled and job.stage_loaded:
-                self.loaded_priority_grants += 1
             for node in available:
                 self.node_owners[node] = job.amr.amr_id
-            self.coordination_generation += 1
             self.max_reserved_nodes = max(self.max_reserved_nodes, len(self.node_owners))
             waited = now - float(job.wait_since)
             if waited > 0:
@@ -1146,7 +640,6 @@ class _Engine:
                 job,
                 nodes=[grid_name(node) for node in available],
             )
-            self._clear_wait(job, now)
             job.request_time = job.wait_since = None
             job.wait_token += 1
             job.blocked_node = None
@@ -1288,7 +781,6 @@ class _Engine:
             )
             self.jobs.append(job)
             self.active_jobs[amr.amr_id] = job
-            self.active_cache = None
             self.record(now, "dispatch", job, covered_skus=covered, covered_lines=sum(lines.values()))
             self._start_stage(job, pickup, now, "to_pickup", False, "pickup_arrival")
 
@@ -1328,16 +820,6 @@ class _Engine:
             "dram_conflict_wait_seconds": sum(job.dram_wait_seconds for job in self.jobs),
             "max_reserved_nodes": self.max_reserved_nodes,
             "deadlock_count": 0,
-            "loaded_priority_grants": self.loaded_priority_grants,
-            "loaded_protected_waits": self.loaded_protected_waits,
-            "following_wait_seconds": self.following_wait_seconds,
-            "following_avoided_reroutes": self.following_avoided_reroutes,
-            "wait_for_cycles": self.wait_for_cycles,
-            "cycle_breaking_reroutes": self.cycle_breaking_reroutes,
-            "corridor_conflicts": self.corridor_conflicts,
-            "corridor_ownership_changes": self.corridor_ownership_changes,
-            "corridor_yielding_amrs": len(self.corridor_yielding_amrs),
-            "corridor_wait_seconds": self.corridor_wait_seconds,
             "amr_utilization": (
                 sum(amr.busy_seconds for amr in self.amrs) / (makespan * len(self.amrs))
                 if makespan else 0.0
