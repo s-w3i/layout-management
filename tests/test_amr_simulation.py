@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 from dataclasses import replace
 from datetime import date, datetime, time
 from pathlib import Path
@@ -37,6 +38,8 @@ from amr_simulation.models import (
     grid_name,
     grid_position,
 )
+from amr_simulation.native_backend import load_native
+from amr_simulation.native_day_backend import load_day_engine
 from amr_simulation.results import summarize
 from amr_simulation.routing import GridRouter, merge_straight_runs, motion_phases
 from warehouse_layout.domain import GridProject, GridSpec, Marker
@@ -99,6 +102,246 @@ def test_dram_candidate_filter_preserves_conflicts():
         index for index, path in enumerate(paths) if paths[0][0] in path[1:]
     )
     assert partial_conflicts(paths, 0, candidates) == partial_conflicts(paths, 0)
+
+
+def test_native_dram_prefix_matches_python_conflicts():
+    kernel, info = load_native(3, "native")
+    assert info.selected == "native"
+    try:
+        kernel.set_path(0, (0, 1, 2))
+        kernel.set_path(1, (2, 1, 0, 3))
+        kernel.set_path(2, (9, 10))
+        result = kernel.check_prefix(0, (1, 2), (0, 1, 2))
+        assert result.safe_count == 0
+        assert result.kind == "cycle"
+        assert result.participants == (0, 1)
+        assert not kernel.following(0, 1, 1)
+        assert kernel.reversed_passage(0, 1) == (0, 1, 2)
+    finally:
+        kernel.close()
+
+
+def test_native_backend_falls_back_in_auto_mode(monkeypatch):
+    import amr_simulation.native_backend as backend
+
+    monkeypatch.setattr(backend, "_build", lambda: (_ for _ in ()).throw(OSError("no compiler")))
+    kernel, info = backend.load_native(2, "auto")
+    assert kernel is None
+    assert info.selected == "python"
+    assert info.fallback_reason == "no compiler"
+
+
+def test_native_day_backend_is_gated_until_full_parity():
+    engine, info = load_day_engine("auto")
+    assert engine is None
+    assert info.selected == "python"
+    assert "parity qualification" in info.fallback_reason
+    with pytest.raises(RuntimeError, match="parity qualification"):
+        load_day_engine("native")
+
+
+def test_native_day_routing_and_motion_stage_matches_python():
+    import amr_simulation.native_day_backend as backend
+
+    library, _build_hash, _seconds = backend._build()
+    native = backend.NativeDayEngine(library)
+    assert native.library.amr_day_calendar_self_test() == 1
+    coordinates = ((0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (1.0, 1.0))
+    edges = (
+        (0, 1, 1.0), (1, 2, 1.0), (0, 3, math.sqrt(2.0)),
+        (3, 2, math.sqrt(2.0)),
+    )
+    assert native.route(coordinates, edges, 0, 2) == ((0, 1, 2), 2.0)
+    assert native.route(coordinates, edges, 0, 2, tabu_nodes=(1,))[0] == (0, 3, 2)
+    seconds, heading = native.predicted_motion(
+        coordinates, (0, 1, 2), 0.0, MotionProfile()
+    )
+    value = GridProject(GridSpec(width_m=2, length_m=1, spacing_m=1))
+    router = GridRouter(value)
+    route = router.route((0, 0), (2, 0))
+    assert seconds == pytest.approx(router.predicted_motion_time(route, 0.0, MotionProfile()))
+    assert heading == pytest.approx(0.0)
+
+
+def test_native_day_result_handle_validates_input_and_is_released():
+    import ctypes
+    import amr_simulation.native_day_backend as backend
+
+    library, _build_hash, _seconds = backend._build()
+    native = backend.NativeDayEngine(library)
+    empty = native.DayInput()
+    handle = native.library.amr_day_simulate(ctypes.byref(empty))
+    assert handle
+    try:
+        assert native.library.amr_day_result_error(handle).decode() == (
+            "invalid or empty native day input"
+        )
+        assert native.library.amr_day_result_metrics_json(handle) == b""
+    finally:
+        native.library.amr_day_result_destroy(handle)
+
+
+def test_native_day_flat_input_imports_reference_fixture():
+    import ctypes
+    import amr_simulation.native_day_backend as backend
+
+    value = project()
+    router = GridRouter(value)
+    selected = config()
+    racks = {
+        "R0": Rack("R0", (0, 0), frozenset(("A",))),
+        "R2": Rack("R2", (2, 0), frozenset(("A", "B"))),
+    }
+    tasks = [task("STORE", {"A": 2, "B": 1})]
+    library, _build_hash, _seconds = backend._build()
+    native = backend.NativeDayEngine(library)
+    packed, backing, ids = native.pack_day(
+        router, racks, tasks, {"STORE": "WS"}, selected
+    )
+    assert backing and ids["racks"] == ("R0", "R2")
+    assert ids["skus"] == ("A", "B")
+    assert native.library.amr_day_dispatch_probe(ctypes.byref(packed)) == 1
+    handle = native.library.amr_day_simulate(ctypes.byref(packed))
+    assert handle
+    try:
+        assert native.library.amr_day_result_error(handle) == b""
+        native_metrics = json.loads(
+            native.library.amr_day_result_metrics_json(handle).decode()
+        )
+        assert native_metrics["completed_lines"] == 3
+        assert native_metrics["completed_tasks"] == 1
+        assert native_metrics["rack_presentations"] == 1
+        reference = simulate_day(
+            value, GridRouter(value), racks, tasks, {"STORE": "WS"}, selected
+        ).metrics
+        for key in (
+            "completed_lines", "completed_tasks", "rack_presentations",
+            "final_completion_seconds", "makespan_seconds", "travel_distance_m",
+            "travel_time_seconds",
+        ):
+            assert native_metrics[key] == pytest.approx(reference[key], abs=1e-12)
+        decoded = native.simulate(
+            router, racks, tasks, {"STORE": "WS"}, selected
+        )
+        assert decoded.metrics == reference
+        reference_result = simulate_day(
+            value, GridRouter(value), racks, tasks, {"STORE": "WS"}, selected
+        )
+        assert decoded.jobs == reference_result.jobs
+    finally:
+        native.library.amr_day_result_destroy(handle)
+
+
+def test_native_day_parallel_base_lifecycle_matches_reference_counts():
+    import ctypes
+    import amr_simulation.native_day_backend as backend
+
+    value = project()
+    racks = {
+        "G2_0": Rack("G2_0", (2, 0), frozenset({"A"})),
+        "G4_0": Rack("G4_0", (4, 0), frozenset({"A", "B"})),
+    }
+    tasks = [task("S1", {"A": 1}), task("S2", {"A": 1, "B": 1})]
+    selected = config(spawns=("G0_0", "G4_0"))
+    mapping = {"S1": "WS", "S2": "WS"}
+    library, _hash, _seconds = backend._build()
+    native = backend.NativeDayEngine(library)
+    packed, backing, _ids = native.pack_day(
+        GridRouter(value), racks, tasks, mapping, selected
+    )
+    assert backing
+    handle = native.library.amr_day_simulate(ctypes.byref(packed))
+    try:
+        assert native.library.amr_day_result_error(handle) == b""
+        metrics = json.loads(native.library.amr_day_result_metrics_json(handle))
+        reference = simulate_day(
+            value, GridRouter(value), racks, tasks, mapping, selected
+        ).metrics
+        for key in (
+            "completed_lines", "completed_tasks", "rack_presentations",
+            "final_completion_seconds", "makespan_seconds", "travel_distance_m",
+            "travel_time_seconds",
+        ):
+            assert metrics[key] == pytest.approx(reference[key], abs=1e-12)
+        decoded = native.simulate(
+            GridRouter(value), racks, tasks, mapping, selected
+        )
+        assert decoded.metrics == reference
+        reference_result = simulate_day(
+            value, GridRouter(value), racks, tasks, mapping, selected
+        )
+        assert decoded.jobs == reference_result.jobs
+    finally:
+        native.library.amr_day_result_destroy(handle)
+
+
+def test_native_day_real_map_reduced_workload_exact_parity():
+    from amr_simulation.native_day_backend import NativeDayEngine, _build
+    from warehouse_layout.slotting_repository import SlottingLayoutRepository
+    from amr_simulation.inputs import racks_from_layout
+
+    root = Path(__file__).resolve().parents[1]
+    value = RmfMapService().load_project(root / "resources/map/map1_1.grid.json")
+    selected = SimulationConfig.load(
+        root / "amr_simulation/config/default.json"
+    ).with_amr_count(2)
+    workload = load_workload(root / "resources/data/Sample Data.xlsx")
+    tasks = [item for item in workload.tasks if item.task_date == date(2023, 1, 3)][:5]
+    payload = SlottingLayoutRepository().load(
+        root / "resources/map/map1_basic.slotting.json"
+    )
+    racks = racks_from_layout(payload["assignments"])
+    mapping = assign_workstations(tasks, selected)
+    reference = simulate_day(
+        value, GridRouter(value), racks, tasks, mapping, selected
+    )
+    library, _hash, _seconds = _build()
+    native = NativeDayEngine(library).simulate(
+        GridRouter(value), racks, tasks, mapping, selected
+    )
+    assert native.metrics == reference.metrics
+    assert native.jobs == reference.jobs
+
+
+def test_native_prefix_fuzz_matches_python_solver():
+    rng = random.Random(7)
+    kernel, _info = load_native(4, "native")
+    try:
+        for _case in range(100):
+            paths = []
+            starts = rng.sample(range(20), 4)
+            for start in starts:
+                tail = rng.sample([node for node in range(20) if node != start], 4)
+                paths.append((start, *tail))
+            ranks = tuple(rng.sample(range(4), 4))
+            for index, path in enumerate(paths):
+                kernel.set_path(index, path)
+            candidates = paths[0][1:]
+            expected_safe = len(candidates)
+            expected = None
+            for candidate_index, candidate in enumerate(candidates):
+                selected = paths[0][paths[0].index(candidate):]
+                current = (selected, *paths[1:])
+                for conflict in partial_conflicts(current, 0):
+                    winner = min(conflict.agent_indices, key=ranks.__getitem__)
+                    if conflict.kind == "cycle" or winner != 0:
+                        expected_safe = candidate_index
+                        expected = (conflict, None if conflict.kind == "cycle" else winner)
+                        break
+                if expected is not None:
+                    break
+            actual = kernel.check_prefix(0, candidates, ranks)
+            assert actual.safe_count == expected_safe
+            if expected is None:
+                assert actual.kind is None
+            else:
+                conflict, winner = expected
+                assert actual.kind == conflict.kind
+                assert actual.overlap_node == conflict.overlap_node
+                assert actual.participants == conflict.agent_indices
+                assert actual.winner == winner
+    finally:
+        kernel.close()
 
 
 def test_dram_wait_configuration_is_snapshotted():
@@ -344,7 +587,16 @@ def test_daily_reset_batch_debug_parity_and_summary_math():
     value, racks = project(), {"G2_0": Rack("G2_0", (2, 0), frozenset({"A"}))}
     first = simulate_day(value, GridRouter(value), racks, [task("S", {"A": 2})], {"S": "WS"}, config())
     traced = simulate_day(value, GridRouter(value), racks, [task("S", {"A": 2})], {"S": "WS"}, config(), trace=True)
+    native = simulate_day(
+        value, GridRouter(value), racks, [task("S", {"A": 2})], {"S": "WS"},
+        config(), trace=True, coordination_backend="native",
+    )
     assert first.metrics == traced.metrics
+    assert native.metrics == traced.metrics
+    assert native.jobs == traced.jobs
+    assert native.events == traced.events
+    assert native.motion_segments == traced.motion_segments
+    assert native.paths == traced.paths
     assert traced.events and traced.motion_segments
     controller = PlaybackController.from_result(traced)
     controller.toggle()

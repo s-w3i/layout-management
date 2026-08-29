@@ -27,6 +27,8 @@ from amr_simulation.inputs import (
     validate_inputs,
 )
 from amr_simulation.models import SimulationConfig
+from amr_simulation.native_backend import load_native
+from amr_simulation.native_day_backend import load_day_engine
 from amr_simulation.results import export_layout_results, write_csv, write_json
 from amr_simulation.routing import GridRouter
 
@@ -52,10 +54,15 @@ def _duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
 
 
-def _simulate_one(name, index, project, racks, tasks, mapping, config, trace):
+def _simulate_one(
+    name, index, project, racks, tasks, mapping, config, trace,
+    coordination_backend, simulation_backend,
+):
     started = time.monotonic()
     result = simulate_day(
-        project, GridRouter(project), racks, tasks, mapping, config, trace=trace
+        project, GridRouter(project), racks, tasks, mapping, config, trace=trace,
+        coordination_backend=coordination_backend,
+        simulation_backend=simulation_backend,
     )
     return name, index, result, time.monotonic() - started
 
@@ -108,6 +115,14 @@ def parser() -> argparse.ArgumentParser:
         "--speed", type=float, default=120.0,
         help="debug multiplier in simulation seconds per real second (default: 120)",
     )
+    value.add_argument(
+        "--coordination-backend", choices=("auto", "python", "native"),
+        default="python", help=argparse.SUPPRESS,
+    )
+    value.add_argument(
+        "--simulation-backend", choices=("auto", "python", "native"),
+        default="auto", help="day simulation implementation (default: auto)",
+    )
     return value
 
 
@@ -142,7 +157,27 @@ def main(argv: list[str] | None = None) -> int:
         workload = load_workload(args.orders)
         tasks = workload.select(start, end)
         mapping = assign_workstations(tasks, config)
-    except (OSError, ValueError) as exc:
+        day_engine, simulation_backend_info = load_day_engine(
+            args.simulation_backend
+        )
+        warm_kernel, backend_info = load_native(
+            config.amr_count, args.coordination_backend
+        )
+        if warm_kernel is not None:
+            warm_kernel.close()
+        if backend_info.fallback_reason:
+            print(
+                f"warning: native coordination unavailable; using Python: "
+                f"{backend_info.fallback_reason}",
+                file=sys.stderr,
+            )
+        if simulation_backend_info.fallback_reason:
+            print(
+                "warning: native day simulation unavailable; using Python: "
+                f"{simulation_backend_info.fallback_reason}",
+                file=sys.stderr,
+            )
+    except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -194,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
             futures = {
                 pool.submit(
                     _simulate_one, name, index, project, racks, day_tasks,
-                    mapping, config, retain_events,
+                    mapping, config, retain_events, backend_info.selected,
+                    simulation_backend_info.selected,
                 ): name
                 for name, racks, _report, _directory in loaded_layouts
                 for index, day_tasks in enumerate(dated_tasks)
@@ -233,6 +269,8 @@ def main(argv: list[str] | None = None) -> int:
                     simulate_day(
                         project, router, racks, day_tasks, mapping, config,
                         trace=retain_events,
+                        coordination_backend=backend_info.selected,
+                        simulation_backend=simulation_backend_info.selected,
                     )
                 )
                 if args.mode == "batch":
@@ -263,6 +301,18 @@ def main(argv: list[str] | None = None) -> int:
         "layout_count": len(loaded_layouts),
         "date_count": len(dates),
         "workers_requested": args.workers,
+        "simulation_backend_requested": simulation_backend_info.requested,
+        "simulation_backend": simulation_backend_info.selected,
+        "simulation_build_hash": simulation_backend_info.build_hash,
+        "simulation_compile_seconds": simulation_backend_info.compile_seconds,
+        "native_simulation_seconds": simulation_backend_info.native_simulation_seconds,
+        "native_decoding_seconds": simulation_backend_info.decoding_seconds,
+        "simulation_fallback_reason": simulation_backend_info.fallback_reason,
+        "coordination_backend_requested": backend_info.requested,
+        "coordination_backend": backend_info.selected,
+        "coordination_build_hash": backend_info.build_hash,
+        "coordination_compile_seconds": backend_info.compile_seconds,
+        "coordination_fallback_reason": backend_info.fallback_reason,
         "workers_used": (
             min(args.workers, len(loaded_layouts) * len(dates))
             if args.mode == "batch" and dates else 1
