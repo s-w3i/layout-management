@@ -11,6 +11,7 @@ SLOTTING_SCHEMA = "inventory_slotting_layout/v2"
 
 DEFAULT_BUILDING_INPUT = PROJECT_ROOT / "resources/map/demo.building.yaml"
 DEFAULT_BUILDING_OUTPUT = PROJECT_ROOT / "resources/map/v6.building.yaml"
+DEFAULT_MAP_DIR = PROJECT_ROOT / "resources/map"
 DEFAULT_GRID_INPUT = PROJECT_ROOT / "resources/map/map1.grid.json"
 DEFAULT_AFFINITY_INPUT = PROJECT_ROOT / "resources/data/Sample Data.xlsx"
 DEFAULT_AFFINITY_CACHE = PROJECT_ROOT / ".cache/rmf_grid_map_editor/affinity"
