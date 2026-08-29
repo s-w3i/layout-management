@@ -33,6 +33,17 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         )
 
 
+def append_csv_row(path: Path, row: dict) -> None:
+    """Append one fixed-schema row, creating the CSV header when needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(row))
+        if new_file:
+            writer.writeheader()
+        writer.writerow({key: _csv_value(value) for key, value in row.items()})
+
+
 def daily_row(result: DayResult, workstations: tuple[str, ...]) -> dict:
     metrics = result.metrics
     row = {

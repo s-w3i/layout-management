@@ -23,9 +23,11 @@ from amr_simulation.inputs import (
     validate_inputs,
 )
 from amr_simulation.models import (
+    DayResult,
     MotionProfile,
     Rack,
     SimulationConfig,
+    ValidationReport,
     WorkloadTask,
     grid_name,
     grid_position,
@@ -326,6 +328,38 @@ def test_daily_reset_batch_debug_parity_and_summary_math():
         first.metrics["completed_lines"] + second.metrics["completed_lines"]
     ) / (first.metrics["makespan_hours"] + second.metrics["makespan_hours"])
     assert math.isclose(summary["weighted_throughput_lines_per_hour"], expected_weighted)
+
+
+def test_batch_layout_worker_discards_heavy_day_state(monkeypatch, tmp_path):
+    import amr_simulation.run_simulation as runner
+
+    value = project()
+    selected = config()
+    workload = [task("S", {"A": 1})]
+    base = simulate_day(
+        value, GridRouter(value),
+        {"G2_0": Rack("G2_0", (2, 0), frozenset({"A"}))},
+        workload, {"S": "WS"}, selected, trace=True,
+    )
+    captured = {}
+
+    monkeypatch.setattr(runner, "simulate_day", lambda *_args, **_kwargs: base)
+
+    def capture(_directory, _name, results, *_args):
+        captured["results"] = results
+        return {"layout": "layout"}
+
+    monkeypatch.setattr(runner, "export_layout_results", capture)
+    summary = runner._simulate_layout(
+        "layout", value,
+        {"G2_0": Rack("G2_0", (2, 0), frozenset({"A"}))},
+        [workload, workload], {"S": "WS"}, selected, False, None,
+        tmp_path, ValidationReport(),
+    )
+
+    assert summary == {"layout": "layout"}
+    assert len((tmp_path / "daily_metrics.csv").read_text().splitlines()) == 3
+    assert all(result == DayResult(metrics=base.metrics) for result in captured["results"])
 
 
 def test_two_layout_hand_calculated_comparison():

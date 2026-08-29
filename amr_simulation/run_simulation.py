@@ -28,8 +28,14 @@ from amr_simulation.inputs import (
     racks_from_layout,
     validate_inputs,
 )
-from amr_simulation.models import SimulationConfig
-from amr_simulation.results import export_layout_results, write_csv, write_json
+from amr_simulation.models import DayResult, SimulationConfig
+from amr_simulation.results import (
+    append_csv_row,
+    daily_row,
+    export_layout_results,
+    write_csv,
+    write_json,
+)
 from amr_simulation.routing import GridRouter
 
 
@@ -48,16 +54,29 @@ def _layout_name(path: Path) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "layout"
 
 
-def _simulate_layout(name, project, racks, dated_tasks, mapping, config, trace, progress_queue):
-    router = GridRouter(project)
+def _simulate_layout(
+    name, project, racks, dated_tasks, mapping, config, trace, progress_queue,
+    directory, report,
+):
+    """Simulate and checkpoint one layout without retaining heavy day state."""
     results = []
+    daily_path = directory / "daily_metrics.csv"
+    daily_path.unlink(missing_ok=True)
     for tasks in dated_tasks:
-        results.append(
-            simulate_day(project, router, racks, tasks, mapping, config, trace=trace)
+        # Route caches are day-local; retaining them across 179 days only grows RAM.
+        result = simulate_day(
+            project, GridRouter(project), racks, tasks, mapping, config, trace=trace
         )
+        append_csv_row(daily_path, daily_row(result, config.workstations))
+        # Detailed logs intentionally retain full results. Normal batch runs keep
+        # metrics only and release jobs, paths, events, and motion segments now.
+        results.append(result if trace else DayResult(metrics=result.metrics))
         if progress_queue is not None:
             progress_queue.put(name)
-    return results
+    all_tasks = [task for day in dated_tasks for task in day]
+    return export_layout_results(
+        directory, name, results, config, mapping, all_tasks, report, trace
+    )
 
 
 def _show_progress(
@@ -191,9 +210,10 @@ def main(argv: list[str] | None = None) -> int:
             futures = {
                 pool.submit(
                     _simulate_layout, name, project, racks, dated_tasks,
-                    mapping, config, retain_events, progress_queue,
+                    mapping, config, retain_events, progress_queue, directory,
+                    report,
                 ): name
-                for name, racks, _report, _directory in loaded_layouts
+                for name, racks, report, directory in loaded_layouts
             }
             pending = set(futures)
             while pending:
@@ -207,43 +227,49 @@ def main(argv: list[str] | None = None) -> int:
                     pass
                 finished = {future for future in pending if future.done()}
                 for future in finished:
-                    completed[futures[future]] = future.result()
+                    name = futures[future]
+                    completed[name] = future.result()
+                    if progress[name] < len(dates):
+                        progress[name] = len(dates)
+                        _show_progress(
+                            progress, len(dates), started, redraw=True,
+                            changed=name,
+                        )
                 pending -= finished
     else:
-        for name, racks, _report, _directory in loaded_layouts:
-            router = GridRouter(project)
-            results = []
-            for day_tasks in dated_tasks:
-                results.append(
-                    simulate_day(
-                        project, router, racks, day_tasks, mapping, config,
-                        trace=retain_events,
-                    )
-                )
-                if args.mode == "batch":
-                    progress[name] += 1
-                    _show_progress(
-                        progress, len(dates), started, redraw=True, changed=name
-                    )
-            completed[name] = results
+        for name, racks, report, directory in loaded_layouts:
+            if args.mode == "batch":
+                class _Progress:
+                    def put(self, changed):
+                        progress[changed] += 1
+                        _show_progress(
+                            progress, len(dates), started, redraw=True,
+                            changed=changed,
+                        )
 
-    if args.mode == "batch" and dates:
-        while sum(progress.values()) < len(names) * len(dates):
-            name = progress_queue.get()
-            progress[name] += 1
-            _show_progress(
-                progress, len(dates), started, redraw=True, changed=name
-            )
+                completed[name] = _simulate_layout(
+                    name, project, racks, dated_tasks, mapping, config,
+                    retain_events, _Progress(), directory, report,
+                )
+            else:
+                completed[name] = [simulate_day(
+                    project, GridRouter(project), racks, dated_tasks[0],
+                    mapping, config, trace=True,
+                )]
 
     summaries = []
     debug_result = None
     for name, racks, report, directory in loaded_layouts:
-        results = completed[name]
-        summary = export_layout_results(
-            directory, name, results, config, mapping, tasks, report, retain_events
-        )
+        if args.mode == "batch":
+            summary = completed[name]
+        else:
+            results = completed[name]
+            summary = export_layout_results(
+                directory, name, results, config, mapping, tasks, report,
+                retain_events,
+            )
+            debug_result = results[0]
         summaries.append(summary)
-        debug_result = results[0] if args.mode == "debug" else None
     if len(summaries) > 1:
         write_csv(output / "layout_comparison.csv", summaries)
     if debug_result is not None:
