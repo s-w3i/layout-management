@@ -19,7 +19,6 @@ from .models import (
     grid_name,
     grid_position,
 )
-from .native_backend import load_native
 from .routing import GridRouter, Route
 
 
@@ -131,7 +130,6 @@ class _Engine:
         mapping: dict[str, str],
         config: SimulationConfig,
         trace: bool,
-        coordination_backend: str,
     ):
         self.project, self.router, self.racks, self.config = project, router, racks, config
         self.trace = trace
@@ -144,18 +142,6 @@ class _Engine:
             _AMR(f"AMR_{index + 1:02d}", grid_position(node), initial_heading)
             for index, node in enumerate(config.spawn_nodes)
         ]
-        self.native_kernel, self.backend_info = load_native(
-            len(self.amrs), coordination_backend
-        )
-        self.native_agent_ids = {
-            amr.amr_id: index for index, amr in enumerate(self.amrs)
-        }
-        native_nodes = sorted(router.coordinates)
-        self.native_node_ids = {node: index for index, node in enumerate(native_nodes)}
-        self.native_nodes = tuple(native_nodes)
-        self.native_resolution_active = False
-        self.native_deferred_paths: dict[str, tuple[tuple[int, int], ...] | None] = {}
-        self.native_synced_paths: dict[str, tuple[tuple[int, int], ...]] = {}
         self.node_owners = {amr.position: amr.amr_id for amr in self.amrs}
         self.stations = {
             station: _Station(station, router.workstations[station])
@@ -483,12 +469,6 @@ class _Engine:
             job.completion_time = now
             self.active_jobs.pop(job.amr.amr_id, None)
             self.active_cache = None
-            if self.native_kernel is not None:
-                if self.native_resolution_active:
-                    self.native_deferred_paths[job.amr.amr_id] = None
-                else:
-                    self.native_kernel.remove(self.native_agent_ids[job.amr.amr_id])
-                    self.native_synced_paths.pop(job.amr.amr_id, None)
             self._update_route_membership(job, ())
             self.coordination_generation += 1
             job.task.inflight -= 1
@@ -577,22 +557,6 @@ class _Engine:
         job.remaining_path_cache = ()
         job.remaining_path_position = None
         self.coordination_generation += 1
-
-    def _sync_native_path(
-        self, job: _Job, positions: tuple[tuple[int, int], ...]
-    ) -> None:
-        if self.native_kernel is None:
-            return
-        if self.native_synced_paths.get(job.amr.amr_id) == positions:
-            return
-        if self.native_resolution_active:
-            self.native_deferred_paths[job.amr.amr_id] = positions
-            return
-        self.native_kernel.set_path(
-            self.native_agent_ids[job.amr.amr_id],
-            tuple(self.native_node_ids[node] for node in positions),
-        )
-        self.native_synced_paths[job.amr.amr_id] = positions
 
     def _update_route_membership(
         self, job: _Job, remaining: tuple[tuple[int, int], ...]
@@ -735,12 +699,6 @@ class _Engine:
         base_paths: dict[str, tuple[tuple[int, int], ...]],
     ) -> bool:
         blocker = self.active_jobs.get(blocker_id)
-        if self.config.mutex_passage_enabled and blocker and self.native_kernel is not None:
-            return self.native_kernel.following(
-                self.native_agent_ids[job.amr.amr_id],
-                self.native_agent_ids[blocker_id],
-                self.native_node_ids[blocked],
-            )
         return bool(
             self.config.mutex_passage_enabled
             and blocker
@@ -840,17 +798,7 @@ class _Engine:
             or first_id not in self.wait_for.get(second_id, set())
         ):
             return "deny"
-        if self.native_kernel is not None:
-            passage_nodes = tuple(
-                self.native_nodes[node]
-                for node in self.native_kernel.reversed_passage(
-                    self.native_agent_ids[first_id], self.native_agent_ids[second_id]
-                )
-            )
-        else:
-            passage_nodes = reversed_passage(
-                base_paths[first.job_id], base_paths[second.job_id]
-            )
+        passage_nodes = reversed_passage(base_paths[first.job_id], base_paths[second.job_id])
         if len(passage_nodes) < 2:
             return "deny"
         key = frozenset(passage_nodes)
@@ -983,50 +931,12 @@ class _Engine:
             node = next_node
         return None, [], None
 
-    def _native_conflict_after_prefix(
-        self,
-        selected: _Job,
-        candidates: list[tuple[int, int]],
-        context: _ConflictContext,
-    ) -> tuple[int, DramConflict | None, list[_Job], _Job | None]:
-        ranks = [len(self.amrs)] * len(self.amrs)
-        for rank, job in enumerate(sorted(context.active, key=self._priority_key)):
-            ranks[self.native_agent_ids[job.amr.amr_id]] = rank
-        result = self.native_kernel.check_prefix(
-            self.native_agent_ids[selected.amr.amr_id],
-            tuple(self.native_node_ids[node] for node in candidates),
-            tuple(ranks),
-        )
-        if result.kind is None:
-            return result.safe_count, None, [], None
-        involved = [
-            self.active_jobs[self.amrs[index].amr_id]
-            for index in result.participants
-            if self.amrs[index].amr_id in self.active_jobs
-        ]
-        indices = tuple(
-            sorted(context.active_indices[job.amr.amr_id] for job in involved)
-        )
-        conflict = DramConflict(
-            result.kind,
-            indices,
-            self.native_nodes[result.overlap_node],
-        )
-        winner = (
-            self.active_jobs.get(self.amrs[result.winner].amr_id)
-            if result.winner is not None else None
-        )
-        return result.safe_count, conflict, involved, winner
-
     def _conflict_context(self) -> _ConflictContext:
         if self.active_cache is None:
             self.active_cache = tuple(
                 self.active_jobs[amr_id] for amr_id in sorted(self.active_jobs)
             )
         paths = {job.job_id: self._remaining_path(job) for job in self.active_cache}
-        if self.native_kernel is not None:
-            for job in self.active_cache:
-                self._sync_native_path(job, paths[job.job_id])
         next_edges = {
             path[0]: (path[1], index)
             for index, job in enumerate(self.active_cache)
@@ -1070,8 +980,6 @@ class _Engine:
             key=self._priority_key,
         )
         context = self._conflict_context()
-        if self.native_kernel is not None:
-            self.native_resolution_active = True
         active = context.active
         active_indices = context.active_indices
         base_paths = context.paths
@@ -1102,44 +1010,29 @@ class _Engine:
                 available.append(node)
             if blocker is None:
                 safe = []
-                remaining = available
-                while remaining:
-                    if self.native_kernel is not None:
-                        count, conflict, conflicting_jobs, winner = (
-                            self._native_conflict_after_prefix(job, remaining, context)
-                        )
-                        safe.extend(remaining[:count])
-                        node = remaining[count] if conflict is not None else None
-                    else:
-                        node = remaining[0]
-                        conflict, conflicting_jobs, winner = self._dram_conflict_after(
-                            job,
-                            active_indices[job.amr.amr_id],
-                            node,
-                            context,
-                        )
-                        count = 0
-                    if conflict is None:
-                        if self.native_kernel is None:
-                            safe.append(node)
-                            remaining = remaining[1:]
-                            continue
+                for node in available:
+                    conflict, conflicting_jobs, winner = self._dram_conflict_after(
+                        job,
+                        active_indices[job.amr.amr_id],
+                        node,
+                        context,
+                    )
+                    if conflict is not None:
+                        if conflict.kind == "head_to_head":
+                            corridor = self._corridor_resolution(
+                                job, conflicting_jobs, base_paths, now
+                            )
+                            if corridor == "allow":
+                                conflict = None
+                                safe.append(node)
+                                continue
+                            if corridor == "rerouted":
+                                coordination_rerouted = True
+                            elif corridor == "deny":
+                                corridor_blocked = True
+                        blocker = conflict.overlap_node
                         break
-                    if conflict.kind == "head_to_head":
-                        corridor = self._corridor_resolution(
-                            job, conflicting_jobs, base_paths, now
-                        )
-                        if corridor == "allow":
-                            conflict = None
-                            safe.append(node)
-                            remaining = remaining[count + 1:]
-                            continue
-                        if corridor == "rerouted":
-                            coordination_rerouted = True
-                        elif corridor == "deny":
-                            corridor_blocked = True
-                    blocker = conflict.overlap_node
-                    break
+                    safe.append(node)
                 available = safe
             if coordination_rerouted:
                 continue
@@ -1261,20 +1154,6 @@ class _Engine:
             job.conflict_signature = None
             job.conflict_amrs = ()
             self._move_reserved(job, available, now)
-        if self.native_kernel is not None:
-            self.native_resolution_active = False
-            for amr_id, positions in self.native_deferred_paths.items():
-                agent = self.native_agent_ids[amr_id]
-                if positions is None:
-                    self.native_kernel.remove(agent)
-                    self.native_synced_paths.pop(amr_id, None)
-                else:
-                    self.native_kernel.set_path(
-                        agent,
-                        tuple(self.native_node_ids[node] for node in positions),
-                    )
-                    self.native_synced_paths[amr_id] = positions
-            self.native_deferred_paths.clear()
 
     def _move_reserved(
         self, job: _Job, reserved: list[tuple[int, int]], now: float
@@ -1514,24 +1393,10 @@ def simulate_day(
     config: SimulationConfig,
     *,
     trace: bool = False,
-    coordination_backend: str = "python",
-    simulation_backend: str = "python",
 ) -> DayResult:
     if not tasks:
         raise ValueError("cannot simulate an empty day")
     dates = {task.task_date for task in tasks}
     if len(dates) != 1:
         raise ValueError("simulate_day requires tasks from exactly one date")
-    if simulation_backend == "native":
-        from .native_day_backend import load_day_engine
-
-        native, _info = load_day_engine("native")
-        return native.simulate(
-            router, racks, tasks, workstation_mapping, config, trace
-        )
-    if simulation_backend != "python":
-        raise ValueError(f"unsupported selected simulation backend: {simulation_backend}")
-    return _Engine(
-        project, router, racks, tasks, workstation_mapping, config, trace,
-        coordination_backend,
-    ).run()
+    return _Engine(project, router, racks, tasks, workstation_mapping, config, trace).run()
