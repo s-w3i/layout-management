@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+project(lacam_dte_planner CXX)
+add_subdirectory(third_party/lacam0/lacam)
+add_executable(lacam_bridge cpp/bridge.cpp)
+target_compile_features(lacam_bridge PRIVATE cxx_std_17)
+target_link_libraries(lacam_bridge PRIVATE lacam)
