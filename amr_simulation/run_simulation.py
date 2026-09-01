@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import ctypes
+import gc
 import os
 import re
 import sys
@@ -28,10 +31,11 @@ from amr_simulation.inputs import (
     racks_from_layout,
     validate_inputs,
 )
-from amr_simulation.models import DayResult, SimulationConfig
+from amr_simulation.models import SimulationConfig
 from amr_simulation.results import (
     append_csv_row,
     daily_row,
+    export_layout_summary,
     export_layout_results,
     write_csv,
     write_json,
@@ -40,6 +44,48 @@ from amr_simulation.routing import GridRouter
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _release_day_memory() -> None:
+    """Collect a completed day and return free glibc heap pages when available."""
+    gc.collect()
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
+
+
+_INTEGER_METRICS = {
+    "completed_lines", "completed_tasks", "rack_presentations",
+    "reservation_conflicts", "node_ownership_conflicts",
+    "dram_solver_conflicts", "reservation_reroutes",
+    "dram_solver_reroutes", "max_reserved_nodes", "deadlock_count",
+    "coordination_fallback_count",
+}
+_SUMMARY_METRICS = {
+    "date", "completed_lines", "completed_tasks", "rack_presentations",
+    "makespan_hours", "line_throughput_per_hour", "travel_distance_m",
+    "station_queue_time_seconds", "node_reservation_wait_seconds",
+    "reservation_conflicts", "node_ownership_conflicts",
+    "dram_solver_conflicts", "reservation_reroutes", "dram_solver_reroutes",
+    "dram_conflict_wait_seconds", "amr_utilization",
+    "coordination_fallback_count",
+}
+
+
+def _checkpoint_metrics(path: Path) -> list[dict]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    metrics = []
+    for row in rows:
+        item = {"date": row["date"]}
+        for key in _SUMMARY_METRICS - {"date"}:
+            value = row.get(key, "0") or "0"
+            item[key] = int(float(value)) if key in _INTEGER_METRICS else float(value)
+        metrics.append(item)
+    return metrics
 
 
 def _date(value: str) -> date:
@@ -61,8 +107,16 @@ def _simulate_layout(
     """Simulate and checkpoint one layout without retaining heavy day state."""
     results = []
     daily_path = directory / "daily_metrics.csv"
-    daily_path.unlink(missing_ok=True)
+    metrics = [] if trace else _checkpoint_metrics(daily_path)
+    completed_dates = {item["date"] for item in metrics}
+    if trace:
+        daily_path.unlink(missing_ok=True)
     for tasks in dated_tasks:
+        task_date = tasks[0].task_date.isoformat()
+        if not trace and task_date in completed_dates:
+            if progress_queue is not None:
+                progress_queue.put(name)
+            continue
         # Route caches are day-local; retaining them across 179 days only grows RAM.
         result = simulate_day(
             project, GridRouter(project), racks, tasks, mapping, config, trace=trace
@@ -70,10 +124,20 @@ def _simulate_layout(
         append_csv_row(daily_path, daily_row(result, config.workstations))
         # Detailed logs intentionally retain full results. Normal batch runs keep
         # metrics only and release jobs, paths, events, and motion segments now.
-        results.append(result if trace else DayResult(metrics=result.metrics))
+        if trace:
+            results.append(result)
+        else:
+            metrics.append(result.metrics)
+            del result
+            _release_day_memory()
         if progress_queue is not None:
             progress_queue.put(name)
     all_tasks = [task for day in dated_tasks for task in day]
+    if not trace:
+        metrics.sort(key=lambda item: item["date"])
+        return export_layout_summary(
+            directory, name, metrics, config, mapping, all_tasks, report
+        )
     return export_layout_results(
         directory, name, results, config, mapping, all_tasks, report, trace
     )

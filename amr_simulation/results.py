@@ -37,8 +37,25 @@ def append_csv_row(path: Path, row: dict) -> None:
     """Append one fixed-schema row, creating the CSV header when needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     new_file = not path.exists() or path.stat().st_size == 0
+    fields = list(row)
+    if not new_file:
+        with path.open(newline="", encoding="utf-8") as stream:
+            reader = csv.reader(stream)
+            existing_fields = next(reader)
+            existing_rows = list(reader)
+        if existing_fields != fields:
+            normalized = [
+                dict(zip(existing_fields, values)) for values in existing_rows
+            ]
+            with path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(
+                    {key: values.get(key, "") for key in fields}
+                    for values in normalized
+                )
     with path.open("a", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(row))
+        writer = csv.DictWriter(stream, fieldnames=fields)
         if new_file:
             writer.writeheader()
         writer.writerow({key: _csv_value(value) for key, value in row.items()})
@@ -60,62 +77,67 @@ def daily_row(result: DayResult, workstations: tuple[str, ...]) -> dict:
     return row
 
 
-def summarize(layout_name: str, results: list[DayResult]) -> dict:
-    throughputs = [result.metrics["line_throughput_per_hour"] for result in results]
-    total_lines = sum(result.metrics["completed_lines"] for result in results)
-    total_hours = sum(result.metrics["makespan_hours"] for result in results)
+def summarize_metrics(layout_name: str, metrics: list[dict]) -> dict:
+    throughputs = [item["line_throughput_per_hour"] for item in metrics]
+    total_lines = sum(item["completed_lines"] for item in metrics)
+    total_hours = sum(item["makespan_hours"] for item in metrics)
     return {
         "layout": layout_name,
-        "days": len(results),
+        "days": len(metrics),
         "total_completed_lines": total_lines,
-        "total_tasks": sum(result.metrics["completed_tasks"] for result in results),
-        "total_rack_presentations": sum(result.metrics["rack_presentations"] for result in results),
-        "total_travel_distance_m": sum(result.metrics["travel_distance_m"] for result in results),
-        "total_station_queue_time_seconds": sum(result.metrics["station_queue_time_seconds"] for result in results),
+        "total_tasks": sum(item["completed_tasks"] for item in metrics),
+        "total_rack_presentations": sum(item["rack_presentations"] for item in metrics),
+        "total_travel_distance_m": sum(item["travel_distance_m"] for item in metrics),
+        "total_station_queue_time_seconds": sum(item["station_queue_time_seconds"] for item in metrics),
         "total_node_reservation_wait_seconds": sum(
-            result.metrics["node_reservation_wait_seconds"] for result in results
+            item["node_reservation_wait_seconds"] for item in metrics
         ),
         "total_reservation_conflicts": sum(
-            result.metrics["reservation_conflicts"] for result in results
+            item["reservation_conflicts"] for item in metrics
         ),
         "total_node_ownership_conflicts": sum(
-            result.metrics["node_ownership_conflicts"] for result in results
+            item["node_ownership_conflicts"] for item in metrics
         ),
         "total_dram_solver_conflicts": sum(
-            result.metrics["dram_solver_conflicts"] for result in results
+            item["dram_solver_conflicts"] for item in metrics
         ),
         "total_reservation_reroutes": sum(
-            result.metrics["reservation_reroutes"] for result in results
+            item["reservation_reroutes"] for item in metrics
         ),
         "total_dram_solver_reroutes": sum(
-            result.metrics["dram_solver_reroutes"] for result in results
+            item["dram_solver_reroutes"] for item in metrics
         ),
         "total_dram_conflict_wait_seconds": sum(
-            result.metrics["dram_conflict_wait_seconds"] for result in results
+            item["dram_conflict_wait_seconds"] for item in metrics
+        ),
+        "total_coordination_fallbacks": sum(
+            item.get("coordination_fallback_count", 0) for item in metrics
         ),
         "mean_daily_throughput_lines_per_hour": fmean(throughputs),
         "weighted_throughput_lines_per_hour": total_lines / total_hours if total_hours else 0.0,
-        "mean_amr_utilization": fmean(result.metrics["amr_utilization"] for result in results),
+        "mean_amr_utilization": fmean(item["amr_utilization"] for item in metrics),
         "model_limitations": [
             "Node ownership is modeled without a time-expanded reservation table.",
             "Inventory depletion and quantity-dependent service time are not modeled.",
+            "Repeated coordination states use serialized recovery and are counted explicitly.",
         ],
     }
 
 
-def export_layout_results(
+def summarize(layout_name: str, results: list[DayResult]) -> dict:
+    return summarize_metrics(layout_name, [result.metrics for result in results])
+
+
+def export_layout_summary(
     directory: Path,
     layout_name: str,
-    results: list[DayResult],
+    metrics: list[dict],
     config: SimulationConfig,
     mapping: dict[str, str],
     tasks: list[WorkloadTask],
     report: ValidationReport,
-    event_log: bool,
 ) -> dict:
-    directory.mkdir(parents=True, exist_ok=True)
-    write_csv(directory / "daily_metrics.csv", [daily_row(result, config.workstations) for result in results])
-    summary = summarize(layout_name, results)
+    summary = summarize_metrics(layout_name, metrics)
     write_json(directory / "summary.json", summary)
     write_json(directory / "config_snapshot.json", config.snapshot())
     workloads = {
@@ -132,6 +154,25 @@ def export_layout_results(
         },
     )
     write_json(directory / "validation_report.json", report.to_dict())
+    return summary
+
+
+def export_layout_results(
+    directory: Path,
+    layout_name: str,
+    results: list[DayResult],
+    config: SimulationConfig,
+    mapping: dict[str, str],
+    tasks: list[WorkloadTask],
+    report: ValidationReport,
+    event_log: bool,
+) -> dict:
+    directory.mkdir(parents=True, exist_ok=True)
+    write_csv(directory / "daily_metrics.csv", [daily_row(result, config.workstations) for result in results])
+    summary = export_layout_summary(
+        directory, layout_name, [result.metrics for result in results],
+        config, mapping, tasks, report,
+    )
     if event_log:
         rows = []
         for result in results:

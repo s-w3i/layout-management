@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import heapq
 import math
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from warehouse_layout.domain import GridProject
 
@@ -19,6 +20,12 @@ from .models import (
     grid_position,
 )
 from .routing import GridRouter, Route
+
+
+MAX_EVENTS_WITHOUT_COMPLETION = 1_000_000
+MAX_WALL_SECONDS_WITHOUT_COMPLETION = 120.0
+MAX_DAY_WALL_SECONDS = 300.0
+MAX_REROUTES_PER_DAY = 10_000
 
 
 @dataclass(slots=True)
@@ -81,6 +88,8 @@ class _Job:
     dram_wait_seconds: float = 0.0
     dram_wait_since: float | None = None
     parking_backoff: bool = False
+    reroute_state: tuple | None = None
+    repeated_reroute_state: int = 0
 
 
 @dataclass(slots=True)
@@ -91,6 +100,7 @@ class _Station:
     service_seconds: float = 0.0
     queue_wait_seconds: float = 0.0
     max_queue: int = 0
+    waiting: list[_Job] = field(default_factory=list)
 
 
 class _Engine:
@@ -145,6 +155,14 @@ class _Engine:
         self.turn_cache: dict[tuple[tuple[int, int], ...], tuple[int, ...]] = {}
         self.processed_events = 0
         self.next_calendar_compaction = 50_000
+        self.last_completion_event = 0
+        self.last_completion_wall = time.monotonic()
+        self.started_wall = self.last_completion_wall
+        self.completed_job_count = 0
+        self.coordination_fallback = False
+        self.coordination_fallback_count = 0
+        self.fallback_job_id: str | None = None
+        self.fallback_reroute_baseline = 0
 
     def schedule(self, when: float, kind: str, payload: object) -> None:
         self.sequence += 1
@@ -177,6 +195,23 @@ class _Engine:
                 self.dispatch_needed = False
                 self._dispatch(now)
             self._resolve_reservations(now)
+            completed = sum(job.completion_time is not None for job in self.jobs)
+            if completed != self.completed_job_count:
+                self.completed_job_count = completed
+                self.last_completion_event = self.processed_events
+                self.last_completion_wall = time.monotonic()
+            elif (
+                not self.coordination_fallback
+                and (
+                    self.processed_events - self.last_completion_event
+                    >= MAX_EVENTS_WITHOUT_COMPLETION
+                    or time.monotonic() - self.last_completion_wall
+                    >= MAX_WALL_SECONDS_WITHOUT_COMPLETION
+                    or time.monotonic() - self.started_wall
+                    >= MAX_DAY_WALL_SECONDS
+                )
+            ):
+                self._enable_coordination_fallback(now, "liveness_limit")
             if self.processed_events >= self.next_calendar_compaction:
                 self._compact_calendar()
                 self.next_calendar_compaction += 50_000
@@ -209,6 +244,26 @@ class _Engine:
             self.calendar = compacted
             heapq.heapify(self.calendar)
 
+    def _enable_coordination_fallback(self, now: float, reason: str) -> None:
+        """Guarantee liveness by serializing jobs after pathological churn."""
+        self.coordination_fallback = True
+        self.coordination_fallback_count += 1
+        self.coordination_fallback_reason = reason
+        self.fallback_reroute_baseline = self.reroute_count
+        self.fallback_job_id = None
+        for job in self.pending.values():
+            job.tabu.clear()
+            job.blocked_node = None
+            job.blocked_reason = None
+            job.conflict_signature = None
+            job.conflict_amrs = ()
+            job.wait_token += 1
+        self.pending_dirty.update(self.pending)
+        self.record(
+            now, "coordination_fallback_enabled",
+            processed_events=self.processed_events, reason=reason,
+        )
+
     def _handle(self, now: float, kind: str, payload: object) -> None:
         if kind == "task_release":
             task = payload
@@ -228,6 +283,8 @@ class _Engine:
                     if waiting.blocked_node == previous
                 )
             job.amr.position = position
+            job.reroute_state = None
+            job.repeated_reroute_state = 0
             self.record(now, "node_entered", job, node=grid_name(position))
             self._wake_dram_waiters(job.amr.amr_id)
             return
@@ -249,11 +306,33 @@ class _Engine:
             return
         if kind == "reservation_timeout":
             job, token = payload
+            if self.coordination_fallback:
+                return
             if self.pending.get(job.amr.amr_id) is not job or token != job.wait_token:
                 return
             if job.blocked_node is None or job.blocked_reason is None:
                 return
             if self._hard_station_wait(job) or job.blocked_node == job.stage_goal:
+                return
+            if job.stage_loaded and job.blocked_reason == "node_owned":
+                job.wait_token += 1
+                self.schedule(
+                    now + self.config.dram_conflict_wait_seconds,
+                    "reservation_timeout", (job, job.wait_token),
+                )
+                self.record(now, "loaded_reroute_protected", job)
+                return
+            reroute_state = (
+                job.amr.position, job.stage_goal, job.blocked_node,
+                job.blocked_reason,
+            )
+            if reroute_state == job.reroute_state:
+                job.repeated_reroute_state += 1
+            else:
+                job.reroute_state = reroute_state
+                job.repeated_reroute_state = 1
+            if job.repeated_reroute_state >= 3:
+                self._enable_coordination_fallback(now, "repeated_blocked_state")
                 return
             dram_timeout = job.blocked_reason == "dram_solver"
             if dram_timeout and job.dram_wait_since is not None:
@@ -262,6 +341,12 @@ class _Engine:
             job.tabu.add(job.blocked_node)
             job.reroutes += 1
             self.reroute_count += 1
+            if (
+                self.reroute_count - self.fallback_reroute_baseline
+                >= MAX_REROUTES_PER_DAY
+            ):
+                self._enable_coordination_fallback(now, "reroute_limit")
+                return
             if dram_timeout:
                 self.dram_solver_reroutes += 1
             self.record(now, "tabu_added", job, node=grid_name(job.blocked_node))
@@ -323,7 +408,10 @@ class _Engine:
             job.tabu.clear()
             station = self.stations[job.workstation]
             if station.busy:
-                raise RuntimeError(f"reserved workstation {station.station_id} is already busy")
+                station.waiting.append(job)
+                station.max_queue = max(station.max_queue, len(station.waiting))
+                self.record(now, "station_service_queued", job)
+                return
             station.busy = True
             job.station_arrival = job.service_start = now
             self._stationary(job, "service", now, now + self.config.service_seconds, station.position, True)
@@ -341,6 +429,15 @@ class _Engine:
                 True,
                 "rack_home",
             )
+            if station.waiting:
+                waiting = station.waiting.pop(0)
+                station.busy = True
+                waiting.station_arrival = waiting.service_start = now
+                self.record(now, "service_start", waiting)
+                self.schedule(
+                    now + self.config.service_seconds,
+                    "service_done", waiting,
+                )
         elif kind == "rack_home":
             job.tabu.clear()
             job.rack_return = now
@@ -352,6 +449,9 @@ class _Engine:
             self.dispatch_needed = True
             job.amr.busy_seconds += now - job.dispatch_time
             job.completion_time = now
+            if self.fallback_job_id == job.job_id:
+                self.fallback_job_id = None
+                self.pending_dirty.update(self.pending)
             self.active_jobs.pop(job.amr.amr_id, None)
             job.task.inflight -= 1
             completed = sum(job.lines.values())
@@ -391,6 +491,8 @@ class _Engine:
         job.blocked_reason = None
         job.conflict_signature = None
         job.conflict_amrs = ()
+        job.reroute_state = None
+        job.repeated_reroute_state = 0
         job.wait_token += 1
         if len(route.positions) == 1:
             self.schedule(now, arrival_kind, job)
@@ -522,11 +624,30 @@ class _Engine:
                 if amr_id in self.pending
             ),
             key=lambda job: (
+                int(not job.stage_loaded),
                 self._remaining_distance(job),
                 float(job.request_time),
                 job.amr.amr_id,
             ),
         )
+        if self.coordination_fallback:
+            if self.fallback_job_id is None:
+                candidates = [
+                    job for job in ordered
+                    if not (
+                        job.stage == "to_station"
+                        and self.stations[job.workstation].busy
+                    )
+                ]
+                if not candidates:
+                    self.pending_dirty.update(self.pending)
+                    return
+                self.fallback_job_id = candidates[0].job_id
+            ordered = [
+                job for job in ordered if job.job_id == self.fallback_job_id
+            ]
+            if not ordered:
+                return
         active = tuple(self.active_jobs[amr_id] for amr_id in sorted(self.active_jobs))
         base_paths = {job.job_id: self._remaining_path(job) for job in active}
         for job in ordered:
@@ -543,14 +664,17 @@ class _Engine:
             conflict = None
             conflicting_jobs = []
             winner = None
-            for node in desired:
-                owner = self.node_owners.get(node)
-                if owner is not None and owner != job.amr.amr_id:
-                    blocker = node
-                    blocking_owner = owner
-                    break
-                available.append(node)
-            if blocker is None:
+            if self.coordination_fallback:
+                available = desired
+            else:
+                for node in desired:
+                    owner = self.node_owners.get(node)
+                    if owner is not None and owner != job.amr.amr_id:
+                        blocker = node
+                        blocking_owner = owner
+                        break
+                    available.append(node)
+            if blocker is None and not self.coordination_fallback:
                 safe = []
                 for node in available:
                     conflict, conflicting_jobs, winner = self._dram_conflict_after(
@@ -618,8 +742,9 @@ class _Engine:
                     station.max_queue = max(station.max_queue, waiting)
                 continue
             del self.pending[job.amr.amr_id]
-            for node in available:
-                self.node_owners[node] = job.amr.amr_id
+            if not self.coordination_fallback:
+                for node in available:
+                    self.node_owners[node] = job.amr.amr_id
             self.max_reserved_nodes = max(self.max_reserved_nodes, len(self.node_owners))
             waited = now - float(job.wait_since)
             if waited > 0:
@@ -820,6 +945,10 @@ class _Engine:
             "dram_conflict_wait_seconds": sum(job.dram_wait_seconds for job in self.jobs),
             "max_reserved_nodes": self.max_reserved_nodes,
             "deadlock_count": 0,
+            "coordination_fallback_count": self.coordination_fallback_count,
+            "coordination_fallback_reason": getattr(
+                self, "coordination_fallback_reason", ""
+            ),
             "amr_utilization": (
                 sum(amr.busy_seconds for amr in self.amrs) / (makespan * len(self.amrs))
                 if makespan else 0.0
