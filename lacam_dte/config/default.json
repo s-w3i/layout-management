@@ -15,7 +15,7 @@
   "planner_timeout_seconds": 5.0,
   "planner_seed": 0,
   "no_progress_ticks": 100,
-  "station_queue_capacity": 2,
+  "station_queue_capacity": 1,
   "workstation_entries": {
     "WS_2_20": "G4_17",
     "WS_8_20": "G10_17",
