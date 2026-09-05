@@ -2,6 +2,10 @@
 
 from .engine import simulate_day
 from .inputs import load_workload
-from .models import SimulationConfig
+from .coordination import DramCoordinator
+from .models import CoordinationConfig, CoordinationStatus, SimulationConfig
 
-__all__ = ["SimulationConfig", "load_workload", "simulate_day"]
+__all__ = [
+    "CoordinationConfig", "CoordinationStatus", "DramCoordinator",
+    "SimulationConfig", "load_workload", "simulate_day",
+]

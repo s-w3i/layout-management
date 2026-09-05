@@ -129,6 +129,12 @@ def run_debugger(
     amr_artist = axis.scatter([], [], s=35, zorder=4)
     reservation_artist = LineCollection([], linewidths=4, alpha=0.8, zorder=3)
     axis.add_collection(reservation_artist)
+    tabu_artist = LineCollection([], colors="#d62828", linewidths=2, linestyles="dashed", zorder=3)
+    axis.add_collection(tabu_artist)
+    frontier_artist = axis.scatter([], [], marker="x", s=55, color="#f4a261", zorder=6)
+    acknowledgement_artist = axis.scatter(
+        [], [], marker="o", s=45, facecolors="none", edgecolors="#264653", zorder=6
+    )
     headings = [axis.plot([], [], color="#222222", linewidth=1.5, zorder=5)[0] for _ in amr_ids]
     paths = [axis.plot([], [], color="#4895ef", alpha=0.35, zorder=2)[0] for _ in amr_ids]
     status = axis.text(
@@ -161,20 +167,25 @@ def run_debugger(
         amr_id: [job["dispatch_time"] for job in jobs]
         for amr_id, jobs in jobs_by_amr.items()
     }
-    completed_jobs = sorted(result.jobs, key=lambda job: float(job["completion_time"]))
+    completed_jobs = sorted(
+        (job for job in result.jobs if job["completion_time"] is not None),
+        key=lambda job: float(job["completion_time"]),
+    )
     completion_times = [float(job["completion_time"]) for job in completed_jobs]
     completed_line_totals, total = [], 0
     for job in completed_jobs:
         total += job["covered_lines"]
         completed_line_totals.append(total)
-    task_completion_times = sorted(
-        max(
+    task_completion_times = []
+    for task_id in {job["task_id"] for job in result.jobs}:
+        times = [
             float(job["completion_time"])
             for job in result.jobs
-            if job["task_id"] == task_id
-        )
-        for task_id in {job["task_id"] for job in result.jobs}
-    )
+            if job["task_id"] == task_id and job["completion_time"] is not None
+        ]
+        if times:
+            task_completion_times.append(max(times))
+    task_completion_times.sort()
     initial_heading = math.radians(initial_heading_degrees)
     last_frame_time = time.monotonic()
     reservation_events = sorted(
@@ -193,6 +204,43 @@ def run_debugger(
         for index, amr_id in enumerate(amr_ids)
     }
     reservation_state = {"index": 0, "owners": dict(initial_owners)}
+    coordination_events = sorted(
+        (
+            event for event in result.events
+            if event["event"] in {
+                "stage_path_planned", "reservation_granted", "reservation_denied",
+                "controller_acknowledgement", "tabu_added",
+                "authorization_frontier_stop", "deadlock_declared",
+            }
+        ),
+        key=lambda event: float(event["time_seconds"]),
+    )
+    coordination_times = [float(event["time_seconds"]) for event in coordination_events]
+    coordination_state = {
+        "index": 0, "frontiers": {}, "acks": {}, "tabu": {}, "latest": "",
+    }
+
+    def coordination_at(when):
+        target = bisect.bisect_right(coordination_times, when)
+        if target < coordination_state["index"]:
+            coordination_state.update(index=0, frontiers={}, acks={}, tabu={}, latest="")
+        while coordination_state["index"] < target:
+            event = coordination_events[coordination_state["index"]]
+            amr_id, kind = event["amr_id"], event["event"]
+            if kind == "stage_path_planned":
+                coordination_state["tabu"].pop(amr_id, None)
+            elif kind == "reservation_granted" and event.get("nodes"):
+                coordination_state["frontiers"][amr_id] = grid_position(event["nodes"][-1])
+            elif kind == "controller_acknowledgement":
+                coordination_state["acks"][amr_id] = grid_position(event["reached"])
+            elif kind == "tabu_added" and len(event.get("edge", ())) == 2:
+                coordination_state["tabu"].setdefault(amr_id, set()).add(
+                    tuple(map(grid_position, event["edge"]))
+                )
+            if kind in {"reservation_denied", "authorization_frontier_stop", "deadlock_declared"}:
+                coordination_state["latest"] = kind
+            coordination_state["index"] += 1
+        return coordination_state
 
     def reservation_owners(when):
         target = bisect.bisect_right(reservation_times, when)
@@ -216,7 +264,12 @@ def run_debugger(
         if index < 0:
             return None
         job = jobs_by_amr[amr_id][index]
-        return job if controller.time < float(job["completion_time"]) else None
+        return (
+            job
+            if job["completion_time"] is None
+            or controller.time < float(job["completion_time"])
+            else None
+        )
 
     def draw(_frame):
         nonlocal last_frame_time
@@ -225,6 +278,7 @@ def run_debugger(
         last_frame_time = now
         active = {amr_id: active_job(amr_id) for amr_id in amr_ids}
         owners = reservation_owners(controller.time)
+        coordination = coordination_at(controller.time)
         reserved_segments, reserved_colors = [], []
         for start, end in project.iter_traversable_lane_positions():
             owner = owners.get(start)
@@ -235,11 +289,27 @@ def run_debugger(
                 reserved_colors.append(owner_colors[owner])
         reservation_artist.set_segments(reserved_segments)
         reservation_artist.set_colors(reserved_colors)
+        tabu_artist.set_segments([
+            (project.coordinates(*start), project.coordinates(*end))
+            for edges in coordination["tabu"].values() for start, end in sorted(edges)
+        ])
+        frontier_points = [
+            project.coordinates(*node) for node in coordination["frontiers"].values()
+        ]
+        acknowledgement_points = [
+            project.coordinates(*node) for node in coordination["acks"].values()
+        ]
+        frontier_artist.set_offsets(frontier_points or [(math.nan, math.nan)])
+        acknowledgement_artist.set_offsets(
+            acknowledgement_points or [(math.nan, math.nan)]
+        )
         reserved = {job["rack_id"] for job in active.values() if job}
         away = {
             job["rack_id"]
             for job in active.values()
             if job
+            and job["rack_departure"] is not None
+            and job["rack_return"] is not None
             and float(job["rack_departure"]) <= controller.time < float(job["rack_return"])
         }
         rack_artist.set_facecolors([
@@ -281,13 +351,16 @@ def run_debugger(
             "SIMULATION\n"
             f"Elapsed       {_format_elapsed(elapsed)}\n"
             f"Speed         {controller.speed:g}x\n\n"
+            f"Coordination  {result.metrics.get('coordination_status', 'VALID')}\n\n"
+            f"Latest event  {coordination['latest'] or '-'}\n\n"
             "CUMULATIVE OUTPUT\n"
             f"Tasks         {completed_tasks:,} / {result.metrics['completed_tasks']:,}\n"
             f"Order lines   {completed_lines:,} / {result.metrics['completed_lines']:,}\n"
             f"Throughput    {throughput:,.2f} lines/h"
         )
         return (
-            rack_artist, reservation_artist, amr_artist, status, *headings, *paths
+            rack_artist, reservation_artist, tabu_artist, frontier_artist,
+            acknowledgement_artist, amr_artist, status, *headings, *paths
         )
 
     animation = FuncAnimation(

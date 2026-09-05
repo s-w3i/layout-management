@@ -123,7 +123,13 @@ class GridRouter:
         ] = {}
         self._reachability: dict[tuple[GridPosition, GridPosition], bool] = {}
         self._cache: dict[
-            tuple[GridPosition, GridPosition, frozenset[GridPosition]], Route | None
+            tuple[
+                GridPosition,
+                GridPosition,
+                frozenset[GridPosition],
+                frozenset[tuple[GridPosition, GridPosition]],
+            ],
+            Route | None,
         ] = {}
         self._runs_cache: dict[tuple[GridPosition, ...], tuple[StraightRun, ...]] = {}
 
@@ -132,8 +138,9 @@ class GridRouter:
         start: GridPosition,
         goal: GridPosition,
         blocked_nodes: frozenset[GridPosition] = frozenset(),
+        blocked_edges: frozenset[tuple[GridPosition, GridPosition]] = frozenset(),
     ) -> Route | None:
-        key = (start, goal, blocked_nodes)
+        key = (start, goal, blocked_nodes, blocked_edges)
         if key in self._cache:
             return self._cache[key]
         if start not in self.graph or goal not in self.graph:
@@ -180,7 +187,7 @@ class GridRouter:
                 self._cache[key] = result
                 return result
             for neighbour, weight in graph[node]:
-                if neighbour in blocked:
+                if neighbour in blocked or (node, neighbour) in blocked_edges:
                     continue
                 candidate = travelled + weight
                 direction = directions.get((node, neighbour))

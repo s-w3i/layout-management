@@ -1,0 +1,12 @@
+{
+  "schema": "amr_simulation_baseline/v1",
+  "source_commit": "404a790",
+  "layout": "map1_basic",
+  "order_date": "2023-01-03",
+  "event_log": false,
+  "runs": [
+    {"amrs": 4, "wall_seconds": 14.1, "weighted_throughput_lines_per_hour": 3.0809813169637468, "rack_presentations": 1920, "coordination_fallbacks": 1},
+    {"amrs": 20, "wall_seconds": 12.69, "peak_kb": 336516, "weighted_throughput_lines_per_hour": 40.15068754565456, "rack_presentations": 1961, "coordination_fallbacks": 1},
+    {"amrs": 40, "wall_seconds": 13.82, "peak_kb": 350596, "weighted_throughput_lines_per_hour": 41.138848504545216, "rack_presentations": 1973, "coordination_fallbacks": 1}
+  ]
+}

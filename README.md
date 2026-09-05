@@ -49,6 +49,16 @@ Useful batch options:
 - `--amrs N`: fleet size from 1 to 40 using configured spawn nodes.
 - `--start-date YYYY-MM-DD --end-date YYYY-MM-DD`: limit the date range.
 - `--event-log`: export detailed events; omit it for faster runs.
+- `--include-degraded`: include `DEGRADED`/`FAILED_DEADLOCK` rows in the
+  comparison CSV; they remain marked ineligible.
+
+The default configuration keeps the reproducible `legacy_v1` coordinator.
+Use `amr_simulation/config/dram_field_v1.json` to enable five-node field-style
+reservation epochs, acknowledgement-delayed release, directed-edge replanning,
+and explicit deadlock outcomes. Field runs report `VALID`, `DEGRADED`, or
+`FAILED_DEADLOCK`; failed/degraded layouts are omitted from comparisons unless
+`--include-degraded` is supplied. Detailed deadlock state is written beside the
+daily output as `deadlock_snapshot_<date>.json`.
 
 ## Run the live simulation
 

@@ -6,6 +6,7 @@ import argparse
 import csv
 import ctypes
 import gc
+import json
 import os
 import re
 import sys
@@ -84,6 +85,12 @@ def _checkpoint_metrics(path: Path) -> list[dict]:
         for key in _SUMMARY_METRICS - {"date"}:
             value = row.get(key, "0") or "0"
             item[key] = int(float(value)) if key in _INTEGER_METRICS else float(value)
+        if row.get("coordination"):
+            item["coordination"] = json.loads(row["coordination"])
+            item["coordination_status"] = row.get("coordination_status", "VALID")
+            item["eligible_for_comparison"] = (
+                row.get("eligible_for_comparison", "True").lower() == "true"
+            )
         metrics.append(item)
     return metrics
 
@@ -121,6 +128,8 @@ def _simulate_layout(
         result = simulate_day(
             project, GridRouter(project), racks, tasks, mapping, config, trace=trace
         )
+        if result.deadlock_snapshot and not trace:
+            write_json(directory / f"deadlock_snapshot_{task_date}.json", result.deadlock_snapshot)
         append_csv_row(daily_path, daily_row(result, config.workstations))
         # Detailed logs intentionally retain full results. Normal batch runs keep
         # metrics only and release jobs, paths, events, and motion segments now.
@@ -178,6 +187,11 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--end-date", type=_date)
     value.add_argument("--date", type=_date, help="single debug date")
     value.add_argument("--output", type=Path)
+    value.add_argument(
+        "--include-degraded",
+        action="store_true",
+        help="include degraded or failed layouts in layout_comparison.csv",
+    )
     value.add_argument("--event-log", action="store_true")
     value.add_argument(
         "--amrs", type=int,
@@ -335,7 +349,11 @@ def main(argv: list[str] | None = None) -> int:
             debug_result = results[0]
         summaries.append(summary)
     if len(summaries) > 1:
-        write_csv(output / "layout_comparison.csv", summaries)
+        comparison = summaries if args.include_degraded else [
+            summary for summary in summaries
+            if summary.get("eligible_for_comparison", True)
+        ]
+        write_csv(output / "layout_comparison.csv", comparison)
     if debug_result is not None:
         run_debugger(
             project, debug_result, config.spawn_nodes,

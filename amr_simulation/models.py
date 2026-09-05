@@ -6,11 +6,74 @@ import json
 import math
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 
 CONFIG_SCHEMA = "amr_simulation_config/v1"
+
+
+class CoordinationStatus(str, Enum):
+    VALID = "VALID"
+    DEGRADED = "DEGRADED"
+    FAILED_DEADLOCK = "FAILED_DEADLOCK"
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinationConfig:
+    profile: str = "legacy_v1"
+    allocation_period_seconds: float = 1.0
+    max_reservation_nodes: int = 5
+    head_to_head_window: int = 3
+    partial_cycle_window: int = 5
+    deadlock_window: int = 5
+    blocked_replan_seconds: float = 5.0
+    acknowledgement_latency_seconds: float = 0.25
+    allocation_order: str = "ascPathLength"
+    tabu_mode: str = "directed_edge"
+    deadlock_timeout_seconds: float = 30.0
+    deadlock_policy: str = "fail"
+    corridors: tuple[tuple[str, ...], ...] = ()
+
+    def validate(self) -> None:
+        if self.profile not in {"legacy_v1", "dram_field_v1"}:
+            raise ValueError("coordination profile must be 'legacy_v1' or 'dram_field_v1'")
+        if self.allocation_order != "ascPathLength":
+            raise ValueError("coordination allocation_order must be 'ascPathLength'")
+        if self.tabu_mode != "directed_edge":
+            raise ValueError("coordination tabu_mode must be 'directed_edge'")
+        if self.deadlock_policy not in {"fail", "degraded_serialize"}:
+            raise ValueError("coordination deadlock_policy must be 'fail' or 'degraded_serialize'")
+        windows = (
+            self.max_reservation_nodes,
+            self.head_to_head_window,
+            self.partial_cycle_window,
+            self.deadlock_window,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in windows):
+            raise ValueError("coordination windows must be integers")
+        positive = (
+            self.allocation_period_seconds,
+            self.max_reservation_nodes,
+            self.head_to_head_window,
+            self.partial_cycle_window,
+            self.deadlock_window,
+            self.blocked_replan_seconds,
+            self.deadlock_timeout_seconds,
+        )
+        if any(not math.isfinite(float(value)) or value <= 0 for value in positive):
+            raise ValueError("coordination periods and windows must be finite and positive")
+        if (
+            not math.isfinite(self.acknowledgement_latency_seconds)
+            or self.acknowledgement_latency_seconds < 0
+        ):
+            raise ValueError("coordination acknowledgement latency must be finite and non-negative")
+        if any(len(corridor) < 2 or len(set(corridor)) != len(corridor) for corridor in self.corridors):
+            raise ValueError("each coordination corridor must contain at least two unique nodes")
+        for corridor in self.corridors:
+            for node in corridor:
+                grid_position(node)
 
 
 def grid_position(value: str) -> tuple[int, int]:
@@ -54,6 +117,7 @@ class SimulationConfig:
     detailed_event_log: bool = False
     reservation_wait_seconds: float = 5.0
     dram_conflict_wait_seconds: float = 15.0
+    coordination: CoordinationConfig = field(default_factory=CoordinationConfig)
     schema: str = CONFIG_SCHEMA
 
     @classmethod
@@ -65,6 +129,28 @@ class SimulationConfig:
         if raw.get("schema") != CONFIG_SCHEMA:
             raise ValueError(f"configuration schema must be {CONFIG_SCHEMA!r}")
         motion = MotionProfile(**(raw.get("motion") or {}))
+        coordination_raw = raw.get("coordination") or {}
+        try:
+            coordination = CoordinationConfig(
+                profile=str(coordination_raw.get("profile", "legacy_v1")),
+                allocation_period_seconds=float(coordination_raw.get("allocation_period_seconds", 1.0)),
+                max_reservation_nodes=int(coordination_raw.get("max_reservation_nodes", 5)),
+                head_to_head_window=int(coordination_raw.get("head_to_head_window", 3)),
+                partial_cycle_window=int(coordination_raw.get("partial_cycle_window", 5)),
+                deadlock_window=int(coordination_raw.get("deadlock_window", 5)),
+                blocked_replan_seconds=float(coordination_raw.get("blocked_replan_seconds", 5.0)),
+                acknowledgement_latency_seconds=float(coordination_raw.get("acknowledgement_latency_seconds", 0.25)),
+                allocation_order=str(coordination_raw.get("allocation_order", "ascPathLength")),
+                tabu_mode=str(coordination_raw.get("tabu_mode", "directed_edge")),
+                deadlock_timeout_seconds=float(coordination_raw.get("deadlock_timeout_seconds", 30.0)),
+                deadlock_policy=str(coordination_raw.get("deadlock_policy", "fail")),
+                corridors=tuple(
+                    tuple(str(node) for node in corridor)
+                    for corridor in coordination_raw.get("corridors", ())
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid coordination configuration: {exc}") from exc
         config = cls(
             amr_count=int(raw.get("amr_count", 0)),
             spawn_nodes=tuple(str(value) for value in raw.get("spawn_nodes", [])),
@@ -81,6 +167,7 @@ class SimulationConfig:
             detailed_event_log=bool(raw.get("detailed_event_log", False)),
             reservation_wait_seconds=float(raw.get("reservation_wait_seconds", 5.0)),
             dram_conflict_wait_seconds=float(raw.get("dram_conflict_wait_seconds", 15.0)),
+            coordination=coordination,
         )
         config.validate()
         return config
@@ -108,6 +195,7 @@ class SimulationConfig:
         ):
             raise ValueError("handling and service times must be finite and non-negative")
         self.motion.validate()
+        self.coordination.validate()
 
     def with_amr_count(self, count: int) -> "SimulationConfig":
         if not 1 <= count <= len(self.spawn_nodes):
@@ -131,6 +219,7 @@ class SimulationConfig:
             "detailed_event_log": self.detailed_event_log,
             "reservation_wait_seconds": self.reservation_wait_seconds,
             "dram_conflict_wait_seconds": self.dram_conflict_wait_seconds,
+            "coordination": asdict(self.coordination),
         }
 
 
@@ -227,3 +316,4 @@ class DayResult:
     motion_segments: list[MotionSegment] = field(default_factory=list)
     jobs: list[dict[str, Any]] = field(default_factory=list)
     paths: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    deadlock_snapshot: dict[str, Any] | None = None

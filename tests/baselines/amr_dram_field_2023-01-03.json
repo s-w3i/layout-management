@@ -1,0 +1,13 @@
+{
+  "schema": "amr_simulation_benchmark/v1",
+  "layout": "map1_basic",
+  "order_date": "2023-01-03",
+  "event_log": false,
+  "runs": [
+    {"amrs": 4, "wall_seconds": 2.27, "peak_kb": 274820, "status": "FAILED_DEADLOCK", "allocation_epochs": 857},
+    {"amrs": 20, "wall_seconds": 2.79, "peak_kb": 272532, "status": "FAILED_DEADLOCK", "allocation_epochs": 154},
+    {"amrs": 40, "wall_seconds": 4.00, "peak_kb": 285340, "status": "FAILED_DEADLOCK", "allocation_epochs": 91},
+    {"amrs": 40, "layouts": 4, "workers": 4, "wall_seconds": 6.52, "peak_kb": 428420, "status": "FAILED_DEADLOCK"}
+  ],
+  "note": "Strict field-profile runs stopped at detected deadlocks; these measurements validate failure-path overhead, not completed-layout throughput."
+}

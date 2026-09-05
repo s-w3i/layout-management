@@ -1,0 +1,25 @@
+{
+  "schema": "dram_coordination_fixture/v1",
+  "cases": [
+    {"id":"C01","name":"same_direction_following","expected":{"action":"wait","tabu":false}},
+    {"id":"C02","name":"opposing_swap","expected":{"conflict":"head_to_head","action":"replan"}},
+    {"id":"C03","name":"extended_reversed_corridor","expected":{"conflict":"head_to_head","action":"yield_side"}},
+    {"id":"C04","name":"three_robot_rotation","expected":{"conflict":"partial_cycle","participants":3}},
+    {"id":"C05","name":"persistent_wait_cycle","expected":{"conflict":"wait_for_deadlock"}},
+    {"id":"C06","name":"opposing_corridor_queues","expected":{"conflict":"corridor_deadlock"}},
+    {"id":"C07","name":"loaded_unloaded","expected":{"yield":"unloaded"}},
+    {"id":"C08","name":"both_loaded","expected":{"tie_break":"priority_then_id"}},
+    {"id":"C09","name":"no_adjacent_escape","expected":{"action":"deadlock_policy"}},
+    {"id":"C10","name":"directed_tabu","expected":{"reverse_legal":true}},
+    {"id":"R01","name":"five_node_horizon","expected":{"maximum":5}},
+    {"id":"R02","name":"safe_prefix","expected":{"partial_grant":true}},
+    {"id":"R03","name":"early_top_up","expected":{"stop":false}},
+    {"id":"R04","name":"late_top_up","expected":{"stop":true}},
+    {"id":"A01","name":"delayed_acknowledgement","expected":{"latency":0.25}},
+    {"id":"A02","name":"stale_acknowledgement","expected":{"ignored":true}},
+    {"id":"E01","name":"same_epoch_order","expected":{"deterministic":true}},
+    {"id":"E02","name":"exact_epoch_request","expected":{"same_epoch":true}},
+    {"id":"D01","name":"strict_deadlock","expected":{"status":"FAILED_DEADLOCK"}},
+    {"id":"D02","name":"degraded_serialization","expected":{"status":"DEGRADED"}}
+  ]
+}

@@ -10,6 +10,16 @@ from dataclasses import dataclass, field
 from warehouse_layout.domain import GridProject
 
 from .conflict_solver import DramConflict, partial_conflicts
+from .coordination import (
+    DramCoordinator,
+    RobotCoordinationState,
+    can_replan,
+    corridor_sides,
+    detect_conflicts,
+    next_epoch,
+    select_corridor_yield_side,
+    straight_window,
+)
 from .models import (
     DayResult,
     MotionSegment,
@@ -26,6 +36,16 @@ MAX_EVENTS_WITHOUT_COMPLETION = 1_000_000
 MAX_WALL_SECONDS_WITHOUT_COMPLETION = 120.0
 MAX_DAY_WALL_SECONDS = 300.0
 MAX_REROUTES_PER_DAY = 10_000
+
+EVENT_PRIORITY = {
+    "node_crossing": 10,
+    "controller_acknowledgement": 20,
+    "conflict_scan": 40,
+    "conflict_resolution": 50,
+    "replan_completed": 60,
+    "allocation_epoch": 70,
+    "movement_tail": 80,
+}
 
 
 @dataclass(slots=True)
@@ -78,6 +98,7 @@ class _Job:
     stage_loaded: bool = False
     stage_arrival_kind: str = ""
     tabu: set[tuple[int, int]] | None = None
+    tabu_edges: set[tuple[tuple[int, int], tuple[int, int]]] = field(default_factory=set)
     request_time: float | None = None
     wait_since: float | None = None
     wait_token: int = 0
@@ -90,6 +111,14 @@ class _Job:
     parking_backoff: bool = False
     reroute_state: tuple | None = None
     repeated_reroute_state: int = 0
+    path_revision: int = 0
+    pending_acknowledgements: set[tuple[tuple[int, int], tuple[int, int], int]] = field(default_factory=set)
+    deadlock_candidate_since: float | None = None
+    acknowledged_position: tuple[int, int] | None = None
+    motion_token: int = 0
+    motion_active: bool = False
+    frontier_wait_since: float | None = None
+    last_acknowledgement_time: float = 0.0
 
 
 @dataclass(slots=True)
@@ -135,7 +164,7 @@ class _Engine:
         for rack in racks.values():
             for sku in rack.skus:
                 self.racks_by_sku.setdefault(sku, set()).add(rack.rack_id)
-        self.calendar: list[tuple[float, int, str, object]] = []
+        self.calendar: list[tuple[float, int, int, str, object]] = []
         self.sequence = 0
         self.job_sequence = 0
         self.jobs: list[_Job] = []
@@ -163,10 +192,41 @@ class _Engine:
         self.coordination_fallback_count = 0
         self.fallback_job_id: str | None = None
         self.fallback_reroute_baseline = 0
+        self.field_coordination = config.coordination.profile == "dram_field_v1"
+        self.scheduled_allocation_epoch: float | None = None
+        self.coordinator = (
+            DramCoordinator(config.coordination, router.coordinates, self.node_owners)
+            if self.field_coordination else None
+        )
+        self.field_decisions = {}
+        self.coordination_metrics = {
+            "profile": config.coordination.profile,
+            "status": "VALID",
+            "allocation_epoch_count": 0,
+            "reservation_request_count": 0,
+            "reservation_grant_count": 0,
+            "reservation_denial_count": 0,
+            "granted_window_nodes": 0,
+            "max_granted_window_nodes": 0,
+            "frontier_stop_count": 0,
+            "frontier_wait_seconds": 0.0,
+            "acknowledgement_delay_seconds": 0.0,
+            "replan_requested_count": 0,
+            "replan_completed_count": 0,
+            "replan_failed_count": 0,
+            "tabu_edge_count": 0,
+            "stale_event_count": 0,
+            "deadlock_count": 0,
+            "serialization_fallback_used": False,
+            "conflicts": {kind: 0 for kind in ("path_overlap", "head_to_head", "partial_cycle", "wait_for_deadlock", "corridor_deadlock")},
+        }
+        self.deadlock_snapshot: dict | None = None
+        self.failed_deadlock = False
 
     def schedule(self, when: float, kind: str, payload: object) -> None:
         self.sequence += 1
-        heapq.heappush(self.calendar, (when, self.sequence, kind, payload))
+        priority = EVENT_PRIORITY.get(kind, 75) if self.field_coordination else 0
+        heapq.heappush(self.calendar, (when, priority, self.sequence, kind, payload))
 
     def record(self, when: float, kind: str, job: _Job | None = None, **values) -> None:
         if not self.trace:
@@ -188,13 +248,14 @@ class _Engine:
         while self.calendar:
             now = self.calendar[0][0]
             while self.calendar and abs(self.calendar[0][0] - now) <= 1e-9:
-                when, _sequence, kind, payload = heapq.heappop(self.calendar)
+                when, _priority, _sequence, kind, payload = heapq.heappop(self.calendar)
                 self.processed_events += 1
                 self._handle(when, kind, payload)
             if self.dispatch_needed:
                 self.dispatch_needed = False
                 self._dispatch(now)
-            self._resolve_reservations(now)
+            if not self.field_coordination:
+                self._resolve_reservations(now)
             completed = sum(job.completion_time is not None for job in self.jobs)
             if completed != self.completed_job_count:
                 self.completed_job_count = completed
@@ -216,7 +277,7 @@ class _Engine:
                 self._compact_calendar()
                 self.next_calendar_compaction += 50_000
         incomplete = [task.source.task_id for task in self.tasks if task.completed_at is None]
-        if incomplete:
+        if incomplete and not self.failed_deadlock:
             waiting = ", ".join(
                 f"{job.amr.amr_id}:{grid_name(job.blocked_node) if job.blocked_node else '?'}"
                 for job in self.pending.values()
@@ -230,7 +291,7 @@ class _Engine:
 
     def _compact_calendar(self) -> None:
         def live(entry) -> bool:
-            _when, _sequence, kind, payload = entry
+            _when, _priority, _sequence, kind, payload = entry
             if kind != "reservation_timeout":
                 return True
             job, token = payload
@@ -246,6 +307,18 @@ class _Engine:
 
     def _enable_coordination_fallback(self, now: float, reason: str) -> None:
         """Guarantee liveness by serializing jobs after pathological churn."""
+        if self.field_coordination:
+            self.coordination_metrics["deadlock_count"] += 1
+            self.deadlock_snapshot = self._deadlock_state(now, reason)
+            self.record(now, "deadlock_declared", reason=reason)
+            if self.config.coordination.deadlock_policy == "fail":
+                self.failed_deadlock = True
+                self.terminal_time = now
+                self.coordination_metrics["status"] = "FAILED_DEADLOCK"
+                self.calendar.clear()
+                return
+            self.coordination_metrics["status"] = "DEGRADED"
+            self.coordination_metrics["serialization_fallback_used"] = True
         self.coordination_fallback = True
         self.coordination_fallback_count += 1
         self.coordination_fallback_reason = reason
@@ -264,7 +337,61 @@ class _Engine:
             processed_events=self.processed_events, reason=reason,
         )
 
+    def _deadlock_state(self, now: float, reason: str) -> dict:
+        return {
+            "time_seconds": now,
+            "reason": reason,
+            "robots": {
+                job.amr.amr_id: {
+                    "job_id": job.job_id,
+                    "current_node": grid_name(job.amr.position),
+                    "acknowledged_node": grid_name(job.acknowledged_position or job.amr.position),
+                    "route_window": [grid_name(node) for node in self._remaining_path(job)],
+                    "loaded": job.stage_loaded,
+                    "tabu_edges": [
+                        [grid_name(start), grid_name(end)]
+                        for start, end in sorted(job.tabu_edges)
+                    ],
+                    "wait_for": list(job.conflict_amrs),
+                    "reserved_nodes": [
+                        grid_name(node)
+                        for node, owner in sorted(self.node_owners.items())
+                        if owner == job.amr.amr_id
+                    ],
+                    "conflict_classification": (
+                        job.conflict_signature[0]
+                        if job.conflict_signature else job.blocked_reason
+                    ),
+                    "last_progress_timestamp": job.last_acknowledgement_time,
+                }
+                for job in sorted(self.pending.values(), key=lambda item: item.amr.amr_id)
+            },
+            "reservations": {
+                grid_name(node): owner
+                for node, owner in sorted(self.node_owners.items())
+            },
+            "wait_for_graph": {
+                job.amr.amr_id: list(job.conflict_amrs)
+                for job in sorted(
+                    self.pending.values(), key=lambda item: item.amr.amr_id
+                )
+            },
+        }
+
     def _handle(self, now: float, kind: str, payload: object) -> None:
+        if kind == "allocation_epoch":
+            if self.scheduled_allocation_epoch == now:
+                self.scheduled_allocation_epoch = None
+            self.coordination_metrics["allocation_epoch_count"] += 1
+            self.pending_dirty.update(self.pending)
+            self.field_decisions = {
+                decision.robot_id: decision
+                for decision in self.coordinator.run_allocation_epoch(now)
+            }
+            self._resolve_reservations(now)
+            if self.pending:
+                self._ensure_allocation_epoch(now + 1e-9)
+            return
         if kind == "task_release":
             task = payload
             task.released = True
@@ -272,9 +399,32 @@ class _Engine:
             self.record(now, kind, task_id=task.source.task_id, store_id=task.source.store_id)
             return
         if kind == "node_crossing":
-            job, position = payload
+            if self.field_coordination:
+                job, position, revision, motion_token = payload
+                if motion_token != job.motion_token:
+                    self.coordination_metrics["stale_event_count"] += 1
+                    return
+                if self.node_owners.get(position) != job.amr.amr_id:
+                    job.motion_active = False
+                    job.motion_token += 1
+                    self.coordination_metrics["frontier_stop_count"] += 1
+                    job.frontier_wait_since = now
+                    self.record(now, "authorization_frontier_stop", job, node=grid_name(job.amr.position))
+                    self._request_reservation(job, now)
+                    return
+            else:
+                job, position = payload
+                revision = job.path_revision
             previous = job.amr.position
-            if previous != position and self.node_owners.get(previous) == job.amr.amr_id:
+            if self.field_coordination and previous != position:
+                token = (previous, position, revision)
+                job.pending_acknowledgements.add(token)
+                self.schedule(
+                    now + self.config.coordination.acknowledgement_latency_seconds,
+                    "controller_acknowledgement",
+                    (job, token),
+                )
+            elif previous != position and self.node_owners.get(previous) == job.amr.amr_id:
                 del self.node_owners[previous]
                 self.record(now, "node_released", job, node=grid_name(previous))
                 self.pending_dirty.update(
@@ -288,8 +438,43 @@ class _Engine:
             self.record(now, "node_entered", job, node=grid_name(position))
             self._wake_dram_waiters(job.amr.amr_id)
             return
+        if kind == "controller_acknowledgement":
+            job, token = payload
+            previous, reached, revision = token
+            if token not in job.pending_acknowledgements:
+                self.coordination_metrics["stale_event_count"] += 1
+                return
+            job.pending_acknowledgements.remove(token)
+            if self.node_owners.get(previous) == job.amr.amr_id:
+                del self.node_owners[previous]
+                self.record(now, "node_released", job, node=grid_name(previous))
+            if self.coordinator is not None:
+                self.coordinator.acknowledge_crossing(
+                    job.amr.amr_id, previous, reached, now=now,
+                    path_revision=revision,
+                )
+            job.acknowledged_position = reached
+            job.last_acknowledgement_time = now
+            self.coordination_metrics["acknowledgement_delay_seconds"] += self.config.coordination.acknowledgement_latency_seconds
+            self.record(now, kind, job, previous=grid_name(previous), reached=grid_name(reached))
+            self.pending_dirty.update(
+                amr_id for amr_id, waiting in self.pending.items()
+                if waiting.blocked_node == previous
+            )
+            if self.pending:
+                self._ensure_allocation_epoch(now)
+            if job.motion_active and job.amr.position != job.stage_goal:
+                self._request_reservation(job, now)
+            return
         if kind == "movement_tail":
-            job, heading, remaining = payload
+            if self.field_coordination:
+                job, heading, remaining, motion_token = payload
+                if motion_token != job.motion_token:
+                    self.coordination_metrics["stale_event_count"] += 1
+                    return
+                job.motion_active = False
+            else:
+                job, heading, remaining = payload
             job.amr.heading = heading
             if job.parking_backoff:
                 job.parking_backoff = False
@@ -299,6 +484,14 @@ class _Engine:
                 self._request_reservation(job, now)
                 return
             job.stage_route = remaining
+            if self.coordinator is not None:
+                self.coordinator.register_route(
+                    job.amr.amr_id,
+                    remaining.positions,
+                    loaded=job.stage_loaded,
+                    now=now,
+                    path_revision=job.path_revision,
+                )
             if len(remaining.positions) == 1:
                 self.schedule(now, job.stage_arrival_kind, job)
             else:
@@ -313,8 +506,31 @@ class _Engine:
             if job.blocked_node is None or job.blocked_reason is None:
                 return
             if self._hard_station_wait(job) or job.blocked_node == job.stage_goal:
+                if not self.field_coordination:
+                    return
+                started = job.deadlock_candidate_since or now
+                if now - started >= self.config.coordination.deadlock_timeout_seconds:
+                    self._enable_coordination_fallback(now, "persistent_terminal_block")
+                else:
+                    job.wait_token += 1
+                    self.schedule(
+                        started + self.config.coordination.deadlock_timeout_seconds,
+                        "reservation_timeout", (job, job.wait_token),
+                    )
                 return
-            if job.stage_loaded and job.blocked_reason == "node_owned":
+            if (
+                self.field_coordination
+                and job.blocked_reason == "node_owned"
+                and self._is_following(job)
+            ):
+                job.wait_token += 1
+                self.schedule(
+                    now + self.config.coordination.blocked_replan_seconds,
+                    "reservation_timeout",
+                    (job, job.wait_token),
+                )
+                return
+            if not self.field_coordination and job.stage_loaded and job.blocked_reason == "node_owned":
                 job.wait_token += 1
                 self.schedule(
                     now + self.config.dram_conflict_wait_seconds,
@@ -332,13 +548,40 @@ class _Engine:
                 job.reroute_state = reroute_state
                 job.repeated_reroute_state = 1
             if job.repeated_reroute_state >= 3:
+                if (
+                    self.field_coordination
+                    and job.deadlock_candidate_since is not None
+                    and now - job.deadlock_candidate_since
+                    < self.config.coordination.deadlock_timeout_seconds
+                ):
+                    job.wait_token += 1
+                    self.schedule(
+                        job.deadlock_candidate_since
+                        + self.config.coordination.deadlock_timeout_seconds,
+                        "reservation_timeout",
+                        (job, job.wait_token),
+                    )
+                    return
                 self._enable_coordination_fallback(now, "repeated_blocked_state")
                 return
             dram_timeout = job.blocked_reason == "dram_solver"
             if dram_timeout and job.dram_wait_since is not None:
                 job.dram_wait_seconds += now - job.dram_wait_since
                 job.dram_wait_since = None
-            job.tabu.add(job.blocked_node)
+            try:
+                blocked_index = job.stage_route.positions.index(job.blocked_node)
+            except ValueError:
+                blocked_index = 1
+            blocked_edge = (
+                job.stage_route.positions[max(0, blocked_index - 1)],
+                job.blocked_node,
+            )
+            if self.field_coordination:
+                job.tabu_edges.add(blocked_edge)
+                self.coordination_metrics["tabu_edge_count"] += 1
+                self.coordination_metrics["replan_requested_count"] += 1
+            else:
+                job.tabu.add(job.blocked_node)
             job.reroutes += 1
             self.reroute_count += 1
             if (
@@ -349,13 +592,33 @@ class _Engine:
                 return
             if dram_timeout:
                 self.dram_solver_reroutes += 1
-            self.record(now, "tabu_added", job, node=grid_name(job.blocked_node))
+            self.record(
+                now,
+                "tabu_added",
+                job,
+                node=grid_name(job.blocked_node),
+                edge=[grid_name(node) for node in blocked_edge]
+                if self.field_coordination else [],
+            )
             route = self.router.route(
-                job.amr.position, job.stage_goal, frozenset(job.tabu)
+                job.amr.position,
+                job.stage_goal,
+                frozenset(job.tabu),
+                frozenset(job.tabu_edges),
             )
             if route is None:
-                job.tabu.clear()
-                self.record(now, "tabu_cleared", job, reason="no_route")
+                if self.field_coordination:
+                    job.tabu_edges.discard(blocked_edge)
+                    self.coordination_metrics["replan_failed_count"] += 1
+                    job.wait_token += 1
+                    deadline = (
+                        job.deadlock_candidate_since or now
+                    ) + self.config.coordination.deadlock_timeout_seconds
+                    self.schedule(max(now, deadline), "reservation_timeout", (job, job.wait_token))
+                    return
+                else:
+                    job.tabu.clear()
+                    self.record(now, "tabu_cleared", job, reason="no_route")
                 route = self._parking_route(job)
                 if route is not None:
                     job.parking_backoff = True
@@ -367,7 +630,32 @@ class _Engine:
                     )
                 else:
                     route = self._required_route(job.amr.position, job.stage_goal)
+            if self.field_coordination:
+                retained = set(route.positions)
+                awaiting = {
+                    previous for previous, _reached, _revision
+                    in job.pending_acknowledgements
+                }
+                for node, owner in list(self.node_owners.items()):
+                    if (
+                        owner == job.amr.amr_id
+                        and node != job.amr.position
+                        and node not in retained
+                        and node not in awaiting
+                    ):
+                        del self.node_owners[node]
             job.stage_route = route
+            job.path_revision += 1
+            if self.field_coordination:
+                self.coordination_metrics["replan_completed_count"] += 1
+                if self.coordinator is not None:
+                    self.coordinator.register_route(
+                        job.amr.amr_id,
+                        route.positions,
+                        loaded=job.stage_loaded,
+                        now=now,
+                        path_revision=job.path_revision,
+                    )
             job.wait_since = now
             job.blocked_node = None
             job.blocked_reason = None
@@ -486,6 +774,7 @@ class _Engine:
         job.stage_loaded = loaded
         job.stage_arrival_kind = arrival_kind
         job.tabu = set()
+        job.tabu_edges.clear()
         job.request_time = job.wait_since = None
         job.blocked_node = None
         job.blocked_reason = None
@@ -493,6 +782,17 @@ class _Engine:
         job.conflict_amrs = ()
         job.reroute_state = None
         job.repeated_reroute_state = 0
+        job.deadlock_candidate_since = None
+        job.path_revision += 1
+        job.acknowledged_position = job.amr.position
+        if self.coordinator is not None:
+            self.coordinator.register_route(
+                job.amr.amr_id,
+                route.positions,
+                loaded=loaded,
+                now=now,
+                path_revision=job.path_revision,
+            )
         job.wait_token += 1
         if len(route.positions) == 1:
             self.schedule(now, arrival_kind, job)
@@ -506,7 +806,18 @@ class _Engine:
             job.wait_since = now
         self.pending[job.amr.amr_id] = job
         self.pending_dirty.add(job.amr.amr_id)
+        if self.field_coordination:
+            self.coordination_metrics["reservation_request_count"] += 1
+            if self.coordinator is not None:
+                self.coordinator.request_reservation(job.amr.amr_id, now)
+            self._ensure_allocation_epoch(now)
         self.record(now, "reservation_requested", job)
+
+    def _ensure_allocation_epoch(self, now: float) -> None:
+        epoch = next_epoch(now, self.config.coordination.allocation_period_seconds)
+        if self.scheduled_allocation_epoch is None or epoch < self.scheduled_allocation_epoch:
+            self.scheduled_allocation_epoch = epoch
+            self.schedule(epoch, "allocation_epoch", None)
 
     def _wake_dram_waiters(self, progressed_amr: str) -> None:
         for amr_id, waiting in self.pending.items():
@@ -517,6 +828,25 @@ class _Engine:
                 waiting.conflict_signature = None
                 waiting.wait_token += 1
                 self.pending_dirty.add(amr_id)
+
+    def _is_following(self, job: _Job) -> bool:
+        if not job.conflict_amrs or job.blocked_node is None:
+            return False
+        leader = self.active_jobs.get(job.conflict_amrs[0])
+        if leader is None:
+            return False
+        follower_path = self._remaining_path(job)
+        leader_path = self._remaining_path(leader)
+        try:
+            follower_index = follower_path.index(job.blocked_node)
+            leader_index = leader_path.index(job.blocked_node)
+        except ValueError:
+            return False
+        return (
+            follower_index + 1 < len(follower_path)
+            and leader_index + 1 < len(leader_path)
+            and follower_path[follower_index + 1] == leader_path[leader_index + 1]
+        )
 
     def _turn_indices(self, positions: tuple[tuple[int, int], ...]) -> list[int]:
         if positions in self.turn_cache:
@@ -534,6 +864,18 @@ class _Engine:
         return turns
 
     def _reservation_window(self, job: _Job) -> tuple[list[tuple[int, int]], bool]:
+        if self.field_coordination:
+            try:
+                start = job.stage_route.positions.index(job.amr.position)
+            except ValueError:
+                start = 0
+            window = straight_window(
+                job.stage_route.positions,
+                start,
+                self.config.coordination.max_reservation_nodes,
+                self.router.coordinates,
+            )
+            return list(window[1:]), False
         positions = job.stage_route.positions
         turns = self._turn_indices(positions)
         if not turns:
@@ -563,14 +905,17 @@ class _Engine:
             return positions[positions.index(job.amr.position):]
         except ValueError:
             route = self.router.route(
-                job.amr.position, job.stage_goal, frozenset(job.tabu)
+                job.amr.position,
+                job.stage_goal,
+                frozenset(job.tabu),
+                frozenset(job.tabu_edges),
             )
             return route.positions if route is not None else (job.amr.position,)
 
     def _priority_key(self, job: _Job) -> tuple[float, float, str]:
         request_time = job.request_time
         return (
-            self._remaining_distance(job),
+            len(self._remaining_path(job)) if self.field_coordination else self._remaining_distance(job),
             float(request_time) if request_time is not None else -math.inf,
             job.amr.amr_id,
         )
@@ -588,6 +933,70 @@ class _Engine:
             if job is selected:
                 path = path[path.index(position):]
             paths.append(path)
+        if self.field_coordination:
+            states = {
+                job.amr.amr_id: RobotCoordinationState(
+                    job.amr.amr_id,
+                    paths[index],
+                    job.stage_loaded,
+                    reserved={
+                        node for node, owner in self.node_owners.items()
+                        if owner == job.amr.amr_id
+                    },
+                    wait_for=set(job.conflict_amrs),
+                )
+                for index, job in enumerate(active)
+            }
+            by_id = {job.amr.amr_id: job for job in active}
+            for detected in detect_conflicts(states, self.config.coordination):
+                if selected.amr.amr_id not in detected.participants:
+                    continue
+                involved = [by_id[name] for name in detected.participants]
+                if detected.kind == "corridor_deadlock":
+                    sides = corridor_sides(
+                        detected, states, self.config.coordination.corridors
+                    )
+                    yielding_side = select_corridor_yield_side(
+                        *sides, states, self.router.graph,
+                        self.node_owners, self.router.rack_positions,
+                    )
+                    if selected.amr.amr_id not in yielding_side:
+                        continue
+                    overlap = detected.edge[1] if detected.edge else position
+                    return (
+                        DramConflict(
+                            detected.kind,
+                            tuple(active.index(other) for other in involved),
+                            overlap,
+                        ),
+                        involved,
+                        selected,
+                    )
+                replannable = [
+                    other for other in involved
+                    if can_replan(
+                        states[other.amr.amr_id],
+                        self.router.graph,
+                        self.node_owners,
+                        self.router.rack_positions,
+                    )
+                ]
+                yielding = max(replannable, key=self._priority_key) if replannable else None
+                if yielding is not selected and detected.kind != "wait_for_deadlock":
+                    continue
+                overlap = detected.node or (
+                    detected.edge[1] if detected.edge else position
+                )
+                return (
+                    DramConflict(
+                        detected.kind,
+                        tuple(active.index(other) for other in involved),
+                        overlap,
+                    ),
+                    involved,
+                    yielding,
+                )
+            return None, [], None
         for conflict in partial_conflicts(paths, active.index(selected)):
             involved = [active[index] for index in conflict.agent_indices]
             winner = min(involved, key=self._priority_key)
@@ -625,7 +1034,8 @@ class _Engine:
             ),
             key=lambda job: (
                 int(not job.stage_loaded),
-                self._remaining_distance(job),
+                len(self._remaining_path(job))
+                if self.field_coordination else self._remaining_distance(job),
                 float(job.request_time),
                 job.amr.amr_id,
             ),
@@ -664,7 +1074,22 @@ class _Engine:
             conflict = None
             conflicting_jobs = []
             winner = None
-            if self.coordination_fallback:
+            decision = self.field_decisions.get(job.amr.amr_id)
+            if self.field_coordination and decision is not None and not self.coordination_fallback:
+                available = [
+                    node for node in decision.granted
+                    if node != job.amr.position and node in desired
+                ]
+                if decision.blocker and decision.blocker[0] in desired:
+                    blocker, blocking_owner = decision.blocker
+                if not available and blocker is None:
+                    for node in desired:
+                        owner = self.node_owners.get(node)
+                        if owner is not None and owner != job.amr.amr_id:
+                            blocker, blocking_owner = node, owner
+                            break
+                        available.append(node)
+            elif self.coordination_fallback:
                 available = desired
             else:
                 for node in desired:
@@ -685,16 +1110,41 @@ class _Engine:
                         break
                     safe.append(node)
                 available = safe
+                if self.field_coordination and decision is not None and self.coordinator is not None:
+                    rejected = [
+                        node for node in decision.granted
+                        if node not in safe and node != job.amr.position
+                    ]
+                    self.coordinator.release_nodes(job.amr.amr_id, rejected)
+                    for node in rejected:
+                        if self.node_owners.get(node) == job.amr.amr_id:
+                            del self.node_owners[node]
             if atomic and blocker is not None:
                 available = []
             if not available:
+                if self.field_coordination and decision is not None and self.coordinator is not None:
+                    rejected = [
+                        node for node in decision.granted
+                        if node != job.amr.position
+                    ]
+                    self.coordinator.release_nodes(job.amr.amr_id, rejected)
+                    for node in rejected:
+                        if self.node_owners.get(node) == job.amr.amr_id:
+                            del self.node_owners[node]
+                    self.coordinator.pending.add(job.amr.amr_id)
                 job.blocked_node = blocker
                 solver_blocked = conflict is not None
                 reason = "dram_solver" if solver_blocked else "node_owned"
                 job.reservation_conflicts += 1
                 self.reservation_conflicts += 1
+                if self.field_coordination:
+                    self.coordination_metrics["reservation_denial_count"] += 1
                 if solver_blocked:
                     self.dram_solver_conflicts += 1
+                    if self.field_coordination:
+                        conflict_kind = "partial_cycle" if conflict.kind == "cycle" else conflict.kind
+                        if conflict_kind in self.coordination_metrics["conflicts"]:
+                            self.coordination_metrics["conflicts"][conflict_kind] += 1
                 else:
                     self.node_ownership_conflicts += 1
                 conflict_amrs = (
@@ -724,10 +1174,15 @@ class _Engine:
                     job.blocked_reason = reason
                     job.conflict_signature = signature
                     job.conflict_amrs = conflict_amrs
+                    if self.field_coordination and job.deadlock_candidate_since is None:
+                        job.deadlock_candidate_since = now
                     job.wait_token += 1
                     timeout = (
-                        self.config.dram_conflict_wait_seconds
-                        if solver_blocked else self.config.reservation_wait_seconds
+                        self.config.coordination.blocked_replan_seconds
+                        if self.field_coordination else (
+                            self.config.dram_conflict_wait_seconds
+                            if solver_blocked else self.config.reservation_wait_seconds
+                        )
                     )
                     self.schedule(now + timeout, "reservation_timeout", (job, job.wait_token))
                 if self._hard_station_wait(job):
@@ -742,7 +1197,7 @@ class _Engine:
                     station.max_queue = max(station.max_queue, waiting)
                 continue
             del self.pending[job.amr.amr_id]
-            if not self.coordination_fallback:
+            if not self.coordination_fallback or self.field_coordination:
                 for node in available:
                     self.node_owners[node] = job.amr.amr_id
             self.max_reserved_nodes = max(self.max_reserved_nodes, len(self.node_owners))
@@ -750,6 +1205,9 @@ class _Engine:
             if waited > 0:
                 job.node_wait_seconds += waited
                 self._stationary(job, "reservation_wait", job.wait_since, now, job.amr.position, job.stage_loaded)
+            if self.field_coordination and job.frontier_wait_since is not None:
+                self.coordination_metrics["frontier_wait_seconds"] += now - job.frontier_wait_since
+                job.frontier_wait_since = None
             if job.dram_wait_since is not None:
                 job.dram_wait_seconds += now - job.dram_wait_since
                 job.dram_wait_since = None
@@ -765,18 +1223,38 @@ class _Engine:
                 job,
                 nodes=[grid_name(node) for node in available],
             )
+            if self.field_coordination:
+                granted_count = len(available) + 1
+                self.coordination_metrics["reservation_grant_count"] += 1
+                self.coordination_metrics["granted_window_nodes"] += granted_count
+                self.coordination_metrics["max_granted_window_nodes"] = max(
+                    self.coordination_metrics["max_granted_window_nodes"], granted_count
+                )
             job.request_time = job.wait_since = None
             job.wait_token += 1
             job.blocked_node = None
             job.blocked_reason = None
+            job.deadlock_candidate_since = None
             job.conflict_signature = None
             job.conflict_amrs = ()
-            self._move_reserved(job, available, now)
+            if not (self.field_coordination and job.motion_active):
+                self._move_reserved(job, available, now)
 
     def _move_reserved(
         self, job: _Job, reserved: list[tuple[int, int]], now: float
     ) -> None:
         positions = (job.amr.position, *reserved)
+        if self.field_coordination:
+            try:
+                start = job.stage_route.positions.index(job.amr.position)
+            except ValueError:
+                start = 0
+            positions = straight_window(
+                job.stage_route.positions,
+                start,
+                len(job.stage_route.positions),
+                self.router.coordinates,
+            )
         route = Route(positions, self.router.route_distance(positions))
         end, heading, segments = self.router.motion(
             job.job_id,
@@ -796,15 +1274,27 @@ class _Engine:
             self.motion_segments.extend(segments)
             path = self.paths.setdefault(job.job_id, [])
             path.extend(route.positions if not path else route.positions[1:])
+        if self.field_coordination:
+            job.motion_active = True
+            job.motion_token += 1
         for position, reached in self.router.crossing_times(route, segments):
-            self.schedule(reached, "node_crossing", (job, position))
-        count = len(reserved)
-        remaining_positions = job.stage_route.positions[count:]
+            payload = (
+                (job, position, job.path_revision, job.motion_token)
+                if self.field_coordination else (job, position)
+            )
+            self.schedule(reached, "node_crossing", payload)
+        count = len(positions) - 1 if self.field_coordination else len(reserved)
+        remaining_start = start + count if self.field_coordination else count
+        remaining_positions = job.stage_route.positions[remaining_start:]
         remaining = Route(
             remaining_positions,
             self.router.route_distance(remaining_positions),
         )
-        self.schedule(end, "movement_tail", (job, heading, remaining))
+        payload = (
+            (job, heading, remaining, job.motion_token)
+            if self.field_coordination else (job, heading, remaining)
+        )
+        self.schedule(end, "movement_tail", payload)
 
     def _required_route(self, start: tuple[int, int], goal: tuple[int, int]) -> Route:
         route = self.router.route(start, goal)
@@ -911,7 +1401,8 @@ class _Engine:
 
     def _result(self) -> DayResult:
         first_release = 0.0
-        last_completion = max(float(task.completed_at) for task in self.tasks)
+        completion_times = [float(task.completed_at) for task in self.tasks if task.completed_at is not None]
+        last_completion = max(completion_times, default=getattr(self, "terminal_time", 0.0))
         makespan = last_completion - first_release
         completed_lines = sum(task.completed_lines for task in self.tasks)
         station_metrics = {
@@ -930,7 +1421,7 @@ class _Engine:
             "makespan_seconds": makespan,
             "makespan_hours": makespan / 3600.0,
             "completed_lines": completed_lines,
-            "completed_tasks": len(self.tasks),
+            "completed_tasks": sum(task.completed_at is not None for task in self.tasks),
             "rack_presentations": len(self.jobs),
             "line_throughput_per_hour": completed_lines * 3600.0 / makespan if makespan else 0.0,
             "travel_distance_m": sum(amr.travel_distance_m for amr in self.amrs),
@@ -944,7 +1435,7 @@ class _Engine:
             "dram_solver_reroutes": self.dram_solver_reroutes,
             "dram_conflict_wait_seconds": sum(job.dram_wait_seconds for job in self.jobs),
             "max_reserved_nodes": self.max_reserved_nodes,
-            "deadlock_count": 0,
+            "deadlock_count": self.coordination_metrics["deadlock_count"] if self.field_coordination else 0,
             "coordination_fallback_count": self.coordination_fallback_count,
             "coordination_fallback_reason": getattr(
                 self, "coordination_fallback_reason", ""
@@ -964,6 +1455,16 @@ class _Engine:
                 for amr in self.amrs
             },
         }
+        if self.field_coordination:
+            coordination = dict(self.coordination_metrics)
+            grants = coordination.pop("granted_window_nodes")
+            coordination["mean_granted_window_nodes"] = (
+                grants / coordination["reservation_grant_count"]
+                if coordination["reservation_grant_count"] else 0.0
+            )
+            metrics["coordination"] = coordination
+            metrics["coordination_status"] = coordination["status"]
+            metrics["eligible_for_comparison"] = coordination["status"] == "VALID"
         job_rows = [
             {
                 "job_id": job.job_id,
@@ -977,7 +1478,10 @@ class _Engine:
                 "dispatch_time": job.dispatch_time,
                 "rack_departure": job.rack_departure,
                 "rack_return": job.rack_return,
-                "station_queue_position": grid_name(job.station_queue_position),
+                "station_queue_position": (
+                    grid_name(job.station_queue_position)
+                    if job.station_queue_position is not None else ""
+                ),
                 "station_queue_enter": job.station_queue_enter,
                 "station_admitted": job.station_admitted,
                 "station_arrival": job.station_arrival,
@@ -992,7 +1496,10 @@ class _Engine:
             }
             for job in self.jobs
         ]
-        return DayResult(metrics, self.events, self.motion_segments, job_rows, self.paths)
+        return DayResult(
+            metrics, self.events, self.motion_segments, job_rows, self.paths,
+            self.deadlock_snapshot,
+        )
 
 
 def simulate_day(

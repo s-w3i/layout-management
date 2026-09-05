@@ -25,7 +25,7 @@
   },
   "detailed_event_log": false,
   "coordination": {
-    "profile": "legacy_v1",
+    "profile": "dram_field_v1",
     "allocation_period_seconds": 1.0,
     "max_reservation_nodes": 5,
     "head_to_head_window": 3,
