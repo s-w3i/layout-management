@@ -38,6 +38,8 @@ class PlannerConfig:
     directional_conflict_gain: float = 0.6
     directional_opposite_penalty_gain: float = 0.8
     max_directional_heat_cost: float = 10.0
+    directional_smoothing_alpha: float = 0.4
+    directional_publish_period_sec: float = 5.0
 
 
 @dataclass
@@ -411,6 +413,7 @@ class AStarPlanner:
         self.map = warehouse_map
         self.config = config or PlannerConfig()
         self.directional_heat_costs: Dict[Tuple[VertexId, VertexId], float] = {}
+        self.base_edge_heat_costs: Dict[Tuple[VertexId, VertexId], float] = {}
         self.committed_paths: Dict[str, List[str]] = {}
         self.committed_path_indices: Dict[str, List[VertexId]] = {}
         self._committed_cell_counts: Counter[VertexId] = Counter()
@@ -619,32 +622,9 @@ class AStarPlanner:
         return committed_cells, committed_edges
 
     def _directional_heat_cost(self, start: VertexId, end: VertexId) -> float:
-        static_forward = self.directional_heat_costs.get((start, end), 0.0)
-        static_reverse = self.directional_heat_costs.get((end, start), 0.0)
-        forward_flow = float(self._directional_flow_counts.get((start, end), 0))
-        reverse_flow = float(self._directional_flow_counts.get((end, start), 0))
-
-        total = forward_flow + reverse_flow
-        if total <= 0.0:
-            return static_forward
-
-        bias = (forward_flow - reverse_flow) / total
-        conflict = min(forward_flow, reverse_flow) / total
-        forward_cost = static_forward - self.config.directional_alignment_gain * bias
-        reverse_cost = static_reverse + self.config.directional_alignment_gain * bias
-        penalty = self.config.directional_conflict_gain * conflict
-        forward_cost += penalty
-        reverse_cost += penalty
-
-        if self.config.directional_opposite_penalty_gain > 0.0 and abs(bias) > 1e-6:
-            minority_penalty = self.config.directional_opposite_penalty_gain * abs(bias)
-            if bias > 0.0:
-                reverse_cost += minority_penalty
-            else:
-                forward_cost += minority_penalty
-
-        max_cost = max(0.5, self.config.max_directional_heat_cost)
-        return max(0.0, min(max_cost, forward_cost))
+        # The DRAM overlay has already blended and smoothed these costs.
+        return self.directional_heat_costs.get((start, end),
+            self.base_edge_heat_costs.get(tuple(sorted((start, end))), 0.0))
 
     def _committed_penalty(
         self,

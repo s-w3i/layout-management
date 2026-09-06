@@ -7,6 +7,7 @@ from time import perf_counter
 from amr_simulation.models import SimulationConfig, WorkloadTask
 
 from .astar_planner import AStarPlanner, PlannerConfig, WarehouseMap
+from .directional_cost_layer import DirectionalCostLayer
 from .conflict_detection import ConflictDetector
 from .conflict_resolution import ConflictResolver
 from .periodic_allocator import PeriodicAllocator
@@ -53,11 +54,15 @@ class WarehouseSystem:
         self.allocator = PeriodicAllocator(
             warehouse_map=warehouse_map, allocator_cfg=config.get("allocator", {}), robot_names=names,
         )
+        self.heat_layer = DirectionalCostLayer(warehouse_map, planner_config)
+        self.heat_layer.set_base_costs(config.get("base_edge_heat_costs", {}))
         self.metrics = RunMetricsRecorder()
         self.plan_generation = MoveRobotPathPlanner(self.planner, self.allocator, warehouse_map, self.metrics)
+        self.plan_generation.heat_layer = self.heat_layer
         self.conflict_detector = ConflictDetector(**config.get("conflicts", {}))
         self.conflict_resolver = ConflictResolver(warehouse_map)
-        self.task_scheduler = StoreDayScheduler(tasks, racks, mapping, amr_config, warehouse_map)
+        self.task_scheduler = StoreDayScheduler(tasks, racks, mapping, amr_config, warehouse_map,
+            workstation_admission_limit=config.get("dispatch", {}).get("workstation_admission_limit", 2))
         self.task_state_machine = TaskStateMachineManager(runtime, warehouse_map)
         self.task_state_machine.seed_rack_positions({rack_id: rack_id for rack_id in racks})
         self.simulator.set_rack_positions(self.task_state_machine.rack_positions)
@@ -94,6 +99,7 @@ class WarehouseSystem:
             self._last_status_time = self.sim_time_sec
             self.status_callback(self.sim_time_sec)
         snapshots = self.simulator.snapshots()
+        self.heat_layer.update(dt, self.planner)
         # Refresh before dispatch so new and replanned routes see current commitments.
         self.planner.set_committed_paths(self.allocator.full_paths())
         while True:
@@ -119,6 +125,8 @@ class WarehouseSystem:
             phase, job_id = previous[name]
             if job_id and context.phase != phase:
                 self.metrics.record_stage(job_id, context.phase, self.sim_time_sec)
+                if context.phase == "to_return":
+                    self.task_scheduler.mark_station_released(job_id, self.sim_time_sec)
         for completion in self.task_state_machine.drain_completed_tasks():
             completed_lines = self.task_scheduler.mark_completed(completion.task_id, self.sim_time_sec)
             if self.progress_callback is not None:
@@ -128,12 +136,16 @@ class WarehouseSystem:
         conflicts = self.conflict_detector.detect_and_log_conflicts(self.allocator.conflict_paths(snapshots))
         order = get_alloc_order(
             self.allocator.states, snapshots, self.task_state_machine.contexts,
-            self.allocator.allocator_cfg["priority_strategy"],
+            self.allocator.allocator_cfg["priority_strategy"], self.map,
+            self.allocator.mutex_passage.robots_move_buffer,
         )
         self.allocator.set_conflict_resolutions(self.conflict_resolver.resolve(
             conflicts=conflicts, priority_order=order, robot_snapshots=snapshots,
             jack_states=self.task_state_machine.jack_states(), sim_time_sec=self.sim_time_sec,
         ))
+        for name, edges in self.conflict_resolver.replan_tabu_edges.items():
+            self.allocator.tabu_sets.setdefault(name, set()).update(edges)
+        self.planner.set_tabu_edges(self.allocator.tabu_sets)
         self.allocator.update(
             dt=dt, planner=self.planner, robot_snapshots=snapshots,
             task_contexts=self.task_state_machine.contexts,

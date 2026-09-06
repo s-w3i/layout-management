@@ -54,6 +54,31 @@ simulation seconds, default 86,400). An early window close is incomplete.
 Exit status: 0 if every requested run completes, 1 for incomplete/failed runs,
 2 for input or batch/report errors. Daily results survive interruption.
 
+## Workstation admission and balanced dispatch
+
+`dispatch.workstation_admission_limit` in `current_heat.yaml` defaults to **2**.
+It limits rack jobs from dispatch through workstation exit, including pickup,
+travel, and service. Returning racks no longer occupy an admission slot.
+
+All store/day groups still release at time zero and keep the shared store-to-
+workstation mapping. Each station works on one store at a time. It starts its
+next store only when the current store has no undispatched SKUs and all its
+admitted jobs have left the station. Rack returns from the previous store may
+still be in progress; order lines count as completed after jack-down as before.
+
+Dispatch considers each station's current store, prioritizes fewer admitted
+jobs, and breaks ties by least recent dispatch then station name. It skips
+stations whose racks cannot currently be dispatched, so their work does not
+hold up another station. Within a store, rack coverage and pickup travel still
+determine the rack/robot choice. Work cannot be guaranteed at every station
+when its demand is exhausted, robots are unavailable, or required racks are busy.
+
+Use the same limit for every layout. Edit the YAML to compare limits of 1, 2,
+or 3; restart the simulator and use a new output directory for each comparison.
+`rack_jobs.csv` includes `station_release_time_s` to audit admission intervals
+and store transitions. This dispatch policy intentionally differs from the
+original task sequence; it does not change the path planner.
+
 ## Shared inputs and fairness
 
 YAML paths resolve relative to the YAML file; CLI paths resolve relative to the
@@ -183,3 +208,66 @@ Pygame rotation uses a constant angular-speed limit while the shared AMR dispatc
 estimate includes angular acceleration. Congestion may prevent completion;
 reported safety interventions are not a proof of physical collision safety.
 Do not infer fleet-scale or full-year performance from a small successful sample.
+
+## Standard DRAM coordination alignment
+
+The simulator ports the following behaviors from `dram_ws/src/dram_plan/dram_plan`
+and `dram_ws/src/dram_viz/dram_viz/directional_cost_layer.py` (WHCA excluded):
+
+- Timeout replanning waits for both five-second conditions and excludes loaded
+  robots and followers with the same two-node continuation.
+- Explicit conflict replans require at most one buffered node and add no tabu
+  edge. A `wait` resolution falls through to normal reservation checks, matching
+  the standard allocator's implementation; reservation/safety checks still apply.
+- A replan queues a request from the buffer tail, clears published paths, and
+  marks the robot computing. The response is delivered on the next simulation
+  tick. It resets passage tracking to the current node and installs the returned
+  path directly. Failed replans clear tabu edges and retry on a later tick.
+  This models callback ordering, not ROS wall-clock/network latency.
+- All deterministic priority strategies use DRAM's quantities: actual buffer
+  size, reservation timestamp (infinity when unset, as in DRAM), distance to the
+  next node, full remaining path length, and geometric path cost. Jack state,
+  numeric priority, and robot name determine group/tie ordering.
+- Directional costs use DRAM's affected-edge histogram updates, base edge heat,
+  clamping, smoothing, and publication interval. Path creation/clearing feeds
+  the overlay; robot motion does not silently shorten its published paths.
+
+`planner.directional_smoothing_alpha` defaults to 0.4 and
+`planner.directional_publish_period_sec` to 5 simulated seconds. Existing heat
+weights remain explicit in YAML. `base_edge_heat_costs` supplies the equivalent
+of `/edge_heat_costs`, for example `{"G1_1->G2_1": 3.0}`; keys are undirected.
+With no external base heat supplied, the base is zero. No external heat publisher
+or ROS transport is simulated.
+
+Tests compare heat calculations and all deterministic priority strategies
+against the local `dram_ws` source when that checkout is available. Callback,
+reservation, and workload regression tests run without ROS. This does not claim
+complete DRAM engine parity: the current-heat A* search, native rack-obstacle
+rules, workload allocation, and physical motion remain simulation-specific.
+Use a new output directory after these changes; old checkpoints have a different
+code fingerprint. Full-day throughput improvement must be measured separately.
+
+### Fleet-stall regression
+
+The standard conflict resolver's tabu-edge publication must accompany its
+replan decisions. Omitting it allowed repeated requests for the same blocked
+route. Overlap waits also must not replace an already selected replan.
+Both are covered by `tests/test_dram_alignment.py`.
+
+A bounded reproduction using `map1_basic`, 2023-01-03, and 40 robots completed
+17 lines before all positions stopped changing (unchanged samples from 480
+through 660 simulated seconds). With the fixes, the same setup completed 143
+lines by 1,200 simulated seconds, with continued movement. This is a stall
+regression check, not evidence of full-day completion or an aggregate throughput
+improvement. Restart an already-running simulator to load the changes.
+
+### Completed order lines per rack presentation
+
+Daily `completed_order_lines_per_rack_presentation` is completed order lines
+(after return/jack-down) divided by `rack_presentations` (rack arrivals at
+workstation service). Repeated visits by the same rack count separately.
+An unfinished return contributes a presentation but no completed lines; zero
+presentations gives an unavailable value. On fully completed days this equals
+`lines_per_completed_rack_trip`. Daily summaries/CSVs include the KPI, and layout
+summaries, `layout_comparison.csv`, and the Markdown report include its arithmetic
+mean over the common completed dates.

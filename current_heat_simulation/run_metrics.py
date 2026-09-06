@@ -121,6 +121,7 @@ class RunMetricsRecorder:
             "rack_id": j.request.rack_id, "workstation": j.task.workstation,
             "covered_skus": json.dumps(sorted(j.lines)), "covered_lines": sum(j.lines.values()),
             "dispatch_time_s": j.dispatch_time, "completion_time_s": j.completion_time,
+            "station_release_time_s": j.station_release_time,
             **{name+"_time_s": self.stages[j.request.task_id].get(name+"_time_s") for name in stage_names},
             **self._counter_row(self.jobs[j.request.task_id]),
         } for j in scheduler.jobs.values()]
@@ -131,6 +132,12 @@ class RunMetricsRecorder:
             row["utilization"] = ratio(row["busy_seconds"], now)
             robot_rows.append(row)
         completed_jobs = [j for j in scheduler.jobs.values() if j.completion_time is not None]
+        presentations = sum(
+            j.station_release_time is not None or j.completion_time is not None
+            or any(self.stages[j.request.task_id].get(stage + "_time_s") is not None
+                   for stage in ("dropoff_wait", "to_ingestor_exit", "to_return", "return_wait", "idle"))
+            for j in scheduler.jobs.values()
+        )
         stations = []
         for name in scheduler.config.workstations:
             station_jobs = [j for j in completed_jobs if j.task.workstation == name]
@@ -168,6 +175,8 @@ class RunMetricsRecorder:
             "safety_blocked_robot_substeps": safety_interventions,
             "empty_distance_m": empty, "loaded_distance_m": loaded, "travel_distance_m": empty+loaded,
             "travel_metres_per_completed_line": ratio(empty+loaded, lines),
+            "rack_presentations": presentations,
+            "completed_order_lines_per_rack_presentation": ratio(lines, presentations),
             "lines_per_completed_rack_trip": ratio(lines, len(completed_jobs)),
             "skus_per_completed_rack_trip": ratio(sum(len(j.lines) for j in completed_jobs), len(completed_jobs)),
             "rack_trips_per_1000_lines": ratio(len(completed_jobs)*1000, lines),

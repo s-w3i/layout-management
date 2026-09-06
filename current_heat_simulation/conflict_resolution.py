@@ -13,6 +13,7 @@ PATH_OVERLAP_REPLAN_SEC = 6.0
 class ConflictResolver:
     def __init__(self, warehouse_map: WarehouseMap) -> None:
         self.map = warehouse_map
+        self.replan_tabu_edges: Dict[str, Set[str]] = {}
         self.waiting_conflicts: Dict[str, Dict[str, object]] = {}
 
     def resolve(
@@ -25,6 +26,14 @@ class ConflictResolver:
         sim_time_sec: float,
     ) -> Dict[str, str]:
         actions: Dict[str, str] = {}
+        self.replan_tabu_edges = {}
+
+        def request_replan(robot, entries):
+            actions[robot] = "replan"
+            edge = self._node_key_for_robot(entries, robot)
+            if edge and edge != "->":
+                self.replan_tabu_edges.setdefault(robot, set()).add(edge)
+
         current_grids = {name: snapshot.current_vertex for name, snapshot in robot_snapshots.items()}
 
         for conflict in conflicts:
@@ -37,7 +46,7 @@ class ConflictResolver:
                 yielding_side = self._select_yielding_side(side_a, side_b, priority_order, current_grids, jack_states)
                 holding_side = side_b if yielding_side == side_a else side_a
                 for robot in yielding_side:
-                    actions[robot] = "replan"
+                    request_replan(robot, entries)
                 for robot in holding_side:
                     actions.setdefault(robot, "wait")
                 continue
@@ -57,7 +66,7 @@ class ConflictResolver:
                     for robot in robots:
                         actions.setdefault(robot, "wait")
                 else:
-                    actions[replan_robot] = "replan"
+                    request_replan(replan_robot, entries)
                     for robot in robots:
                         if robot != replan_robot:
                             actions.setdefault(robot, "wait")
@@ -86,7 +95,10 @@ class ConflictResolver:
                     "resolution": resolution,
                     "robot": lower,
                 }
-                actions[lower] = resolution
+                if resolution == "replan":
+                    request_replan(lower, entries)
+                else:
+                    actions.setdefault(lower, resolution)
                 continue
 
             replan_robot = self._select_robot_to_replan(robots, priority_order, current_grids, jack_states)
@@ -94,7 +106,7 @@ class ConflictResolver:
                 for robot in robots:
                     actions.setdefault(robot, "wait")
             else:
-                actions[replan_robot] = "replan"
+                request_replan(replan_robot, entries)
                 for robot in robots:
                     if robot != replan_robot:
                         actions.setdefault(robot, "wait")

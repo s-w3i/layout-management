@@ -8,6 +8,7 @@ from statistics import mean, median, stdev
 from .run_metrics import TIME_CATEGORIES, ratio, write_csv, write_json
 
 KPI_MEANS = (
+    "completed_order_lines_per_rack_presentation",
     "makespan_hours", "travel_metres_per_completed_line", "lines_per_completed_rack_trip",
     "skus_per_completed_rack_trip", "rack_trips_per_1000_lines", "mean_store_completion_seconds",
     "p95_store_completion_seconds", "amr_utilization", "reservation_wait_seconds_per_line",
@@ -101,10 +102,17 @@ def generate_report(output: Path, results, layouts, dates, baseline, warehouse_m
         rate_text = f"{value:.2f}" if value is not None else "unavailable"
         change_text = f"{change:+.2f}%" if change is not None else "unavailable"
         lines.append(f"| {s['layout']} | {s.get('slotting_strategy') or 'unspecified'} | {s['completed_days']}/{s['requested_days']} | {rate_text} | {change_text} |")
+    lines += ["", "| Layout | Completed order lines per rack presentation (daily mean) |",
+              "|---|---:|"]
+    for s in summaries:
+        value = s["mean_daily_completed_order_lines_per_rack_presentation"]
+        value_text = f"{value:.2f}" if value is not None else "unavailable"
+        lines.append(f"| {s['layout']} | {value_text} |")
     for title, filename in charts:
         lines += ["", f"## {title}", "", f"![{title}](charts/{filename})"]
     lines += ["", "## Interpretation and definitions", "",
               "- Throughput bars use sample standard deviation across days, not a confidence interval. One day has no measured between-day variation.",
+              "- Completed order lines per rack presentation divides returned/jacked-down order lines by rack arrivals at workstation service. Unfinished returns contribute a presentation but no completed lines. No presentations means unavailable.",
               "- Weighted throughput is total completed lines divided by total simulation hours over the common dates.",
               "- Travel is actual substep displacement, split by loaded/empty state. Normalized travel and waits use completed source order lines, not units or distinct SKUs.",
               "- Robot time categories are mutually exclusive. Utilization includes active waiting; movement and waiting charts explain the difference.",

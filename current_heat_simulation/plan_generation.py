@@ -33,6 +33,8 @@ class MoveRobotPathPlanner:
         self.task_queue: Dict[str, Deque[QueuedMove]] = {}
         self.current_tasks: Dict[str, Optional[str]] = {}
         self.current_goals: Dict[str, Optional[str]] = {}
+        self.pending_replans = {}
+        self.heat_layer = None
 
     def submit_move(self, request: MoveRobotRequest) -> None:
         queue = self.task_queue.setdefault(request.robot_name, deque())
@@ -49,6 +51,8 @@ class MoveRobotPathPlanner:
         if self.current_tasks.get(robot_name) == task_id:
             self.current_tasks[robot_name] = None
             self.current_goals[robot_name] = None
+            if self.heat_layer is not None:
+                self.heat_layer.path_changed(robot_name, [])
 
     def update(
         self,
@@ -57,6 +61,14 @@ class MoveRobotPathPlanner:
         carrying_rack: Dict[str, bool],
         occupied_shelves: set[str],
     ) -> None:
+        # Deliver requests on a later tick, like ROS service response callbacks.
+        pending, self.pending_replans = self.pending_replans, {}
+        for robot_name, (goal, task_id, start) in pending.items():
+            self._request_path_computation(
+                robot_name=robot_name, goal_vertex=goal, task_id=task_id,
+                robot_snapshots=robot_snapshots, carrying_rack=carrying_rack,
+                occupied_shelves=occupied_shelves, replan_start=start,
+            )
         for robot_name in list(self.task_queue):
             if self.current_tasks.get(robot_name) is not None:
                 continue
@@ -84,16 +96,20 @@ class MoveRobotPathPlanner:
         task_id = self.current_tasks.get(robot_name)
         if not goal_vertex or not task_id:
             return
+        if robot_name in self.pending_replans:
+            return
         if self.metrics_recorder is not None:
             self.metrics_recorder.record_replan()
-        self._request_path_computation(
-            robot_name=robot_name,
-            goal_vertex=goal_vertex,
-            task_id=task_id,
-            robot_snapshots=robot_snapshots,
-            carrying_rack=carrying_rack,
-            occupied_shelves=occupied_shelves,
-        )
+        snapshot = robot_snapshots[robot_name]
+        window = self.allocator._window_nodes(robot_name, snapshot.current_vertex)
+        start = window[-1] if window else snapshot.current_vertex
+        self.pending_replans[robot_name] = (goal_vertex, task_id, start)
+        self.allocator.pending_replans.add(robot_name)
+        self.allocator.conflict_resolutions[robot_name] = "computing"
+        self.allocator.states[robot_name].full_path = []
+        self.allocator.states[robot_name].current_index = 0
+        if self.heat_layer is not None:
+            self.heat_layer.path_changed(robot_name, [])
 
     def nearest_reachable_goal(
         self,
@@ -148,12 +164,14 @@ class MoveRobotPathPlanner:
         robot_snapshots: Dict[str, RobotSnapshot],
         carrying_rack: Dict[str, bool],
         occupied_shelves: set[str],
+        replan_start: Optional[str] = None,
     ) -> None:
         snapshot = robot_snapshots[robot_name]
+        start_name = replan_start if replan_start is not None else snapshot.current_vertex
         started_at = perf_counter()
         try:
             path = self.planner.plan(
-                start_name=snapshot.current_vertex,
+                start_name=start_name,
                 goal_name=goal_vertex,
                 carrying_rack=carrying_rack.get(robot_name, False),
                 occupied_shelves=occupied_shelves,
@@ -161,9 +179,15 @@ class MoveRobotPathPlanner:
             )
         except ValueError:
             self.clear_tabu_set_for_robot(robot_name)
+            if replan_start is not None:
+                if self.metrics_recorder is not None:
+                    self.metrics_recorder.record_planning_result(
+                        latency_ms=(perf_counter() - started_at) * 1000.0, success=False)
+                self.pending_replans[robot_name] = (goal_vertex, task_id, start_name)
+                return
             try:
                 path = self.planner.plan(
-                    start_name=snapshot.current_vertex,
+                    start_name=start_name,
                     goal_name=goal_vertex,
                     carrying_rack=carrying_rack.get(robot_name, False),
                     occupied_shelves=occupied_shelves,
@@ -185,4 +209,16 @@ class MoveRobotPathPlanner:
 
         self.current_tasks[robot_name] = task_id
         self.current_goals[robot_name] = goal_vertex
-        self.allocator.set_full_path(robot_name, path, goal_vertex)
+        if replan_start is not None:
+            self.allocator.pending_replans.discard(robot_name)
+            self.allocator.mutex_passage.remove_all_planned_paths(robot_name)
+            self.allocator.mutex_passage.update_move_buffer(robot_name, snapshot.current_vertex)
+            self.allocator.conflict_resolutions[robot_name] = "clear"
+        # planned_path_callback installs the response as given, without merging.
+        state = self.allocator.states[robot_name]
+        state.full_path = list(path)
+        state.current_index = 0
+        state.last_goal = goal_vertex
+        self.allocator.mutex_passage.add_planned_path(robot_name, path)
+        if self.heat_layer is not None:
+            self.heat_layer.path_changed(robot_name, path)

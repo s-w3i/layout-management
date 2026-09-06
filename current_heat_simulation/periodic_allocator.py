@@ -25,6 +25,7 @@ class PeriodicAllocator:
         self.tabu_sets: Dict[str, set[str]] = {}
         self.mutex_passage = MutexPassage()
         self.conflict_resolutions: Dict[str, str] = {}
+        self.pending_replans: set[str] = set()
         self.sim_time_sec = 0.0
         self._allocation_elapsed = 0.0
 
@@ -101,7 +102,7 @@ class PeriodicAllocator:
 
     def window_paths(self, robot_snapshots: Dict[str, RobotSnapshot]) -> Dict[str, List[str]]:
         return {
-            robot_name: self._window_nodes(robot_name, robot_snapshots[robot_name].current_vertex)
+            robot_name: ([] if robot_name in self.pending_replans else self._window_nodes(robot_name, robot_snapshots[robot_name].current_vertex))
             for robot_name in self.states
             if robot_name in robot_snapshots
         }
@@ -163,7 +164,7 @@ class PeriodicAllocator:
         return_replan_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._reserve_stationary_positions(robot_snapshots)
-        order = get_alloc_order(self.states, robot_snapshots, task_contexts, str(self.allocator_cfg.get("priority_strategy", "ascPathLength")))
+        order = get_alloc_order(self.states, robot_snapshots, task_contexts, str(self.allocator_cfg.get("priority_strategy", "ascPathLength")), self.map, self.mutex_passage.robots_move_buffer)
         for robot_name in order:
             self._allocate_robot_window(
                 robot_name=robot_name,
@@ -268,6 +269,15 @@ class PeriodicAllocator:
     ) -> None:
         state = self.states[robot_name]
         snapshot = robot_snapshots[robot_name]
+        if robot_name in self.pending_replans:
+            return
+        resolution = self.conflict_resolutions.get(robot_name, "allocate")
+        buffer = self.mutex_passage.robots_move_buffer.get(robot_name, ())
+        if resolution == "replan" and len(buffer) <= 1:
+            # DRAM's explicit resolution requests a path without adding a tabu edge.
+            replan_callback(robot_name)
+            return
+        # Standard DRAM's "wait" falls through to normal reservation checks.
         if state.current_index >= len(state.full_path):
             return
 
@@ -285,26 +295,6 @@ class PeriodicAllocator:
             self.mutex_passage.update_move_buffer(robot_name, snapshot.current_vertex)
             window_nodes = self._window_nodes(robot_name, snapshot.current_vertex)
 
-        resolution = self.conflict_resolutions.get(robot_name, "allocate")
-        if resolution == "wait":
-            return
-        if resolution == "replan":
-            from_node = window_nodes[-1] if window_nodes else snapshot.current_vertex
-            if state.current_index < len(state.full_path):
-                to_node = state.full_path[state.current_index]
-                self._trigger_blocked_replan(
-                    robot_name=robot_name,
-                    state=state,
-                    snapshot=snapshot,
-                    blocked_node=to_node,
-                    planner=planner,
-                    task_context=task_contexts[robot_name],
-                    replan_callback=replan_callback,
-                    return_replan_callback=return_replan_callback,
-                )
-            self.conflict_resolutions[robot_name] = "clear"
-            return
-
         for _ in segment_indices[: int(self.allocator_cfg.get("max_reservation", 8))]:
             if state.current_index >= len(state.full_path):
                 break
@@ -317,6 +307,13 @@ class PeriodicAllocator:
             if owner and owner != robot_name:
                 self.mutex_passage.add_wait_for_robot(robot_name, {owner})
                 state.conflict_start_times.setdefault(node_name, self.sim_time_sec)
+                # DRAM allows followers and loaded robots to wait; explicit
+                # conflict-resolution replans above remain available to both.
+                leader = self.states.get(owner)
+                if leader and self.is_following_path(state.full_path, leader.full_path, node_name):
+                    return
+                if snapshot.jack_up:
+                    return
                 conflict_wait = self.sim_time_sec - state.conflict_start_times[node_name]
                 arrival_wait = self.sim_time_sec - state.last_arrival_time if state.last_arrival_time else 0.0
                 if (
@@ -366,6 +363,16 @@ class PeriodicAllocator:
                 state.last_arrival_node = None
             window_nodes = self._window_nodes(robot_name, snapshot.current_vertex)
 
+    @staticmethod
+    def is_following_path(current_path: Sequence[str], leader_path: Sequence[str], conflict_node: str) -> bool:
+        """Match DRAM's two-node continuation test at the reserved node."""
+        try:
+            current_index = current_path.index(conflict_node)
+            leader_index = leader_path.index(conflict_node)
+        except ValueError:
+            return False
+        return current_path[current_index:current_index + 2] == leader_path[leader_index:leader_index + 2]
+
     def _merge_preserved_window_with_new_path(self, preserved_window: List[str], node_list: List[str]) -> List[str]:
         if not preserved_window:
             return list(node_list)
@@ -405,18 +412,12 @@ class PeriodicAllocator:
         replan_callback: Callable[[str], None],
         return_replan_callback: Optional[Callable[[str], None]],
     ) -> None:
-        block_key = f"{snapshot.current_vertex}->{blocked_node}"
-        cooldown = float(self.allocator_cfg.get("blocked_replan_cooldown_sec", self.allocator_cfg.get("replan_wait_sec", 5.0)))
-        if (
-            state.last_blocked_replan_key == block_key
-            and state.last_blocked_replan_time > 0.0
-            and (self.sim_time_sec - state.last_blocked_replan_time) < cooldown
-        ):
-            return
-
+        window = self._window_nodes(robot_name, snapshot.current_vertex)
+        from_node = window[-1] if window else snapshot.current_vertex
+        block_key = f"{from_node}->{blocked_node}"
         state.last_blocked_replan_key = block_key
         state.last_blocked_replan_time = self.sim_time_sec
-        self._publish_tabu_item(robot_name, snapshot.current_vertex, blocked_node)
+        self._publish_tabu_item(robot_name, from_node, blocked_node)
         planner.set_tabu_edges(self.tabu_sets)
 
         if return_replan_callback is not None and task_context.phase == "to_return" and task_context.carrying_rack:

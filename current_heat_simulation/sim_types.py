@@ -66,6 +66,8 @@ class RobotTaskContext:
 
 @dataclass
 class RobotAllocationState:
+    priority: int = 0
+    last_reservation_time: float = float("inf")
     full_path: List[str] = field(default_factory=list)
     current_index: int = 0
     last_goal: Optional[str] = None

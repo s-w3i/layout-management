@@ -17,6 +17,12 @@ planner:
   directional_conflict_gain: 2.0
   directional_opposite_penalty_gain: 2.0
   max_directional_heat_cost: 50.0
+  directional_smoothing_alpha: 0.4
+  directional_publish_period_sec: 5.0
+# Undirected /edge_heat_costs equivalent; zero when no external heat is supplied.
+base_edge_heat_costs: {}
+dispatch:
+  workstation_admission_limit: 6
 allocator:
   max_reservation: 8
   priority_strategy: ascPathLength
