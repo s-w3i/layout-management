@@ -18,6 +18,18 @@ python3 rmf_grid_map_editor.py
 The desktop app provides grid editing, SKU analysis, slotting, traffic
 optimization, and inventory operations.
 
+## Current-heat Pygame simulation
+
+Run the copied current-heat planner on the native grid, with store/day tasks
+released at time zero using the AMR workload rules:
+
+```bash
+python3 -m current_heat_simulation.pygame_simulator
+```
+
+See [current_heat_simulation/README.md](current_heat_simulation/README.md) for
+date, layout, fleet, headless-run, and output options. Pygame is required.
+
 ## Compare four slotting layouts
 
 Run all observed order dates with 40 AMRs and one persistent worker per layout:

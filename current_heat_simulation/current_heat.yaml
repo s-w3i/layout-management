@@ -1,0 +1,44 @@
+method: current_heat
+map_file: ../resources/map/map1_1.grid.json
+orders_file: ../resources/data/Sample Data.xlsx
+layout_file: ../resources/map/map1_basic.slotting.json
+amr_config: ../amr_simulation/config/default.json
+
+planner:
+  weighted_astar_epsilon: 1.3
+  turning_penalty: 1.0
+  use_turn_penalty: true
+  use_committed_path_awareness: true
+  committed_node_penalty: 2.0
+  committed_edge_penalty: 1.0
+  use_directional_heat: true
+  heat_weight: 1.0
+  directional_alignment_gain: 0.8
+  directional_conflict_gain: 2.0
+  directional_opposite_penalty_gain: 2.0
+  max_directional_heat_cost: 50.0
+allocator:
+  max_reservation: 8
+  priority_strategy: ascPathLength
+  allocation_interval_sec: 0.5
+  replan_wait_sec: 5.0
+motion:
+  waypoint_epsilon_m: 0.05
+  heading_align_rad: 0.08
+  enforce_collision_safety: true
+  collision_clearance_m: 0.35
+conflicts:
+  print_conflicts: false
+display:
+  width: 1280
+  height: 720
+  margin: 40
+  robot_radius: 5
+  show_paths: true
+simulation:
+  fps: 60
+  sim_time_scale: 20.0
+  fixed_sim_step_sec: 0.05
+  max_frame_dt_sec: 0.1
+  max_sim_steps_per_frame: 64
+  stop_at_sim_time_sec: 86400.0

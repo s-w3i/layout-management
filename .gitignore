@@ -8,6 +8,7 @@ __pycache__/
 .cache/
 amr_simulation/.cache/
 amr_simulation/results/
+current_heat_simulation/results/
 
 # Local document build artifacts
 *.aux

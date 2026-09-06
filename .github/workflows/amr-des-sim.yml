@@ -1,0 +1,26 @@
+name: AMR DES standalone checks
+on:
+  push:
+    paths: ['amr-des-sim/**', '.github/workflows/amr-des-sim.yml']
+  pull_request:
+    paths: ['amr-des-sim/**', '.github/workflows/amr-des-sim.yml']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12']
+    defaults:
+      run:
+        working-directory: amr-des-sim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ matrix.python }}'
+      - run: python -m pip install -e '.[dev,debug]'
+      - run: python -I -m pytest -q
+      - run: ruff check .
+      - run: mypy src/amr_des
+      - run: amr-des run examples/minimal.json --out runs/ci-minimal
+      - run: amr-des run-warehouse --map examples/native/map.grid.json --slotting examples/native/layout.slotting.json --orders examples/native/orders.xlsx --config examples/native/config.json --date 2026-01-05 --out runs/ci-warehouse
