@@ -26,6 +26,7 @@ class PeriodicAllocator:
         self.mutex_passage = MutexPassage()
         self.conflict_resolutions: Dict[str, str] = {}
         self.pending_replans: set[str] = set()
+        self.recovery_robots: set[str] = set()
         self.sim_time_sec = 0.0
         self._allocation_elapsed = 0.0
 
@@ -269,6 +270,8 @@ class PeriodicAllocator:
     ) -> None:
         state = self.states[robot_name]
         snapshot = robot_snapshots[robot_name]
+        if robot_name in self.recovery_robots:
+            return
         if robot_name in self.pending_replans:
             return
         resolution = self.conflict_resolutions.get(robot_name, "allocate")

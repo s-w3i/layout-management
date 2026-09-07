@@ -24,10 +24,26 @@ Omit the date arguments to run **all observed workbook dates headlessly**.
 Use `--date 2023-01-03` for a single day. Start with a representative small
 selection before scheduling all dates: congested runs can remain incomplete.
 
+For separate dates, repeat `--date`, for example
+`--headless --date 2023-01-03 --date 2023-02-03 --date 2023-03-03`.
+Each selected date must have workload data. Dates are sorted and duplicates
+run only once. Multiple dates require headless mode; do not combine explicit
+dates with `--start-date` or `--end-date`.
+
 The fleet size is fixed across layouts. Default: 40 robots from the AMR config;
 use `--amrs 10` to use its first ten spawn positions. Workers default to the
 smaller of four, available CPUs, and pending layout/day runs. They are processes,
 not threads, and each day has fresh mutable simulation state.
+
+Dates run in chronological order. For each date, all requested layouts run
+(up to `--workers` in parallel); the next date starts only after every layout
+for the current date has finished its attempt. Completed checkpoints count
+as finished when resuming. Each run keeps separate files under
+`OUTPUT/LAYOUT/YYYY-MM-DD/`, with its live log beside that date folder.
+One combined report and comparison charts are generated after all dates finish.
+Each date opens fresh per-layout progress bars using only that day's order-line
+total. Date labels identify each set; completed bars remain visible. Resumed
+layouts start with their checkpoint's completed-line count for that date.
 
 To resume, repeat the same input/configuration arguments and append `--resume`
 with the same `--output`. Successful, intact, compatible days are skipped;
@@ -53,6 +69,55 @@ accepts one layout. Both modes stop at completion or `--max-seconds` (per-day
 simulation seconds, default 86,400). An early window close is incomplete.
 Exit status: 0 if every requested run completes, 1 for incomplete/failed runs,
 2 for input or batch/report errors. Daily results survive interruption.
+
+## Live diagnostics
+
+Live diagnostics are written automatically to
+`OUTPUT/LAYOUT/YYYY-MM-DD.diagnostics.jsonl` at startup, every 10 wall-clock
+seconds after a simulation step/frame, and on completion or interruption.
+Each JSON line is flushed immediately and survives temporary result cleanup.
+Rerunning an incomplete day replaces that day's diagnostic log.
+
+Snapshots contain per-robot positions, routes, goals, task phases, interval
+travel and activity times, reservation owners, wait-for dependencies, last
+substep safety blockers, conflicts, tabu edges, planner counts and time, and
+unfinished station workloads. `no_*_sampled_sim_s` values measure quiet time
+at snapshot resolution, not exact event timestamps. Zero completed lines with
+positive travel can indicate ongoing work; zero travel plus sustained safety
+or reservation waits identifies robots to inspect. Recorded conflicts and
+wait-for entries alone are not proof of deadlock; compare successive samples.
+If a single step hangs, snapshots stop too; the last snapshot is the last
+completed step. The progress bar's simulation clock also refreshes without
+requiring an order line to finish.
+
+```bash
+tail -f OUTPUT/LAYOUT/YYYY-MM-DD.diagnostics.jsonl
+```
+
+## Recovery from prolonged movement stalls
+
+Beyond the standard DRAM rules, the simulator checks movement every five
+simulated seconds. After the whole fleet has made no sampled positional
+progress for 30 seconds, it considers a yielding move by a blocked active robot.
+Ordinary queues are left alone while the fleet is still moving. Only one robot yields
+at a time; its short route (at most six edges) is reserved in full and protected
+from conflict-triggered replanning. Normal collision safety remains enabled.
+
+The refuge must be reachable through directed lanes without crossing another
+robot's occupied cells or reservations, avoid rack/workstation parking and
+other robots' immediate routes, and have a static path back to the original
+task goal. The task and rack assignment remain unchanged. On arrival, normal
+planning resumes toward the original goal. An escape that cannot finish within
+60 simulated seconds is released only when the robot is at a vertex. If no
+legal refuge is found, the simulator records that outcome instead of forcing
+a move. This is a bounded local recovery heuristic, not a guarantee that every
+fleet configuration can be resolved.
+
+Failed replan requests retry after five simulated seconds instead of every
+tick. Live diagnostics include the active recovery and the most recent 100
+recovery events (`yield_started`, `refuge_reached`, `yield_timeout`, and
+`no_reachable_refuge`). These policies intentionally extend the DRAM reference
+behavior; use the same code version for all compared layouts.
 
 ## Workstation admission and balanced dispatch
 
@@ -222,7 +287,8 @@ and `dram_ws/src/dram_viz/dram_viz/directional_cost_layer.py` (WHCA excluded):
 - A replan queues a request from the buffer tail, clears published paths, and
   marks the robot computing. The response is delivered on the next simulation
   tick. It resets passage tracking to the current node and installs the returned
-  path directly. Failed replans clear tabu edges and retry on a later tick.
+  path directly. Failed replans clear tabu edges; the simulator now delays
+  retries by five simulated seconds as described in the recovery section.
   This models callback ordering, not ROS wall-clock/network latency.
 - All deterministic priority strategies use DRAM's quantities: actual buffer
   size, reservation timestamp (infinity when unset, as in DRAM), distance to the

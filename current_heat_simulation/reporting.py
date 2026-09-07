@@ -1,6 +1,7 @@
 """Paired-day comparison tables and static diagnostic charts."""
 
 from collections import Counter
+from datetime import date
 import csv
 from pathlib import Path
 from statistics import mean, median, stdev
@@ -54,6 +55,9 @@ def aggregate(results, layouts, dates, baseline):
         for key in KPI_MEANS:
             values = [r[key] for r in rows if r.get(key) is not None]
             summary["mean_daily_"+key] = mean(values) if values else None
+        for stat, operation in (("min", min), ("max", max)):
+            key = stat+"_completed_order_lines_per_rack_presentation"
+            summary[key] = operation((r[key] for r in rows if r.get(key) is not None), default=None)
         summaries.append(summary)
     base = next(s for s in summaries if s["layout"] == baseline)
     for s in summaries:
@@ -73,6 +77,14 @@ def aggregate(results, layouts, dates, baseline):
 
 
 def generate_report(output: Path, results, layouts, dates, baseline, warehouse_map):
+    # Backfill older runs from job records without modifying their checkpoints.
+    results = [dict(row) for row in results]
+    for row in results:
+        if "min_completed_order_lines_per_rack_presentation" not in row:
+            counts = [int(job["covered_lines"]) for job in csv_rows(output/row["layout"]/row["date"]/"rack_jobs.csv")
+                      if job.get("completion_time_s") not in (None, "")]
+            row["min_completed_order_lines_per_rack_presentation"] = min(counts, default=None)
+            row["max_completed_order_lines_per_rack_presentation"] = max(counts, default=None)
     summaries, paired, common = aggregate(results, layouts, dates, baseline)
     excluded = sorted(set(dates)-set(common))
     for summary in summaries:
@@ -102,17 +114,18 @@ def generate_report(output: Path, results, layouts, dates, baseline, warehouse_m
         rate_text = f"{value:.2f}" if value is not None else "unavailable"
         change_text = f"{change:+.2f}%" if change is not None else "unavailable"
         lines.append(f"| {s['layout']} | {s.get('slotting_strategy') or 'unspecified'} | {s['completed_days']}/{s['requested_days']} | {rate_text} | {change_text} |")
-    lines += ["", "| Layout | Completed order lines per rack presentation (daily mean) |",
-              "|---|---:|"]
+    lines += ["", "Completed order lines per rack presentation across common completed days:", "",
+              "| Layout | Minimum individual presentation | Daily mean | Maximum individual presentation |", "|---|---:|---:|---:|"]
     for s in summaries:
-        value = s["mean_daily_completed_order_lines_per_rack_presentation"]
-        value_text = f"{value:.2f}" if value is not None else "unavailable"
-        lines.append(f"| {s['layout']} | {value_text} |")
+        values = [s[prefix+"completed_order_lines_per_rack_presentation"] for prefix in ("min_", "mean_daily_", "max_")]
+        cells = " | ".join(f"{value:.3f}" if value is not None else "unavailable" for value in values)
+        lines.append(f"| {s['layout']} | {cells} |")
     for title, filename in charts:
         lines += ["", f"## {title}", "", f"![{title}](charts/{filename})"]
     lines += ["", "## Interpretation and definitions", "",
               "- Throughput bars use sample standard deviation across days, not a confidence interval. One day has no measured between-day variation.",
               "- Completed order lines per rack presentation divides returned/jacked-down order lines by rack arrivals at workstation service. Unfinished returns contribute a presentation but no completed lines. No presentations means unavailable.",
+              "- The mean presentation chart shows daily averages. The separate minimum/maximum chart shows the smallest/largest covered order-line count of any single completed rack job on the common dates. Repeated visits by the same rack count separately; unfinished jobs are excluded from these extrema.",
               "- Weighted throughput is total completed lines divided by total simulation hours over the common dates.",
               "- Travel is actual substep displacement, split by loaded/empty state. Normalized travel and waits use completed source order lines, not units or distinct SKUs.",
               "- Robot time categories are mutually exclusive. Utilization includes active waiting; movement and waiting charts explain the difference.",
@@ -155,6 +168,55 @@ def _charts(output, results, summaries, common, warehouse_map):
     ax.set_title(f"Mean daily throughput · {len(common)} common days (± daily SD)")
     ax.tick_params(axis="x", labelrotation=15)
     save(fig, "Throughput comparison", "throughput.png")
+
+    fig, ax = plt.subplots(figsize=(max(8, len(names)*2), 4.8))
+    values = [s["mean_daily_completed_order_lines_per_rack_presentation"] for s in summaries]
+    positions = np.arange(len(names))
+    available = [i for i, value in enumerate(values) if value is not None]
+    bars = ax.bar(positions[available], [values[i] for i in available], color=colors[available])
+    ax.bar_label(bars, fmt="%.3f", padding=4)
+    for i, value in enumerate(values):
+        if value is None:
+            ax.text(i, .03, "N/A", ha="center", transform=ax.get_xaxis_transform())
+    ax.set_xticks(positions, labels)
+    ax.set_xlim(-.6, len(names)-.4)
+    ax.set_ylim(0, max((value for value in values if value is not None), default=0)*1.2 or 1)
+    ax.set_ylabel("Completed order lines / rack presentation")
+    ax.set_title(f"Mean completed order lines per rack presentation · {len(common)} common day{'s' if len(common) != 1 else ''}")
+    ax.tick_params(axis="x", labelrotation=15)
+    save(fig, "Completed order lines per rack presentation", "completed_lines_per_rack_presentation.png")
+
+    columns = min(2, len(names))
+    rows_count = (len(names)+columns-1)//columns
+    fig, axes = plt.subplots(rows_count, columns, figsize=(7*columns, 4*rows_count),
+                             sharex=True, sharey=True, squeeze=False)
+    fig.suptitle("Daily minimum and maximum order lines per rack presentation")
+    days = sorted({row["date"] for row in results})
+    x = [date.fromisoformat(day) for day in days]
+    tick_indices = list(range(0, len(days), max(1, (len(days)+5)//6)))
+    for ax, name, label in zip(axes.flat, names, labels):
+        daily = {row["date"]: row for row in results if row["layout"] == name}
+        for stat, style, color in (("min", "--", "#3679ad"), ("max", "-", "#e58b2a")):
+            values = [daily.get(day, {}).get(stat+"_completed_order_lines_per_rack_presentation")
+                      if day in common else None for day in days]
+            ax.plot(x, [value if value is not None else np.nan for value in values],
+                    linestyle=style, marker="o" if stat == "min" else "s",
+                    markersize=6, color=color, label="Minimum" if stat == "min" else "Maximum")
+        if not common:
+            ax.text(.5, .5, "No common completed dates", ha="center", transform=ax.transAxes)
+        ax.set_xticks([x[i] for i in tick_indices], [days[i] for i in tick_indices])
+        if len(x) == 1:
+            from datetime import timedelta
+            ax.set_xlim(x[0]-timedelta(days=1), x[0]+timedelta(days=1))
+        ax.set(title=label, ylabel="Order lines per presentation", xlabel="Date")
+        ax.tick_params(axis="x", labelrotation=30, labelbottom=True)
+        ax.grid(axis="y", alpha=.2)
+        ax.legend(fontsize=8)
+    maxima = [s["max_completed_order_lines_per_rack_presentation"] for s in summaries]
+    axes.flat[0].set_ylim(0, max((value for value in maxima if value is not None), default=0)*1.2 or 1)
+    for ax in list(axes.flat)[len(names):]:
+        ax.set_visible(False)
+    save(fig, "Minimum and maximum individual rack presentation", "rack_presentation_min_max.png")
 
     fig, ax = plt.subplots(figsize=(10, 4))
     for name, label, color in zip(names, labels, colors):

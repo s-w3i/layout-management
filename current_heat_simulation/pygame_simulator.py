@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--layout", type=Path, action="append", help="repeat for each slotting layout")
     parser.add_argument("--amr-config", type=Path)
     parser.add_argument("--amrs", type=int)
-    parser.add_argument("--date", type=date.fromisoformat)
+    parser.add_argument("--date", type=date.fromisoformat, action="append", help="select a date; repeat for separate dates")
     parser.add_argument("--start-date", type=date.fromisoformat)
     parser.add_argument("--end-date", type=date.fromisoformat)
     parser.add_argument("--headless", action="store_true", help="all observed dates by default")
@@ -48,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.date and (args.start_date or args.end_date):
         parser.error("use --date or --start-date/--end-date, not both")
+    if args.date and len(set(args.date)) > 1 and not args.headless:
+        parser.error("multiple dates require --headless")
     if (args.start_date or args.end_date) and not args.headless:
         parser.error("date ranges require --headless; use --date for a rendered run")
     if args.workers < 1:
@@ -95,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Loading shared workload and validating layouts...", flush=True)
         workload = load_workload(orders_path)
         if args.date:
-            tasks = workload.select(args.date, args.date)
+            tasks = [task for day in sorted(set(args.date)) for task in workload.select(day, day)]
         elif args.headless:
             tasks = workload.select(args.start_date, args.end_date)
         else:

@@ -34,6 +34,7 @@ class MoveRobotPathPlanner:
         self.current_tasks: Dict[str, Optional[str]] = {}
         self.current_goals: Dict[str, Optional[str]] = {}
         self.pending_replans = {}
+        self.retry_after = {}
         self.heat_layer = None
 
     def submit_move(self, request: MoveRobotRequest) -> None:
@@ -64,6 +65,9 @@ class MoveRobotPathPlanner:
         # Deliver requests on a later tick, like ROS service response callbacks.
         pending, self.pending_replans = self.pending_replans, {}
         for robot_name, (goal, task_id, start) in pending.items():
+            if self.allocator.sim_time_sec < self.retry_after.get(robot_name, 0):
+                self.pending_replans[robot_name] = (goal, task_id, start)
+                continue
             self._request_path_computation(
                 robot_name=robot_name, goal_vertex=goal, task_id=task_id,
                 robot_snapshots=robot_snapshots, carrying_rack=carrying_rack,
@@ -95,6 +99,8 @@ class MoveRobotPathPlanner:
         goal_vertex = self.current_goals.get(robot_name)
         task_id = self.current_tasks.get(robot_name)
         if not goal_vertex or not task_id:
+            return
+        if robot_name in self.allocator.recovery_robots:
             return
         if robot_name in self.pending_replans:
             return
@@ -184,6 +190,7 @@ class MoveRobotPathPlanner:
                     self.metrics_recorder.record_planning_result(
                         latency_ms=(perf_counter() - started_at) * 1000.0, success=False)
                 self.pending_replans[robot_name] = (goal_vertex, task_id, start_name)
+                self.retry_after[robot_name] = self.allocator.sim_time_sec + 5.0
                 return
             try:
                 path = self.planner.plan(
@@ -208,6 +215,7 @@ class MoveRobotPathPlanner:
             )
 
         self.current_tasks[robot_name] = task_id
+        self.retry_after.pop(robot_name, None)
         self.current_goals[robot_name] = goal_vertex
         if replan_start is not None:
             self.allocator.pending_replans.discard(robot_name)

@@ -81,6 +81,7 @@ class PygameE3DSimulator:
         self.rack_positions: Dict[str, str] = {}
         self.overlay = OverlayState()
         self.safety_interventions = 0
+        self.safety_blockers = {}
         self.global_reservations: Dict[str, str] = {}
         self.font: Optional[pygame.font.Font] = None
         self.world_to_screen = None
@@ -368,6 +369,7 @@ class PygameE3DSimulator:
         return robot.active_window_path[robot.path_index]
 
     def _compute_translation_permissions(self) -> set[str]:
+        self.safety_blockers = {}
         if not bool(self.motion_cfg.get("enforce_collision_safety", False)):
             return {robot.name for robot in self.robots}
 
@@ -405,6 +407,7 @@ class PygameE3DSimulator:
             if blocking_occupants:
                 for robot_name in contenders:
                     allowed.discard(robot_name)
+                    self.safety_blockers[robot_name] = {"reason": "occupied_target", "robots": sorted(blocking_occupants), "target": target_name}
                 continue
             if len(contenders) <= 1:
                 continue
@@ -412,6 +415,7 @@ class PygameE3DSimulator:
             for robot_name in contenders:
                 if robot_name != winner:
                     allowed.discard(robot_name)
+                    self.safety_blockers[robot_name] = {"reason": "same_target", "robots": [winner], "target": target_name}
 
         processed_edges: set[Tuple[str, str]] = set()
         for robot_name, intent in intents.items():
@@ -437,6 +441,7 @@ class PygameE3DSimulator:
             for loser in [robot_name] + contenders:
                 if loser != winner:
                     allowed.discard(loser)
+                    self.safety_blockers.setdefault(loser, {"reason": "opposing_edge", "robots": [winner], "target": str(intents[loser]["target"])})
 
         self.safety_interventions += len(intents)-len(allowed)
         return allowed

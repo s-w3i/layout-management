@@ -8,6 +8,8 @@ from amr_simulation.models import SimulationConfig, WorkloadTask
 
 from .astar_planner import AStarPlanner, PlannerConfig, WarehouseMap
 from .directional_cost_layer import DirectionalCostLayer
+from .diagnostics import DiagnosticLog
+from .deadlock_recovery import DeadlockRecovery
 from .conflict_detection import ConflictDetector
 from .conflict_resolution import ConflictResolver
 from .periodic_allocator import PeriodicAllocator
@@ -72,6 +74,8 @@ class WarehouseSystem:
         self.status_callback = None
         self._last_status_time = -1.0
         self.headless = False
+        self.latest_conflicts = []
+        self.deadlock_recovery = DeadlockRecovery()
         self.metrics.contexts = self.task_state_machine.contexts
         self.metrics.scheduler = self.task_scheduler
         self.metrics.allocator = self.allocator
@@ -99,6 +103,7 @@ class WarehouseSystem:
             self._last_status_time = self.sim_time_sec
             self.status_callback(self.sim_time_sec)
         snapshots = self.simulator.snapshots()
+        self.deadlock_recovery.update(self, snapshots)
         self.heat_layer.update(dt, self.planner)
         # Refresh before dispatch so new and replanned routes see current commitments.
         self.planner.set_committed_paths(self.allocator.full_paths())
@@ -134,6 +139,7 @@ class WarehouseSystem:
                     self.progress_callback(1)
 
         conflicts = self.conflict_detector.detect_and_log_conflicts(self.allocator.conflict_paths(snapshots))
+        self.latest_conflicts = conflicts
         order = get_alloc_order(
             self.allocator.states, snapshots, self.task_state_machine.contexts,
             self.allocator.allocator_cfg["priority_strategy"], self.map,
@@ -166,7 +172,8 @@ class WarehouseSystem:
                 reserved_nodes=len(self.allocator.global_reservations),
             ))
 
-    def run(self, *, headless: bool, output: Path, max_seconds: float | None = None) -> dict:
+    def run(self, *, headless: bool, output: Path, max_seconds: float | None = None,
+            diagnostic_path: Path | None = None) -> dict:
         import pygame
 
         started = perf_counter()
@@ -177,10 +184,13 @@ class WarehouseSystem:
         if not math.isfinite(dt) or dt <= 0 or not math.isfinite(limit) or limit <= 0:
             raise ValueError("step size and duration must be positive and finite")
         reason = ""
+        diagnostics = DiagnosticLog(diagnostic_path or output/"diagnostics.jsonl")
         try:
+            diagnostics.write(self, "started")
             if headless:
                 while not self.done and self.sim_time_sec < limit-1e-9:
                     self.step(min(dt, limit-self.sim_time_sec))
+                    diagnostics.write(self)
             else:
                 screen, clock = self.simulator.make_screen()
                 accumulator = 0.0
@@ -197,6 +207,7 @@ class WarehouseSystem:
                         accumulator -= dt
                     self.simulator.draw(screen)
                     pygame.display.flip()
+                    diagnostics.write(self)
             if not self.done and not reason:
                 reason = "simulation_time_limit_with_unfinished_tasks"
         except KeyboardInterrupt:
@@ -206,6 +217,10 @@ class WarehouseSystem:
             reason = f"{type(exc).__name__}: {exc}"
             raise
         finally:
+            try:
+                diagnostics.write(self, "finished", reason)
+            finally:
+                diagnostics.close()
             self.run_summary = self.metrics.finalize(
                 output, self.task_scheduler, self.sim_time_sec, reason,
                 self.simulator.safety_interventions, perf_counter()-started,

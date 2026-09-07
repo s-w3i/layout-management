@@ -103,6 +103,8 @@ class TaskStateMachineManager:
             snapshot = robot_snapshots.get(robot_name)
             if snapshot is None:
                 continue
+            if robot_name in allocator.recovery_robots:
+                continue
 
             if context.action_timer > 0.0:
                 context.action_timer = max(0.0, context.action_timer - dt)

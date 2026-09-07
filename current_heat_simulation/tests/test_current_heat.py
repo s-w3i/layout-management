@@ -112,6 +112,8 @@ class CurrentHeatTests(unittest.TestCase):
             self.assertEqual(summary["completed_rack_jobs"], 2)
             self.assertEqual(summary["rack_presentations"], 2)
             self.assertEqual(summary["completed_order_lines_per_rack_presentation"], 2.5)
+            self.assertEqual(summary["min_completed_order_lines_per_rack_presentation"], 2)
+            self.assertEqual(summary["max_completed_order_lines_per_rack_presentation"], 3)
             self.assertEqual(system.task_state_machine.rack_positions, {"G0_0": "G0_0"})
             self.assertEqual(system.simulator.robots[0].current_vertex, "G0_0")
             import csv

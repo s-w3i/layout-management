@@ -177,6 +177,8 @@ class RunMetricsRecorder:
             "travel_metres_per_completed_line": ratio(empty+loaded, lines),
             "rack_presentations": presentations,
             "completed_order_lines_per_rack_presentation": ratio(lines, presentations),
+            "min_completed_order_lines_per_rack_presentation": min((sum(j.lines.values()) for j in completed_jobs), default=None),
+            "max_completed_order_lines_per_rack_presentation": max((sum(j.lines.values()) for j in completed_jobs), default=None),
             "lines_per_completed_rack_trip": ratio(lines, len(completed_jobs)),
             "skus_per_completed_rack_trip": ratio(sum(len(j.lines) for j in completed_jobs), len(completed_jobs)),
             "rack_trips_per_1000_lines": ratio(len(completed_jobs)*1000, lines),

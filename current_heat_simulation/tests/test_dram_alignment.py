@@ -154,7 +154,7 @@ class DirectReferenceTests(unittest.TestCase):
                 if not expected:
                     self.assertEqual(allocator.global_reservations['G3_1'],'a')
 
-    def test_failed_replan_retries_on_later_tick_without_fallback(self):
+    def test_failed_replan_waits_five_seconds_before_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             warehouse = small_map(directory)
             allocator = PeriodicAllocator(warehouse_map=warehouse, allocator_cfg={}, robot_names=['a'])
@@ -174,6 +174,10 @@ class DirectReferenceTests(unittest.TestCase):
                     self.assertIn('a',bridge.pending_replans)
                     self.assertNotIn('a',allocator.tabu_sets)
                     self.assertEqual(allocator.states['a'].full_path,[])
+                    allocator.sim_time_sec = 4.9
+                    bridge.update(robot_snapshots={'a':snapshot},carrying_rack={'a':False},occupied_shelves=set())
+                    self.assertEqual(planner.plan.call_count, 1)
+                    allocator.sim_time_sec = 5.0
             self.assertNotIn('a',allocator.pending_replans)
             self.assertEqual(allocator.states['a'].full_path[-1],'G3_1')
 
