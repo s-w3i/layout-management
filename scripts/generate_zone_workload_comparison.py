@@ -17,7 +17,7 @@ from warehouse_layout.slotting_repository import SlottingLayoutRepository
 from warehouse_layout.traffic import TrafficAwareSlottingService
 
 
-MAP = ROOT / "resources/map/map1.grid.json"
+MAP = ROOT / "resources/map/map1_1.grid.json"
 BASELINE = ROOT / "resources/map/basic_CO_quantity_slotting_layout.slotting.json"
 ORDERS = ROOT / "resources/data/Sample Data.xlsx"
 CACHE = ROOT / "resources/data/sku_affinity_cache"
@@ -39,7 +39,7 @@ def main() -> None:
     affinity = AffinityService(CACHE)
     dataset = affinity.load_orders(ORDERS)
     parameters = CtbsaParameters(
-        population_size=10, generations=5, random_seed=0, selected_solution=3
+        population_size=3, generations=1, random_seed=0, selected_solution=3
     )
     results = {}
     for label, enabled, destination in (

@@ -55,6 +55,34 @@ Physical-exception or incomplete-data shelves remain fixed and are reported.
 
 ## Hard constraints
 
+### Optional minimum-rack mode
+
+Enable **Use minimum racks** beside the NSGA-II settings to limit clustering to
+`ceil(inventory_loads / slots_per_rack)` racks in each compatible attribute
+profile. The default is off, preserving the original all-candidate-rack search.
+Affinity and maximum rack demand remain the optimization objectives; the rack
+count is fixed first. Spare slots can move between clusters during optimization.
+With zone balancing enabled, those clusters can still be assigned across all
+compatible rack locations. Without it, demand-ranked clusters use the nearest
+compatible racks.
+
+This minimum applies to ordinary single-slot loads within each existing profile.
+Exception racks stay fixed and count in addition to that minimum. The shared
+allocator still validates physical and cumulative-weight limits; generation
+fails if the chosen clustering cannot be placed, rather than silently opening
+extra racks or relaxing constraints. This is not a global packing proof across
+different profiles or exception inventory. Fewer racks do not guarantee fewer
+visits or better throughput.
+
+For programmatic generation, pass
+`CtbsaParameters(minimize_rack_count=True, ...)` as `ctbsa_parameters` to the
+traffic pipeline (or as `parameters` to `optimize_ctbsa`). The reusable
+`cluster_capacities()` function selects the rack budget. Saved results record
+`minimize_rack_count`, `optimized_rack_count`, `selected_rack_count`, and
+`rack_budget_policy`; loading a result restores the checkbox. Older results
+default to off. For comparison, keep the seed, search budget, zone option,
+inputs, and evaluation dates identical and save on/off runs to different files.
+
 The paper model enforces:
 
 1. Every inventory load is assigned to exactly one cluster:

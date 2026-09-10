@@ -36,8 +36,11 @@ class CtbsaParameters:
     generations: int = 50_000
     random_seed: int = 0
     selected_solution: int = 3
+    minimize_rack_count: bool = False
 
     def validate(self) -> None:
+        if not isinstance(self.minimize_rack_count, bool):
+            raise ValueError("minimize_rack_count must be a boolean")
         if self.population_size < 2:
             raise ValueError("C&TBSA population size must be at least 2")
         if self.generations < 1:
@@ -76,6 +79,24 @@ class CtbsaPlacementPlan:
     cluster_rows: list[dict]
     pareto_rows: list[dict]
     parameters: dict
+
+
+def cluster_capacities(
+    load_count: int, rack_count: int, capacity: int, *, minimize_rack_count: bool = False,
+) -> list[int]:
+    """Choose the slot-capacity minimum per compatible profile, or all racks.
+
+    Keep equal-capacity clusters (including spare slots on the last rack), so
+    NSGA-II can balance demand instead of forcing one particular rack to be full.
+    Physical exceptions are excluded by the caller and final feasibility is
+    still checked by the slot allocator.
+    """
+    if load_count < 0 or rack_count < 0 or capacity < 1:
+        raise ValueError("invalid load count, rack count, or rack capacity")
+    if load_count > rack_count * capacity:
+        raise ValueError("inventory loads exceed available rack capacity")
+    count = (load_count + capacity - 1) // capacity if minimize_rack_count else rack_count
+    return [capacity] * count
 
 
 class CtbsaNsga2:
@@ -606,7 +627,10 @@ class CtbsaPlacementPlanner:
             optimizer = CtbsaNsga2(
                 demands,
                 correlations,
-                [capacity] * len(group_racks),
+                cluster_capacities(
+                    len(group_loads), len(group_racks), capacity,
+                    minimize_rack_count=parameters.minimize_rack_count,
+                ),
                 real_item_count=len(group_loads),
             )
 
@@ -756,6 +780,9 @@ class CtbsaPlacementPlanner:
                 "generations": parameters.generations,
                 "random_seed": parameters.random_seed,
                 "selected_solution": parameters.selected_solution,
+                "minimize_rack_count": parameters.minimize_rack_count,
+                "rack_count_scope": "slot_capacity_per_compatible_profile_plus_fixed_racks",
+                "optimized_rack_count": sum(bool(row["inventory_load_ids"]) for row in cluster_rows),
                 "cluster_unit": "AMR shelf",
                 "storage_locations_per_cluster": capacity,
                 "active_zone_attribute_keys": active_attribute_keys,

@@ -364,7 +364,7 @@ class SlottingService:
 
     @staticmethod
     def apply_stock_requirements(
-        sku_rows: list[dict], stock_rows: list[dict]
+        sku_rows: list[dict], stock_rows: list[dict], *, require_complete: bool = False,
     ) -> list[dict]:
         """Attach calculated stock targets to velocity rows by SKU."""
         stock_by_sku: dict[str, dict] = {}
@@ -391,6 +391,28 @@ class SlottingService:
                     if key in stock:
                         row[key] = stock[key]
             result.append(row)
+        if require_complete:
+            invalid = []
+            for row in result:
+                try:
+                    quantity = float(row["total_required_ea"])
+                    slots = float(row["required_slots"])
+                    valid = (
+                        math.isfinite(quantity) and math.isfinite(slots)
+                        and quantity >= 0 and slots >= 0
+                        and (quantity == 0) == (slots == 0)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    invalid.append(str(row.get("sku", "")))
+            if invalid:
+                raise ValueError(
+                    f"Minimum stock quantities or required slots are missing or "
+                    f"unresolved for {len(invalid):,} SKU(s): {', '.join(invalid[:5])}. "
+                    "Calculate Stock Requirements for the selected SKUs before "
+                    "generating a layout. Slotting cannot assume one slot per SKU."
+                )
         return result
 
     def load_velocity(
@@ -672,6 +694,7 @@ class SlottingService:
         auto_plan_oversize: bool = False,
         ctbsa_target_racks: dict[str, str] | None = None,
         ctbsa_rank_by_sku: dict[str, int] | None = None,
+        zone_workload_enabled: bool = False,
     ) -> tuple[list[dict], dict]:
         parameters = locals()
         service = parameters.pop("self")
@@ -699,6 +722,7 @@ class SlottingService:
         storage_layout=None,
         ergonomic_weight_heuristic: bool = True,
         auto_plan_oversize: bool = False,
+        zone_workload_enabled: bool = False,
     ) -> tuple[list[dict], dict]:
         parameters = locals()
         service = parameters.pop("self")

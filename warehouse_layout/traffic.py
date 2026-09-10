@@ -1129,7 +1129,11 @@ class TrafficAwareSlottingService:
             },
             {
                 "rack_budget": candidate_rack_count,
-                "source": "paper_ctbsa_selected_representative",
+                "source": (
+                    "minimum_racks_ctbsa_selected_representative"
+                    if parameters.minimize_rack_count
+                    else "paper_ctbsa_selected_representative"
+                ),
                 "selected": True,
                 **{
                     key: candidate_metrics.get(key)
@@ -1182,11 +1186,17 @@ class TrafficAwareSlottingService:
             "validation_mode": "static_expected_flow_only",
             "regenerated_summary": regenerated_summary,
             "clusters": plan.cluster_rows,
-            "rack_budget_policy": "paper_ctbsa_selected_solution",
+            "rack_budget_policy": (
+                "minimum_compatible_racks" if parameters.minimize_rack_count
+                else "paper_ctbsa_selected_solution"
+            ),
             "compact_rack_count": compact_rack_count,
             "selected_rack_count": candidate_rack_count,
             "rack_budget_trials": rack_budget_trials,
             "rack_budget_selection_reason": (
+                "slot-capacity minimum per compatible profile; affinity and "
+                "maximum shelf demand optimized within that rack count"
+                if parameters.minimize_rack_count else
                 "selected C&TBSA Pareto representative applied without a "
                 "post-simulation route-metric veto"
             ),

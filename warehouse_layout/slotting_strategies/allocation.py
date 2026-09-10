@@ -7,6 +7,8 @@ from collections import defaultdict
 
 import numpy as np
 
+from .zone_workload import balanced_zone_candidates
+
 from ..affinity import AffinityAnalysis
 from ..attributes import (
     OVERSIZE_CAPABLE_KEY,
@@ -142,7 +144,12 @@ def allocate(
     auto_plan_oversize: bool = False,
     ctbsa_target_racks: dict[str, str] | None = None,
     ctbsa_rank_by_sku: dict[str, int] | None = None,
+    zone_workload_enabled: bool = False,
 ) -> tuple[list[dict], dict]:
+    if not isinstance(zone_workload_enabled, bool):
+        raise ValueError("zone_workload_enabled must be a boolean")
+    if zone_workload_enabled and strategy == "ctbsa":
+        raise ValueError("C&TBSA zone balancing belongs in the traffic planner")
     if levels_per_rack < 1 or slots_per_level < 1:
         raise ValueError("levels and slots per level must be at least 1")
     if strategy not in {"basic", "abc_affinity", "ctbsa"}:
@@ -818,6 +825,20 @@ def allocate(
         "rack_velocity_class",
     )
     available_positions = list(positions)
+    zone_capacities = defaultdict(int)
+    zone_workloads = defaultdict(float)
+    for position in positions:
+        zone_capacities[str(position["zone_id"])] += 1
+    # Each replica carries its quantity share of logical SKU demand.
+    quantity_totals = defaultdict(float)
+    quantity_counts = defaultdict(int)
+    quantity_weights = {}
+    for row in sorted_skus:
+        raw_quantity = row.get("quantity_ea")
+        quantity = max(0.0, float(raw_quantity if raw_quantity not in (None, "") else 1))
+        quantity_weights[id(row)] = quantity
+        quantity_totals[str(row.get("sku", ""))] += quantity
+        quantity_counts[str(row.get("sku", ""))] += 1
     rack_state: dict[str, dict] = {}
     rack_max_weight = None
     if handling_unit_type == "AMR shelf":
@@ -856,6 +877,10 @@ def allocate(
         )
         sku_rank = abc_frequency_rank
         current_sku = str(sku.get("sku", ""))
+        zone_demand = max(0.0, float(sku.get("pick_frequency") or 0)) * (
+            quantity_weights[id(sku)] / quantity_totals[current_sku]
+            if quantity_totals[current_sku] else 1 / quantity_counts[current_sku]
+        )
         current_order_mask = order_membership_masks.get(current_sku, 0)
         requirements = sku.get("sku_requirements")
         if not isinstance(requirements, dict):
@@ -1308,6 +1333,10 @@ def allocate(
                 ))
             if hard_candidates:
                 spread_candidates = hard_candidates
+                if zone_workload_enabled:
+                    spread_candidates = balanced_zone_candidates(
+                        spread_candidates, zone_workloads, zone_capacities, zone_demand,
+                    )
                 if int(sku.get("quantity_load_count") or 1) > 1:
                     # Quantity diversity is a secondary objective. Reuse the
                     # compatible rack pool already opened by the whole system;
@@ -1522,6 +1551,7 @@ def allocate(
                     _key, selected_index, position, auto_overrides,
                     occupied_positions, missing_override_keys,
                 ) = selected_candidate
+                zone_workloads[str(position["zone_id"])] += zone_demand
                 occupied_ids = {id(item) for item in occupied_positions}
                 available_positions = [
                     item for item in available_positions
@@ -2070,6 +2100,16 @@ def allocate(
     }
     summary = {
         "strategy": strategy,
+        "zone_workload_enabled": zone_workload_enabled,
+        "zone_workload_model": "quantity_weighted_pick_frequency_per_zone_slot",
+        "zone_workload": {
+            zone: {
+                "slot_capacity": capacity,
+                "demand": zone_workloads[zone],
+                "normalized_demand": zone_workloads[zone] / capacity,
+            }
+            for zone, capacity in sorted(zone_capacities.items())
+        },
         "hard_rule_profile": SHARED_HARD_RULE_PROFILE,
         "hard_rules": list(SHARED_HARD_RULES),
         "sku_count": quantity_summary["source_sku_count"],

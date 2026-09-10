@@ -1980,6 +1980,7 @@ class GridMapEditorApp:
         self.slot_chilled_path = tk.StringVar(value=str(DEFAULT_SKU_ATTRIBUTES_INPUT))
         self.slot_output_path = tk.StringVar(value=str(DEFAULT_SLOTTING_OUTPUT))
         self.slot_strategy = tk.StringVar(value="basic")
+        self.slot_zone_workload_enabled = tk.BooleanVar(value=False)
         self.slot_affinity_path = tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
         self.slot_affinity_weight = tk.StringVar(value="50")
         self.slot_affinity_max_service = tk.StringVar()
@@ -2045,6 +2046,10 @@ class GridMapEditorApp:
         )
         strategy_box.grid(row=3, column=1, sticky="w", pady=4)
         strategy_box.bind("<<ComboboxSelected>>", self.slot_strategy_changed)
+        ttk.Checkbutton(
+            form, text="Balance workload across zones",
+            variable=self.slot_zone_workload_enabled,
+        ).grid(row=3, column=1, sticky="w", padx=(190, 0), pady=4)
 
         affinity_panel = ttk.LabelFrame(
             form, text="ABC + affinity settings", padding=(8, 5)
@@ -2385,7 +2390,7 @@ class GridMapEditorApp:
         self.traffic_ctbsa_population = tk.StringVar(value="100")
         self.traffic_ctbsa_generations = tk.StringVar(value="50000")
         self.traffic_ctbsa_solution = tk.StringVar(value="3")
-        self.traffic_ctbsa_extended_solution = tk.StringVar(value="Auto")
+        self.traffic_minimize_rack_count = tk.BooleanVar(value=False)
         self.traffic_ctbsa_seed = tk.StringVar(value="0")
         self.traffic_zone_workload_enabled = tk.BooleanVar(value=False)
         self.traffic_zone_overlay = tk.StringVar(value="Off")
@@ -2618,14 +2623,11 @@ class GridMapEditorApp:
             text="Balance workload across zones",
             variable=self.traffic_zone_workload_enabled,
         ).pack(side="left", padx=(10, 0))
-        ttk.Label(parameters, text="Zone solution").pack(side="left", padx=(8, 3))
-        ttk.Combobox(
+        ttk.Checkbutton(
             parameters,
-            textvariable=self.traffic_ctbsa_extended_solution,
-            state="readonly",
-            values=("Auto", "1", "2", "3", "4", "5"),
-            width=5,
-        ).pack(side="left")
+            text="Use minimum racks",
+            variable=self.traffic_minimize_rack_count,
+        ).pack(side="left", padx=(10, 0))
 
         ttk.Label(traffic_settings, text="Optimized layout output").grid(
             row=5, column=0, sticky="w", pady=3
@@ -2955,15 +2957,12 @@ class GridMapEditorApp:
                 date.fromisoformat(self.traffic_end_date.get())
                 if self.traffic_end_date.get().strip() else None
             )
-            extended_solution = self.traffic_ctbsa_extended_solution.get().strip()
             ctbsa_parameters = CtbsaParameters(
                 population_size=int(self.traffic_ctbsa_population.get()),
                 generations=int(self.traffic_ctbsa_generations.get()),
                 random_seed=int(self.traffic_ctbsa_seed.get()),
                 selected_solution=int(self.traffic_ctbsa_solution.get()),
-                extended_selected_solution=(
-                    None if extended_solution == "Auto" else int(extended_solution)
-                ),
+                minimize_rack_count=bool(self.traffic_minimize_rack_count.get()),
             )
             ctbsa_parameters.validate()
             grid_project = self.rmf_maps.load_project(grid_project_path)
@@ -2986,6 +2985,12 @@ class GridMapEditorApp:
             inline_zones = copy.deepcopy(self.traffic_zone_assignments)
             inline_locations = copy.deepcopy(self.traffic_location_attributes)
             inline_catalog = copy.deepcopy(self.traffic_attribute_catalog)
+            # Capture validated quantities before starting the worker so a new
+            # stock calculation cannot change the inventory during generation.
+            sku_rows = self.slotting.apply_stock_requirements(
+                self.slotting.load_velocity(velocity_path, inline_catalog, chilled_path),
+                copy.deepcopy(self.stock_rows), require_complete=True,
+            )
             self.traffic_levels.set(str(levels))
             self.traffic_slots.set(str(slots))
             self.traffic_handling_unit.set(handling_unit)
@@ -3028,9 +3033,6 @@ class GridMapEditorApp:
                     self.traffic.load_network(network_path)
                     if network_path is not None
                     else self.traffic.network_from_rmf(building)
-                )
-                sku_rows = self.slotting.load_velocity(
-                    velocity_path, inline_catalog, chilled_path
                 )
                 self.traffic_messages.put(("sku_count", len(sku_rows)))
                 order_analysis = self.affinity.analyze(dataset, start, end)
@@ -3193,14 +3195,12 @@ class GridMapEditorApp:
             self.traffic_ctbsa_population.set(str(params["population_size"]))
             self.traffic_ctbsa_generations.set(str(params["generations"]))
             self.traffic_ctbsa_solution.set(str(params["selected_solution"]))
-            self.traffic_ctbsa_extended_solution.set(
-                "Auto" if params.get("extended_selected_solution") is None
-                else str(params["extended_selected_solution"])
-            )
+            self.traffic_minimize_rack_count.set(bool(params.get("minimize_rack_count", False)))
             self.traffic_ctbsa_seed.set(str(params["random_seed"]))
             self.traffic_parameter_status.set(
                 "Paper C&TBSA completed; zone balancing "
                 + ("enabled." if params.get("zone_workload_enabled") else "disabled.")
+                + (" Minimum racks enabled." if params.get("minimize_rack_count") else " Original rack budget.")
             )
             self.traffic_view_mode.set("C&TBSA result")
         else:
@@ -3287,10 +3287,7 @@ class GridMapEditorApp:
             self.traffic_ctbsa_generations.set(str(parameters["generations"]))
         if parameters.get("selected_solution") is not None:
             self.traffic_ctbsa_solution.set(str(parameters["selected_solution"]))
-        self.traffic_ctbsa_extended_solution.set(
-            "Auto" if parameters.get("extended_selected_solution") is None
-            else str(parameters["extended_selected_solution"])
-        )
+        self.traffic_minimize_rack_count.set(bool(parameters.get("minimize_rack_count", False)))
         self.traffic_zone_workload_enabled.set(bool(
             parameters.get("zone_workload_enabled", False)
         ))
@@ -3516,7 +3513,7 @@ class GridMapEditorApp:
                 "crossover_probability": "PMX crossover probability",
                 "mutation_probability": "2-opt mutation probability",
                 "selected_solution": "Selected C&TBSA solution",
-                "extended_selected_solution": "Extended zone solution",
+                "minimize_rack_count": "Use minimum racks",
                 "objective_mode": "C&TBSA objective mode",
                 "extended_selection": "Extended Pareto selection",
                 "post_assignment_policy": "Post-assignment policy",
@@ -4452,6 +4449,9 @@ class GridMapEditorApp:
         self.slot_zone_assignments = zones
         self.slot_levels.set(str(levels)); self.slot_slots.set(str(slots))
         self.slot_strategy.set(payload.get("strategy", "basic"))
+        self.slot_zone_workload_enabled.set(bool(
+            payload.get("summary", {}).get("zone_workload_enabled", False)
+        ))
         affinity_configuration = payload.get("affinity_configuration") or payload.get(
             "summary", {}
         ).get("affinity_tuning", {})
@@ -4769,10 +4769,9 @@ class GridMapEditorApp:
                     else None
                 ),
             )
-            if self.stock_rows:
-                skus = self.slotting.apply_stock_requirements(
-                    skus, self.stock_rows
-                )
+            skus = self.slotting.apply_stock_requirements(
+                skus, self.stock_rows, require_complete=True,
+            )
             self.update_slot_progress(25, f"Loaded {len(skus):,} SKUs")
             levels=int(self.slot_levels.get()); slots=int(self.slot_slots.get())
             source_affinity = ""
@@ -4826,6 +4825,7 @@ class GridMapEditorApp:
                     self.slot_location_attributes,
                     tuning_parameters,
                     storage_layout=self.slot_grid_project.storage_layout,
+                    zone_workload_enabled=bool(self.slot_zone_workload_enabled.get()),
                 )
             else:
                 self.update_slot_progress(45, "Generating basic ABC layout…")
@@ -4834,6 +4834,7 @@ class GridMapEditorApp:
                     self.slot_zone.get(), self.slot_zone_assignments,
                     self.slot_attribute_catalog, self.slot_location_attributes,
                     storage_layout=self.slot_grid_project.storage_layout,
+                    zone_workload_enabled=bool(self.slot_zone_workload_enabled.get()),
                 )
             self.slot_zone_assignments = dict(
                 summary.get("zone_assignments", self.slot_zone_assignments)
