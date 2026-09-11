@@ -959,6 +959,7 @@ class TrafficAwareSlottingService:
         *,
         parameters: CtbsaParameters | None = None,
         zone_workload_enabled: bool = False,
+        maximum_same_sku_slots_per_rack: int | None = None,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TrafficOptimizationResult:
@@ -971,6 +972,11 @@ class TrafficAwareSlottingService:
         rack_capacity = payload.get("rack_capacity") or {}
         levels = int(rack_capacity.get("levels") or 1)
         slots = int(rack_capacity.get("slots_per_level") or 1)
+        if maximum_same_sku_slots_per_rack is None:
+            maximum_same_sku_slots_per_rack = (
+                payload.get("summary", {}).get("maximum_same_sku_slots_per_rack")
+                or levels * slots
+            )
         parameters = parameters or self.default_ctbsa_parameters
         planner = CtbsaPlacementPlanner(self.slotting)
         plan = planner.build(
@@ -987,6 +993,7 @@ class TrafficAwareSlottingService:
                 self.rack_traffic_costs(payload["building"], network)
                 if zone_workload_enabled else None
             ),
+            maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
             parameters=parameters,
             progress=progress,
             cancelled=cancelled,
@@ -1024,6 +1031,7 @@ class TrafficAwareSlottingService:
             auto_plan_oversize=True,
             ctbsa_target_racks=plan.target_racks,
             ctbsa_rank_by_sku=plan.rank_by_sku,
+            maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
         )
         failed = [
             row for row in regenerated
@@ -1279,6 +1287,7 @@ class TrafficAwareSlottingService:
         *,
         parameters: CtbsaParameters | None = None,
         zone_workload_enabled: bool = False,
+        maximum_same_sku_slots_per_rack: int | None = None,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TrafficOptimizationResult:
@@ -1289,6 +1298,7 @@ class TrafficAwareSlottingService:
             network,
             parameters=parameters,
             zone_workload_enabled=zone_workload_enabled,
+            maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
             progress=progress,
             cancelled=cancelled,
         )
@@ -1549,6 +1559,7 @@ class TrafficAwareSlottingService:
         optimize_traffic: bool = True,
         ctbsa_parameters: CtbsaParameters | None = None,
         zone_workload_enabled: bool = False,
+        maximum_same_sku_slots_per_rack: int | None = None,
     ) -> TrafficPipelineResult:
         def stage(current: int, message: str) -> None:
             if cancelled and cancelled():
@@ -1593,6 +1604,7 @@ class TrafficAwareSlottingService:
                 payload, analysis_source, network,
                 parameters=ctbsa_parameters,
                 zone_workload_enabled=zone_workload_enabled,
+                maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
                 progress=progress,
                 cancelled=cancelled,
             )
@@ -1662,6 +1674,7 @@ class TrafficAwareSlottingService:
         end_date=None,
         ctbsa_parameters: CtbsaParameters | None = None,
         zone_workload_enabled: bool = False,
+        maximum_same_sku_slots_per_rack: int | None = None,
         baseline_path: str = "",
         source_orders: str = "",
         progress: ProgressCallback | None = None,
@@ -1688,6 +1701,7 @@ class TrafficAwareSlottingService:
             progress_total=5,
             ctbsa_parameters=ctbsa_parameters,
             zone_workload_enabled=zone_workload_enabled,
+            maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
         )
 
     def run_full_pipeline(
@@ -1712,6 +1726,7 @@ class TrafficAwareSlottingService:
         optimize_traffic: bool = True,
         ctbsa_parameters: CtbsaParameters | None = None,
         zone_workload_enabled: bool = False,
+        maximum_same_sku_slots_per_rack: int | None = None,
         source_grid_project: str = "",
         source_velocity: str = "",
         source_chilled: str = "",
@@ -1766,6 +1781,7 @@ class TrafficAwareSlottingService:
                 strict_compatibility=False,
                 ergonomic_weight_heuristic=True,
                 auto_plan_oversize=True,
+                maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
             )
             affinity_configuration = {}
         else:
@@ -1778,6 +1794,7 @@ class TrafficAwareSlottingService:
                 strict_compatibility=False,
                 ergonomic_weight_heuristic=True,
                 auto_plan_oversize=True,
+                maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
             )
             affinity_configuration = summary.get("affinity_tuning", {})
         zones = dict(summary.get("zone_assignments", zones))
@@ -1836,6 +1853,7 @@ class TrafficAwareSlottingService:
             optimize_traffic=optimize_traffic,
             ctbsa_parameters=ctbsa_parameters,
             zone_workload_enabled=zone_workload_enabled,
+            maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
         )
 
     @staticmethod

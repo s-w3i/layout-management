@@ -42,6 +42,7 @@ class AbcAffinitySlottingStrategy:
         ergonomic_weight_heuristic: bool = True,
         auto_plan_oversize: bool = True,
         zone_workload_enabled: bool = False,
+        maximum_same_sku_slots_per_rack: int | None = None,
     ) -> tuple[list[dict], dict]:
         """Generate affinity/ABC balanced bay slotting with empirical tuning."""
         if not 0.0 <= affinity_weight <= 1.0:
@@ -101,6 +102,7 @@ class AbcAffinitySlottingStrategy:
             ergonomic_weight_heuristic=ergonomic_weight_heuristic,
             auto_plan_oversize=auto_plan_oversize,
             zone_workload_enabled=zone_workload_enabled,
+            maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
         )
         _level, racks, _workstations, _unreachable = service.rack_distances(building)
         service.apply_zone_local_aisles(
@@ -171,6 +173,7 @@ class AbcAffinitySlottingStrategy:
                 ergonomic_weight_heuristic=ergonomic_weight_heuristic,
                 auto_plan_oversize=auto_plan_oversize,
                 zone_workload_enabled=zone_workload_enabled,
+                maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
             )
             # Both strategies already use the same shared hard-rule allocator.
             # Preserve Basic's assignment coverage at every affinity weight;

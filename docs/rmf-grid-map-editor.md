@@ -308,8 +308,10 @@ SKUs are stored in its handling unit. The RMF-only address remains available as
 
 If Stock Requirements was calculated in the current application session, its
 quantity targets feed Inventory Slotting automatically. Repeated loads of one
-SKU prefer different compatible racks and are balanced across those racks;
-non-adjacent slots are preferred when a rack must be reused. Each physical
+SKU fill adjacent compatible positions on the preferred ergonomic rack level
+up to **Maximum same-SKU slots/rack**, then continue on another compatible
+level or rack. The limit counts physical occupied cells and defaults to full
+rack capacity. Each physical
 oversize copy continues to reserve one contiguous merged footprint rather than
 being separated into independent footprint cells.
 

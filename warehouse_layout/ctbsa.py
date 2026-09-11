@@ -10,6 +10,7 @@ logical SKU to occupy multiple clusters without changing either objective.
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Callable
 
@@ -389,6 +390,7 @@ class CtbsaPlacementPlanner:
         attribute_catalog=None,
         zone_workload_enabled: bool = False,
         rack_traffic_costs: dict[str, dict[str, float]] | None = None,
+        maximum_same_sku_slots_per_rack: int | None = None,
         parameters: CtbsaParameters | None = None,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
@@ -398,6 +400,16 @@ class CtbsaPlacementPlanner:
         if levels_per_rack < 1 or slots_per_level < 1:
             raise ValueError("C&TBSA rack capacity must be positive")
         capacity = levels_per_rack * slots_per_level
+        if maximum_same_sku_slots_per_rack is None:
+            maximum_same_sku_slots_per_rack = capacity
+        if (
+            isinstance(maximum_same_sku_slots_per_rack, bool)
+            or not isinstance(maximum_same_sku_slots_per_rack, int)
+            or maximum_same_sku_slots_per_rack < 1
+        ):
+            raise ValueError(
+                "maximum same-SKU slots per rack must be a positive integer"
+            )
         rack_traffic_costs = rack_traffic_costs or {}
         _level, racks, _workstations, _unreachable = self.slotting.rack_distances(
             building
@@ -570,6 +582,19 @@ class CtbsaPlacementPlanner:
                     f"C&TBSA profile {profile_label} requires "
                     f"{len(group_loads):,} locations but only {available:,} are available"
                 )
+            sku_counts = Counter(
+                str(assigned_by_load[load_id].get("sku", ""))
+                for load_id in group_loads
+            )
+            impossible_skus = [
+                sku for sku, count in sku_counts.items()
+                if count > len(group_racks) * maximum_same_sku_slots_per_rack
+            ]
+            if impossible_skus:
+                raise ValueError(
+                    "C&TBSA same-SKU rack limit cannot fit SKU(s): "
+                    + ", ".join(sorted(impossible_skus)[:5])
+                )
             group_skus = [
                 str(assigned_by_load[load_id].get("sku", ""))
                 for load_id in group_loads
@@ -733,29 +758,80 @@ class CtbsaPlacementPlanner:
                         break
                 cluster_records = [record for record, _rack in selected_pairs]
                 rack_targets = [rack for _record, rack in selected_pairs]
-            rng = np.random.default_rng(parameters.random_seed + group_number)
+            preferred_rack_by_load = {}
+            cluster_demand_by_load = {}
+            planned_racks = []
             for accessible_rank, ((cluster_demand, source_cluster, items), rack) in enumerate(
                 zip(cluster_records, rack_targets), start=1
             ):
-                ordered_items = list(rng.permutation(items)) if items else []
+                planned_racks.append(rack)
+                ordered_items = sorted(
+                    items,
+                    key=lambda item: (
+                        str(assigned_by_load[group_loads[int(item)]].get("sku", "")),
+                        group_loads[int(item)],
+                    ),
+                )
                 load_ids = [group_loads[int(item)] for item in ordered_items]
-                skus = [
-                    str(assigned_by_load[load_id].get("sku", ""))
-                    for load_id in load_ids
-                ]
                 for load_id in load_ids:
-                    rank += 1
-                    rank_by_sku[load_id] = rank
-                    target_racks[load_id] = str(rack["rack_id"])
+                    preferred_rack_by_load[load_id] = str(rack["rack_id"])
+                    cluster_demand_by_load[load_id] = int(
+                        demands[group_loads.index(load_id)]
+                    )
+
+            rack_loads = {str(rack["rack_id"]): [] for rack in planned_racks}
+            rack_sku_counts = defaultdict(Counter)
+            for load_id in sorted(
+                group_loads,
+                key=lambda value: (
+                    -sku_counts[str(assigned_by_load[value].get("sku", ""))],
+                    str(assigned_by_load[value].get("sku", "")),
+                    value,
+                ),
+            ):
+                sku = str(assigned_by_load[load_id].get("sku", ""))
+                preferred = preferred_rack_by_load[load_id]
+                eligible = [
+                    rack for rack in planned_racks
+                    if len(rack_loads[str(rack["rack_id"])]) < capacity
+                    and rack_sku_counts[str(rack["rack_id"])][sku]
+                    < maximum_same_sku_slots_per_rack
+                ]
+                if not eligible:
+                    raise ValueError(
+                        f"C&TBSA could not place {load_id} within rack capacity "
+                        "and the maximum same-SKU slot limit"
+                    )
+                rack = min(
+                    eligible,
+                    key=lambda candidate: (
+                        str(candidate["rack_id"]) != preferred,
+                        -rack_sku_counts[str(candidate["rack_id"])][sku],
+                        len(rack_loads[str(candidate["rack_id"])]),
+                        float(candidate["distance_m"]),
+                        str(candidate["rack_id"]),
+                    ),
+                )
+                rack_id = str(rack["rack_id"])
+                rack_loads[rack_id].append(load_id)
+                rack_sku_counts[rack_id][sku] += 1
+                rank += 1
+                rank_by_sku[load_id] = rank
+                target_racks[load_id] = rack_id
+
+            for accessible_rank, rack in enumerate(planned_racks, start=1):
+                rack_id = str(rack["rack_id"])
+                load_ids = rack_loads[rack_id]
+                skus = [str(assigned_by_load[value].get("sku", "")) for value in load_ids]
                 cluster_rows.append({
                     "storage_class": profile_label,
                     "attribute_profile": dict(attribute_profile),
-                    "source_cluster": source_cluster + 1,
+                    "source_cluster": accessible_rank,
                     "accessible_rank": accessible_rank,
-                    "rack_id": str(rack["rack_id"]),
+                    "rack_id": rack_id,
                     "rack_distance": float(rack["distance_m"]),
                     "sku_count": len(skus),
-                    "cluster_demand": cluster_demand,
+                    "cluster_demand": sum(cluster_demand_by_load[value] for value in load_ids),
                     "skus": skus,
                     "inventory_load_ids": load_ids,
                 })
@@ -785,6 +861,7 @@ class CtbsaPlacementPlanner:
                 "optimized_rack_count": sum(bool(row["inventory_load_ids"]) for row in cluster_rows),
                 "cluster_unit": "AMR shelf",
                 "storage_locations_per_cluster": capacity,
+                "maximum_same_sku_slots_per_rack": maximum_same_sku_slots_per_rack,
                 "active_zone_attribute_keys": active_attribute_keys,
                 "attribute_profile_count": len(active_groups),
                 "paper_hard_constraints": (

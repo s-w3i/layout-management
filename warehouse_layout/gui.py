@@ -1994,6 +1994,7 @@ class GridMapEditorApp:
         self.slot_zone = tk.StringVar(value="Z01")
         self.slot_levels = tk.StringVar(value="3")
         self.slot_slots = tk.StringVar(value="4")
+        self.slot_maximum_same_sku_slots = tk.StringVar(value="12")
         self.slot_summary = tk.StringVar(value="Choose the inputs and generate a slotting layout.")
         self.slot_progress_value = tk.DoubleVar(value=0)
         self.slot_progress_text = tk.StringVar(value="Ready")
@@ -2140,17 +2141,25 @@ class GridMapEditorApp:
             self.slot_affinity_adjusted_button,
         ]
 
+        same_sku_limit = ttk.Frame(form)
+        same_sku_limit.grid(row=5, column=0, columnspan=4, sticky="w", pady=4)
+        ttk.Label(same_sku_limit, text="Maximum same-SKU slots/rack").pack(side="left")
+        ttk.Spinbox(
+            same_sku_limit, from_=1, to=10000,
+            textvariable=self.slot_maximum_same_sku_slots, width=7,
+        ).pack(side="left", padx=(8, 0))
+
         ttk.Label(
             form,
             text="Warehouse zones, buffers, capacities, and advanced attributes are loaded from the grid project.",
             foreground="#4d646d",
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 6))
+        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(2, 6))
 
-        ttk.Label(form, text="Output layout JSON").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.slot_output_path).grid(row=6, column=1, sticky="ew", pady=4)
-        ttk.Button(form, text="Browse…", command=self.browse_slot_output).grid(row=6, column=2, padx=(8, 0), pady=4)
+        ttk.Label(form, text="Output layout JSON").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.slot_output_path).grid(row=7, column=1, sticky="ew", pady=4)
+        ttk.Button(form, text="Browse…", command=self.browse_slot_output).grid(row=7, column=2, padx=(8, 0), pady=4)
         slot_actions = ttk.Frame(form)
-        slot_actions.grid(row=7, column=1, columnspan=3, sticky="w", pady=(10, 4))
+        slot_actions.grid(row=8, column=1, columnspan=3, sticky="w", pady=(10, 4))
         self.slot_generate_button = ttk.Button(
             slot_actions,
             text="Generate slotting layout",
@@ -2167,7 +2176,7 @@ class GridMapEditorApp:
         )
         self.slot_progress.pack(side="left", padx=(12, 6))
         ttk.Label(slot_actions, textvariable=self.slot_progress_text).pack(side="left")
-        ttk.Label(form, textvariable=self.slot_summary, foreground="#315b66").grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(form, textvariable=self.slot_summary, foreground="#315b66").grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         unassigned_frame = ttk.LabelFrame(
             parent, text="SKUs not slotted", padding=8
@@ -2358,13 +2367,13 @@ class GridMapEditorApp:
             foreground="#4d646d",
             wraplength=210,
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        columns = ("abc_rank", "affinity_rank", "sku", "rack_quantity", "class", "flags", "static", "dynamic", "unit_type", "unit_id", "status")
+        columns = ("abc_rank", "affinity_rank", "sku", "load_id", "slot_quantity", "class", "flags", "static", "dynamic", "unit_type", "unit_id", "status")
         tree_frame = ttk.Frame(rack_view)
         tree_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=8, pady=(8, 0))
         tree_frame.columnconfigure(0, weight=1); tree_frame.rowconfigure(0, weight=1)
         self.slot_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-        headings = {"abc_rank":"ABC rank", "affinity_rank":"Affinity order", "sku":"SKU", "rack_quantity":"Qty in rack (EA)", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Occupied dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
-        widths = {"abc_rank":65, "affinity_rank":85, "sku":95, "rack_quantity":95, "class":50, "flags":180, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
+        headings = {"abc_rank":"ABC rank", "affinity_rank":"Affinity order", "sku":"SKU", "load_id":"Inventory load ID", "slot_quantity":"Qty in slot (EA)", "class":"ABC", "flags":"Storage flags", "static":"Current static address", "dynamic":"Occupied dynamic address", "unit_type":"Unit type", "unit_id":"Handling unit ID", "status":"Status"}
+        widths = {"abc_rank":65, "affinity_rank":85, "sku":95, "load_id":125, "slot_quantity":95, "class":50, "flags":180, "static":150, "dynamic":230, "unit_type":90, "unit_id":120, "status":90}
         for column in columns:
             self.slot_tree.heading(column, text=headings[column]); self.slot_tree.column(column, width=widths[column], anchor="center" if column not in {"flags","static","dynamic"} else "w")
         yscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.slot_tree.yview)
@@ -2382,6 +2391,7 @@ class GridMapEditorApp:
         self.traffic_handling_unit = tk.StringVar(value="AMR shelf")
         self.traffic_levels = tk.StringVar(value="3")
         self.traffic_slots = tk.StringVar(value="4")
+        self.traffic_maximum_same_sku_slots = tk.StringVar(value="12")
         self.traffic_network_mode = tk.StringVar(value="Use embedded RMF map")
         self.traffic_network_path = tk.StringVar()
         self.traffic_start_date = tk.StringVar()
@@ -2517,6 +2527,11 @@ class GridMapEditorApp:
             setup, from_=1, to=100, textvariable=self.traffic_slots,
             width=4, state="disabled",
         ).pack(side="left", padx=(4, 0))
+        ttk.Label(setup, text="Max same-SKU/rack").pack(side="left", padx=(10, 4))
+        ttk.Spinbox(
+            setup, from_=1, to=10000,
+            textvariable=self.traffic_maximum_same_sku_slots, width=6,
+        ).pack(side="left")
 
         ttk.Label(
             initial,
@@ -2902,6 +2917,10 @@ class GridMapEditorApp:
         self.traffic_handling_unit.set(project.storage_layout.handling_unit_type)
         self.traffic_levels.set(str(project.storage_layout.levels_per_rack))
         self.traffic_slots.set(str(project.storage_layout.slots_per_level))
+        self.traffic_maximum_same_sku_slots.set(str(
+            project.storage_layout.levels_per_rack
+            * project.storage_layout.slots_per_level
+        ))
         self.traffic_area_mode.set(True)
         self.traffic_analysis = None
         self.traffic_result = None
@@ -2978,6 +2997,13 @@ class GridMapEditorApp:
             storage_layout = grid_project.storage_layout
             levels = int(storage_layout.levels_per_rack)
             slots = int(storage_layout.slots_per_level)
+            maximum_same_sku_slots = int(
+                self.traffic_maximum_same_sku_slots.get()
+            )
+            if maximum_same_sku_slots < 1:
+                raise ValueError(
+                    "maximum same-SKU slots per rack must be a positive integer"
+                )
             handling_unit = storage_layout.handling_unit_type
             if self.traffic_loaded_grid_project_path != grid_project_path:
                 if not self.load_traffic_area_map():
@@ -3053,6 +3079,7 @@ class GridMapEditorApp:
                     zone_workload_enabled=bool(
                         self.traffic_zone_workload_enabled.get()
                     ),
+                    maximum_same_sku_slots_per_rack=maximum_same_sku_slots,
                     source_grid_project=str(grid_project_path),
                     source_velocity=str(velocity_path),
                     source_chilled=str(chilled_path or ""),
@@ -3290,6 +3317,15 @@ class GridMapEditorApp:
         self.traffic_minimize_rack_count.set(bool(parameters.get("minimize_rack_count", False)))
         self.traffic_zone_workload_enabled.set(bool(
             parameters.get("zone_workload_enabled", False)
+        ))
+        capacity = payload.get("rack_capacity") or {}
+        default_same_sku_limit = int(capacity.get("levels") or 1) * int(
+            capacity.get("slots_per_level") or 1
+        )
+        self.traffic_maximum_same_sku_slots.set(str(
+            parameters.get(
+                "maximum_same_sku_slots_per_rack", default_same_sku_limit
+            )
         ))
         self.traffic_parameter_status.set(
             "Saved run loaded; expected resource traffic rebuilt from saved final visits."
@@ -4004,10 +4040,10 @@ class GridMapEditorApp:
         ttk.Label(control,textvariable=self.ops_details,justify="left",wraplength=470).grid(row=1,column=0,sticky="ew",pady=(0,10))
 
         inventory=ttk.LabelFrame(control,text="SELECTED RACK INVENTORY",padding=6); inventory.grid(row=2,column=0,sticky="nsew",pady=(0,8)); inventory.columnconfigure(0,weight=1); inventory.rowconfigure(0,weight=1)
-        columns=("sku","quantity","class","flags","static","dynamic","unit")
+        columns=("sku","load_id","quantity","class","flags","static","dynamic","unit")
         self.ops_inventory_tree=ttk.Treeview(inventory,columns=columns,show="headings",height=8)
-        headings={"sku":"SKU","quantity":"Qty in rack (EA)","class":"ABC","flags":"Storage flags","static":"Static address","dynamic":"Occupied dynamic address","unit":"Shelf / unit"}
-        widths={"sku":100,"quantity":100,"class":45,"flags":180,"static":190,"dynamic":220,"unit":110}
+        headings={"sku":"SKU","load_id":"Inventory load ID","quantity":"Qty in slot (EA)","class":"ABC","flags":"Storage flags","static":"Static address","dynamic":"Occupied dynamic address","unit":"Shelf / unit"}
+        widths={"sku":100,"load_id":125,"quantity":100,"class":45,"flags":180,"static":190,"dynamic":220,"unit":110}
         for column in columns:
             self.ops_inventory_tree.heading(column,text=headings[column]);self.ops_inventory_tree.column(column,width=widths[column],anchor="center" if column in {"class","unit"} else "w")
         inventory_y=ttk.Scrollbar(inventory,orient="vertical",command=self.ops_inventory_tree.yview)
@@ -4176,9 +4212,8 @@ class GridMapEditorApp:
         if not rack_id:return
         rows=[row for row in self.ops_rows if row.get("assignment_status")=="ASSIGNED" and row.get("rack_id")==rack_id]
         rows.sort(key=lambda row:(int(row.get("storage_level") or 0),int(row.get("storage_slot") or 0),str(row.get("sku",""))))
-        rack_quantities=self.rack_sku_quantity_totals(rows)
         for row in rows:
-            item=self.ops_inventory_tree.insert("","end",values=(row.get("sku",""),rack_quantities.get((str(rack_id),str(row.get("sku",""))),""),row.get("velocity_class",""),self.sku_storage_flags(row),row.get("static_address",""),self.occupied_dynamic_address(row),row.get("handling_unit_id","")))
+            item=self.ops_inventory_tree.insert("","end",values=(row.get("sku",""),row.get("inventory_load_id",row.get("sku","")),row.get("quantity_ea",""),row.get("velocity_class",""),self.sku_storage_flags(row),row.get("static_address",""),self.occupied_dynamic_address(row),row.get("handling_unit_id","")))
             self.ops_inventory_rows[item]=row
 
     def ops_inventory_select(self,_event=None):
@@ -4448,6 +4483,11 @@ class GridMapEditorApp:
         self.slot_loaded_path = Path(self.slot_building_path.get()).expanduser().resolve()
         self.slot_zone_assignments = zones
         self.slot_levels.set(str(levels)); self.slot_slots.set(str(slots))
+        self.slot_maximum_same_sku_slots.set(str(
+            payload.get("summary", {}).get(
+                "maximum_same_sku_slots_per_rack", levels * slots
+            )
+        ))
         self.slot_strategy.set(payload.get("strategy", "basic"))
         self.slot_zone_workload_enabled.set(bool(
             payload.get("summary", {}).get("zone_workload_enabled", False)
@@ -4605,6 +4645,10 @@ class GridMapEditorApp:
         self.slot_handling_unit.set(project.storage_layout.handling_unit_type)
         self.slot_levels.set(str(project.storage_layout.levels_per_rack))
         self.slot_slots.set(str(project.storage_layout.slots_per_level))
+        self.slot_maximum_same_sku_slots.set(str(
+            project.storage_layout.levels_per_rack
+            * project.storage_layout.slots_per_level
+        ))
         self.slot_zone_assignments=zones; self.slot_rows=[]; self.slot_selected_rack=None
         self.slot_rack_zone_name.set("")
         self.slot_rack_zone_edit_status.set("Select a rack to rename its zone.")
@@ -4774,6 +4818,11 @@ class GridMapEditorApp:
             )
             self.update_slot_progress(25, f"Loaded {len(skus):,} SKUs")
             levels=int(self.slot_levels.get()); slots=int(self.slot_slots.get())
+            maximum_same_sku_slots = int(self.slot_maximum_same_sku_slots.get())
+            if maximum_same_sku_slots < 1:
+                raise ValueError(
+                    "maximum same-SKU slots per rack must be a positive integer"
+                )
             source_affinity = ""
             if strategy == "abc_affinity":
                 affinity_weight = float(self.slot_affinity_weight.get()) / 100.0
@@ -4826,6 +4875,7 @@ class GridMapEditorApp:
                     tuning_parameters,
                     storage_layout=self.slot_grid_project.storage_layout,
                     zone_workload_enabled=bool(self.slot_zone_workload_enabled.get()),
+                    maximum_same_sku_slots_per_rack=maximum_same_sku_slots,
                 )
             else:
                 self.update_slot_progress(45, "Generating basic ABC layout…")
@@ -4835,6 +4885,7 @@ class GridMapEditorApp:
                     self.slot_attribute_catalog, self.slot_location_attributes,
                     storage_layout=self.slot_grid_project.storage_layout,
                     zone_workload_enabled=bool(self.slot_zone_workload_enabled.get()),
+                    maximum_same_sku_slots_per_rack=maximum_same_sku_slots,
                 )
             self.slot_zone_assignments = dict(
                 summary.get("zone_assignments", self.slot_zone_assignments)
@@ -4982,16 +5033,13 @@ class GridMapEditorApp:
 
     def show_slotting_rows(self, rows):
         self.slot_tree.delete(*self.slot_tree.get_children())
-        rack_quantities = self.rack_sku_quantity_totals(rows)
         for row in rows[:1000]:
             self.slot_tree.insert("", "end", values=(
                 row.get("abc_frequency_rank", row.get("sku_rank", "")),
                 row.get("affinity_placement_rank", ""),
                 row["sku"],
-                rack_quantities.get(
-                    (str(row.get("rack_id", "")), str(row.get("sku", ""))),
-                    "",
-                ),
+                row.get("inventory_load_id", row.get("sku", "")),
+                row.get("quantity_ea", ""),
                 row["velocity_class"], self.sku_storage_flags(row),
                 row["static_address"], self.occupied_dynamic_address(row),
                 row["handling_unit_type"], row["handling_unit_id"],

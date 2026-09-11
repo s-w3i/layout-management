@@ -4,6 +4,12 @@ Inventory slotting is organized as a stable service facade, independent
 strategies, and shared domain rules. This keeps GUI and CLI callers compatible
 while making new strategies easier to add.
 
+Repeated quantity loads are consolidated by the shared allocator. The optional
+`maximum_same_sku_slots_per_rack` parameter counts occupied physical cells,
+defaults to configured rack capacity, and applies identically to Basic,
+Affinity, and C&TBSA regeneration. Same-SKU footprints prefer contiguous slots
+on the ergonomically ranked level before another compatible level or rack.
+
 ## Module map
 
 - `warehouse_layout/slotting.py` is the public `SlottingService` facade. It

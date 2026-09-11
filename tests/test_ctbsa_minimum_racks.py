@@ -70,6 +70,41 @@ class MinimumRackTests(unittest.TestCase):
             # The same demand objective is retained, with no lost/duplicated loads.
             self.assertEqual(sum(row["cluster_demand"] for row in compact.cluster_rows), 38)
 
+    def test_same_sku_target_rack_limit(self):
+        racks = [dict(rack_id=f"R{i}", distance_m=i, zone_id="ambient") for i in range(3)]
+        rows = [
+            dict(sku="A", inventory_load_id=f"A{i}", rack_id=f"R{i // 2}",
+                 assignment_status="ASSIGNED", occupied_slot_count=1,
+                 handling_unit_type="AMR shelf", sku_requirements={})
+            for i in range(5)
+        ]
+        attributes = SimpleNamespace(
+            physical_profile=lambda _: {"data_status": "COMPLETE", "storage_class": "STANDARD"},
+            configured_zone_attribute_keys=lambda _: set(),
+            normalize_catalog=lambda _: {},
+            effective_attributes=lambda *_: ({}, {}),
+        )
+        slotting = SimpleNamespace(
+            attributes=attributes,
+            rack_distances=lambda _: ("L1", racks, [], []),
+            apply_zone_local_aisles=lambda *args: None,
+        )
+        analysis = SimpleNamespace(
+            dataset=SimpleNamespace(skus=("A",)),
+            sku_store_day_totals=np.array([10]),
+            shared_store_days=np.ones((1, 1), dtype=np.int64),
+        )
+        plan = CtbsaPlacementPlanner(slotting).build(
+            rows, {}, analysis, levels_per_rack=1, slots_per_level=2,
+            maximum_same_sku_slots_per_rack=2,
+            parameters=CtbsaParameters(
+                population_size=6, generations=3, minimize_rack_count=True,
+            ),
+        )
+        counts = Counter(plan.target_racks[value] for value in plan.optimized_loads)
+        self.assertEqual(sorted(counts.values()), [1, 2, 2])
+        self.assertEqual(plan.parameters["maximum_same_sku_slots_per_rack"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

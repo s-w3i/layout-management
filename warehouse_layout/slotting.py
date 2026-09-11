@@ -695,6 +695,7 @@ class SlottingService:
         ctbsa_target_racks: dict[str, str] | None = None,
         ctbsa_rank_by_sku: dict[str, int] | None = None,
         zone_workload_enabled: bool = False,
+        maximum_same_sku_slots_per_rack: int | None = None,
     ) -> tuple[list[dict], dict]:
         parameters = locals()
         service = parameters.pop("self")
@@ -723,6 +724,7 @@ class SlottingService:
         ergonomic_weight_heuristic: bool = True,
         auto_plan_oversize: bool = False,
         zone_workload_enabled: bool = False,
+        maximum_same_sku_slots_per_rack: int | None = None,
     ) -> tuple[list[dict], dict]:
         parameters = locals()
         service = parameters.pop("self")

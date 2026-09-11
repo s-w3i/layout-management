@@ -5,6 +5,10 @@ The **Traffic-Aware Slotting** tab runs C&TBSA directly from an editable
 the separate affinity-slotting strategy are optional comparison methods in
 Inventory Slotting; neither is a C&TBSA prerequisite.
 
+**Maximum same-SKU slots/rack** limits the physical cells one SKU may occupy
+in a rack. C&TBSA enforces the limit while assigning target racks, and final
+physical regeneration packs same-SKU loads together within those targets.
+
 The workflow does not read a building YAML. The grid project supplies the physical
 map, generated buffers, rack zones, chilled/capacity settings, attribute
 catalog, and inherited hierarchy values.

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 
@@ -145,6 +145,7 @@ def allocate(
     ctbsa_target_racks: dict[str, str] | None = None,
     ctbsa_rank_by_sku: dict[str, int] | None = None,
     zone_workload_enabled: bool = False,
+    maximum_same_sku_slots_per_rack: int | None = None,
 ) -> tuple[list[dict], dict]:
     if not isinstance(zone_workload_enabled, bool):
         raise ValueError("zone_workload_enabled must be a boolean")
@@ -152,6 +153,14 @@ def allocate(
         raise ValueError("C&TBSA zone balancing belongs in the traffic planner")
     if levels_per_rack < 1 or slots_per_level < 1:
         raise ValueError("levels and slots per level must be at least 1")
+    if maximum_same_sku_slots_per_rack is None:
+        maximum_same_sku_slots_per_rack = levels_per_rack * slots_per_level
+    if (
+        isinstance(maximum_same_sku_slots_per_rack, bool)
+        or not isinstance(maximum_same_sku_slots_per_rack, int)
+        or maximum_same_sku_slots_per_rack < 1
+    ):
+        raise ValueError("maximum same-SKU slots per rack must be a positive integer")
     if strategy not in {"basic", "abc_affinity", "ctbsa"}:
         raise ValueError(f"unsupported slotting strategy: {strategy}")
     if not 0.0 <= affinity_weight <= 1.0:
@@ -416,11 +425,11 @@ def allocate(
                 # Place one load of every SKU before replenishment loads. This
                 # discovers the compact system rack pool early enough for hot
                 # quantity loads to spread without opening dedicated racks.
-                int(row.get("quantity_load_index") or 1),
                 class_rank.get(str(row.get("velocity_class", "")).upper(), 9),
                 physical_group_rank(row),
                 -float(row.get("pick_frequency") or 0),
                 str(row.get("sku", "")),
+                int(row.get("quantity_load_index") or 1),
             ),
         )
     abc_rank_by_id = {
@@ -506,6 +515,19 @@ def allocate(
         )
     else:
         sorted_skus = logical_sorted_skus
+
+    sku_group_order = {}
+    for row in sorted_skus:
+        sku_group_order.setdefault(str(row.get("sku", "")), len(sku_group_order))
+    sorted_skus = sorted(
+        sorted_skus,
+        key=lambda row: (
+            sku_group_order[str(row.get("sku", ""))],
+            int(row.get("quantity_load_index") or 1),
+            str(row.get("inventory_load_id", "")),
+        ),
+    )
+    sku_load_counts = Counter(str(row.get("sku", "")) for row in sorted_skus)
 
     def position_key(position: dict) -> tuple[str, int, int]:
         return (
@@ -657,7 +679,7 @@ def allocate(
         constrained_records.append({
             "row_id": id(sku),
             "sku": str(sku.get("sku", "")),
-            "spread_quantity": int(sku.get("quantity_load_count") or 1) > 1,
+            "spread_quantity": sku_load_counts[str(sku.get("sku", ""))] > 1,
             "strategy_rank": strategy_rank,
             "placements": placements,
             "largest_footprint": max(
@@ -682,7 +704,7 @@ def allocate(
             return (new_rack_penalty, 0, 0)
         sku_footprints = quantity_reservations_by_sku[record["sku"]]
         rack_count = sum(
-            prior[0][0] == rack_id for prior in sku_footprints if prior
+            len(prior) for prior in sku_footprints if prior and prior[0][0] == rack_id
         )
         prior_positions = {
             position
@@ -697,7 +719,14 @@ def allocate(
             for existing in prior_positions
             for position in footprint
         )
-        return (new_rack_penalty, rack_count, int(adjacent))
+        same_level_adjacent = any(
+            existing[0] == position[0]
+            and existing[1] == position[1]
+            and abs(existing[2] - position[2]) == 1
+            for existing in prior_positions
+            for position in footprint
+        )
+        return (new_rack_penalty, -rack_count, -int(same_level_adjacent), -int(adjacent))
 
     def reserve_all(remaining: tuple[dict, ...]) -> bool:
         nonlocal search_nodes
@@ -711,6 +740,14 @@ def allocate(
             viable = [
                 footprint for footprint in record["placements"]
                 if not occupied_reservations.intersection(footprint)
+                and (
+                    sum(
+                        len(prior)
+                        for prior in quantity_reservations_by_sku[record["sku"]]
+                        if prior and prior[0][0] == footprint[0][0]
+                    ) + len(footprint)
+                    <= maximum_same_sku_slots_per_rack
+                )
             ]
             if not viable:
                 return False
@@ -772,6 +809,14 @@ def allocate(
             viable = [
                 value for value in record["placements"]
                 if not occupied_reservations.intersection(value)
+                and (
+                    sum(
+                        len(prior)
+                        for prior in quantity_reservations_by_sku[record["sku"]]
+                        if prior and prior[0][0] == value[0][0]
+                    ) + len(value)
+                    <= maximum_same_sku_slots_per_rack
+                )
             ]
             footprint = min(
                 viable,
@@ -1323,6 +1368,14 @@ def allocate(
                     candidate_key = (
                         *candidate_key[:4], 0, *candidate_key[5:]
                     )
+                if (
+                    sku_load_counts[current_sku] > 1
+                    and quantity_rack_counts[current_sku][
+                        str(candidate["rack_id"])
+                    ] + len(occupied_positions)
+                    > maximum_same_sku_slots_per_rack
+                ):
+                    continue
                 hard_candidates.append((
                     candidate_key,
                     index,
@@ -1333,52 +1386,45 @@ def allocate(
                 ))
             if hard_candidates:
                 spread_candidates = hard_candidates
-                if zone_workload_enabled:
-                    spread_candidates = balanced_zone_candidates(
-                        spread_candidates, zone_workloads, zone_capacities, zone_demand,
-                    )
-                if int(sku.get("quantity_load_count") or 1) > 1:
-                    # Quantity diversity is a secondary objective. Reuse the
-                    # compatible rack pool already opened by the whole system;
-                    # do not open one rack per load merely to spread a SKU.
-                    opened_candidates = [
-                        record for record in spread_candidates
-                        if str(record[2]["rack_id"]) in rack_state
-                    ]
-                    if opened_candidates:
-                        spread_candidates = opened_candidates
+                if sku_load_counts[current_sku] > 1:
                     rack_counts = quantity_rack_counts[current_sku]
-                    minimum_rack_count = min(
-                        rack_counts[str(record[2]["rack_id"])]
-                        for record in spread_candidates
-                    )
                     spread_candidates = [
                         record for record in spread_candidates
                         if rack_counts[str(record[2]["rack_id"])]
-                        == minimum_rack_count
+                        + len(record[4]) <= maximum_same_sku_slots_per_rack
                     ]
+                    same_sku_racks = [
+                        record for record in spread_candidates
+                        if rack_counts[str(record[2]["rack_id"])] > 0
+                    ]
+                    if same_sku_racks:
+                        spread_candidates = same_sku_racks
                     prior_positions = quantity_positions_by_sku[current_sku]
 
-                    def adjacent_to_same_sku(record) -> bool:
+                    def same_level_adjacent_to_same_sku(record) -> bool:
                         return any(
                             prior[0] == str(position["rack_id"])
-                            and abs(prior[1] - int(position["level"]))
-                            + abs(prior[2] - int(position["slot"])) == 1
+                            and prior[1] == int(position["level"])
+                            and abs(prior[2] - int(position["slot"])) == 1
                             for prior in prior_positions
                             for position in record[4]
                         )
-
-                    minimum_adjacency = min(
-                        int(adjacent_to_same_sku(record))
-                        for record in spread_candidates
+                    selection_key = lambda record: (
+                        *record[0][:9],
+                        -int(same_level_adjacent_to_same_sku(record)),
+                        *record[0][9:],
                     )
-                    spread_candidates = [
-                        record for record in spread_candidates
-                        if int(adjacent_to_same_sku(record))
-                        == minimum_adjacency
-                    ]
+                else:
+                    selection_key = lambda record: record[0]
+                if zone_workload_enabled and not any(
+                    quantity_rack_counts[current_sku][str(record[2]["rack_id"])] > 0
+                    for record in spread_candidates
+                ):
+                    spread_candidates = balanced_zone_candidates(
+                        spread_candidates, zone_workloads, zone_capacities, zone_demand,
+                    )
                 baseline_candidate = min(
-                    spread_candidates, key=lambda item: item[0]
+                    spread_candidates, key=selection_key
                 )
                 selected_candidate = baseline_candidate
                 related_assigned = [
@@ -1734,10 +1780,10 @@ def allocate(
                     for key, value in sorted(auto_overrides.items())
                 )
                 assigned_affinity_positions[current_sku] = position
-                if int(sku.get("quantity_load_count") or 1) > 1:
+                if sku_load_counts[current_sku] > 1:
                     quantity_rack_counts[current_sku][
                         str(position["rack_id"])
-                    ] += 1
+                    ] += len(occupied_positions)
                     quantity_positions_by_sku[current_sku].extend(
                         (
                             str(item["rack_id"]),
@@ -2101,6 +2147,7 @@ def allocate(
     summary = {
         "strategy": strategy,
         "zone_workload_enabled": zone_workload_enabled,
+        "maximum_same_sku_slots_per_rack": maximum_same_sku_slots_per_rack,
         "zone_workload_model": "quantity_weighted_pick_frequency_per_zone_slot",
         "zone_workload": {
             zone: {
