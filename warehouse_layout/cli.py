@@ -33,6 +33,14 @@ class GridMapEditorCommand:
         parser.add_argument("--width", type=float, default=20.0, help="Total warehouse width in metres")
         parser.add_argument("--length", type=float, default=15.0, help="Total warehouse length in metres")
         parser.add_argument("--spacing", type=float, default=1.0, help="Distance between grid points in metres")
+        parser.add_argument(
+            "--x-spacing", type=float,
+            help="X-axis grid distance; defaults to --spacing",
+        )
+        parser.add_argument(
+            "--y-spacing", type=float,
+            help="Y-axis grid distance; defaults to --spacing",
+        )
         parser.add_argument("--name", default="warehouse_grid", help="Building map name")
         parser.add_argument("--level", default="L1", help="RMF level name")
         parser.add_argument(
@@ -67,9 +75,10 @@ class GridMapEditorCommand:
             GridSpec(
                 args.width,
                 args.length,
-                args.spacing,
+                args.x_spacing if args.x_spacing is not None else args.spacing,
                 args.name,
                 args.level,
+                args.y_spacing if args.y_spacing is not None else args.spacing,
             ),
             dict(args.marker),
         )

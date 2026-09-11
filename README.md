@@ -1,499 +1,154 @@
-# RMF Grid Map Editor — User Manual
+# Warehouse Layout Management
 
-`rmf_grid_map_editor.py` is a Python desktop application for creating a
-grid-based Open-RMF warehouse map, assigning inventory zones, generating a
-basic ABC slotting layout, and demonstrating inventory search and position
-swaps.
+Design an AMR warehouse, generate slotting layouts, and compare throughput with
+a deterministic discrete-event simulator.
 
-The application does not require a warehouse drawing. Grid point `(0, 0)` is
-the bottom-left point of a generated map, and positive Y points upward.
+## Quick start
 
-## Contents
-
-1. [Install and start](#install-and-start)
-2. [Application workflow](#application-workflow)
-3. [Grid Map Editor tab](#1-grid-map-editor-tab)
-4. [Inventory Slotting tab](#2-inventory-slotting-tab)
-5. [Inventory Operations Demo tab](#3-inventory-operations-demo-tab)
-6. [Inventory address rules](#inventory-address-rules)
-7. [Command-line map generation](#command-line-map-generation)
-8. [Files and folders](#files-and-folders)
-9. [Code architecture](#code-architecture)
-10. [Troubleshooting](#troubleshooting)
-
-## Install and start
-
-### Requirements
-
-- Python 3.10 or newer
-- Tkinter
-- PyYAML
-
-On Ubuntu or Debian, install the required packages with:
+Requirements: Python 3.10+, Tkinter, PyYAML, openpyxl, matplotlib, and OR-Tools.
 
 ```bash
 sudo apt install python3 python3-tk python3-pip
-python3 -m pip install PyYAML
-```
-
-Clone the public repository and start the application:
-
-```bash
+python3 -m pip install PyYAML openpyxl matplotlib ortools
 git clone https://github.com/s-w3i/layout-management.git
 cd layout-management
 python3 rmf_grid_map_editor.py
 ```
 
-The application opens with three tabs:
+The desktop app provides grid editing, SKU analysis, slotting, traffic
+optimization, and inventory operations.
 
-| Tab | Purpose |
-|---|---|
-| **Grid Map Editor** | Create the grid, place racks and workstations, and export RMF YAML |
-| **Inventory Slotting** | Assign zones and generate an ABC slotting recommendation |
-| **Inventory Operations Demo** | Search inventory and demonstrate SKU or AMR-shelf swaps |
+## Current-heat Pygame simulation
 
-## Application workflow
-
-For a new warehouse, use the tabs in this order:
-
-1. Create the warehouse grid in **Grid Map Editor**.
-2. Place rack pickup points and workstation drop-off points.
-3. Save the editable project and export the RMF building YAML.
-4. Open **Inventory Slotting** and load the building YAML.
-5. Group every rack into a zone.
-6. Load the ABC SKU velocity CSV and generate the slotting layout.
-7. Open **Inventory Operations Demo** and load the generated `.slotting.json`.
-8. Search for SKUs or demonstrate position swaps.
-9. Save operation-demo changes to a new JSON file when required.
-
-To use the included demonstration map, start directly from the Inventory
-Slotting tab. Its default building file is:
-
-```text
-resources/map/demo.building.yaml
-```
-
-## 1. Grid Map Editor tab
-
-### Create the warehouse grid
-
-Enter the following values:
-
-| Field | Meaning |
-|---|---|
-| **Map name** | Name written into the RMF building file |
-| **Level name** | RMF floor or level name, such as `L1` |
-| **Total width (m)** | Warehouse size along the X axis |
-| **Total length (m)** | Warehouse size along the Y axis |
-| **Distance per grid (m)** | Real distance between neighbouring grid points |
-
-Width and length must be exact multiples of the grid distance. For example, a
-20 m width with 1 m spacing produces points from X=0 through X=20, including
-both boundaries.
-
-Click **Generate / reset grid**. The editor creates horizontal and vertical
-edges between neighbouring points. All generated lanes are bidirectional by
-default.
-
-> Generating a new grid removes the current rack and workstation markers after
-> confirmation.
-
-### Place rack pickup points
-
-Set **Rack ID prefix**, then choose one of these tools:
-
-- **Paint rack pickups (drag)** — hold the left mouse button and paint rack
-  points individually or along an irregular shape.
-- **Fill rack rectangle (2 clicks)** — click two opposite corners to fill every
-  grid point in the rectangle with racks.
-
-Rack IDs are generated from the prefix and grid location. They can be changed
-later with **Select / edit**.
-
-### Place workstation drop-off points
-
-Choose **Place workstation drop-off**, then click a grid point. The resulting
-RMF vertex is exported with a `dropoff_ingestor` property.
-
-Use **Select / edit** to give the workstation a meaningful endpoint ID, such as
-`WS_INBOUND_01` or `WS_PACKING_01`.
-
-### Edit or remove points
-
-- Choose **Select / edit** and click a point.
-- Change **Role** to `rack`, `workstation`, or `none`.
-- Edit **Endpoint ID** if necessary.
-- Click **Apply point edit**.
-
-For bulk removal, choose **Clear markers (drag)** and drag over the points.
-
-### Undo and redo
-
-| Action | Shortcut |
-|---|---|
-| Undo | `Ctrl+Z` |
-| Redo | `Ctrl+Y` or `Ctrl+Shift+Z` |
-
-A drag-paint, drag-clear, or rectangle-fill action is treated as one undoable
-operation.
-
-### Save and export
-
-The editor has two different save formats:
-
-- **Save editable project…** writes a `.grid.json` file. Use this format when
-  you want to continue editing the grid later.
-- **Export RMF building YAML…** writes a `.building.yaml` file for RMF and the
-  Inventory Slotting tab.
-
-Use **Load editable project…** to reopen a `.grid.json` project. A building YAML
-is an export format and cannot replace the editable project file.
-
-## 2. Inventory Slotting tab
-
-### Input files
-
-The default inputs are:
-
-| Input | Default path |
-|---|---|
-| Building YAML | `resources/map/demo.building.yaml` |
-| ABC SKU velocity CSV | `resources/data/sku_velocity_output/sku_velocity_summary.csv` |
-| Output layout | `resources/data/basic_slotting_layout.slotting.json` |
-
-The YAML must contain at least one rack with `pickup_dispenser` and at least one
-workstation with `dropoff_ingestor`.
-
-The SKU CSV must contain these columns:
-
-- `sku`
-- `pick_frequency`
-- `velocity_class`
-
-The included compact CSV is ready for the demo. To analyse another warehouse,
-place its transaction workbook under `resources/data/` and follow the
-[SKU velocity analysis guide](docs/sku-velocity-analysis.md). Raw workbooks and
-generated demand plots are intentionally excluded from the public repository.
-
-### Load the building map
-
-1. Confirm or browse for the **Building YAML**.
-2. Click **Load map**.
-3. Confirm that the status reports the expected rack and workstation counts.
-
-### Assign rack zones
-
-Every rack must have a zone before slotting can be generated.
-
-1. Leave **Rectangle zone selection** enabled.
-2. Enter the first **Zone ID**, normally `Z01`.
-3. Drag a rectangle around a group of rack points.
-4. Repeat until the status reports zero unassigned racks.
-
-With **Auto next ID** enabled, the zone advances automatically after each
-successful selection:
-
-```text
-Z01 → Z02 → Z03
-```
-
-IDs such as `ZONE_001` also advance while preserving their numeric width. Use
-**Clear zones** to restart zone assignment.
-
-### Aisle and bay rules
-
-- A zone is a collection of racks.
-- Each different rack column, identified by its X coordinate, is a separate
-  aisle.
-- Aisle numbering restarts at `A01` in every zone.
-- The fixed bay ID uses the RMF grid waypoint name.
-- Bays in an aisle are ordered by their Y coordinate.
-
-For example, racks in two columns inside `Z02` are addressed under `Z02/A01`
-and `Z02/A02`, even if another zone already uses those aisle numbers.
-
-### Configure rack capacity and handling units
-
-Select:
-
-- **Strategy** — currently `basic`.
-- **Handling unit** — `AMR shelf`, `Tote`, or `Pallet`.
-- **Levels** — vertical storage levels in each fixed bay.
-- **Slots per level** — SKU positions on each level.
-
-The handling-unit choice controls where the dynamic identity appears in the
-address. See [Inventory address rules](#inventory-address-rules).
-
-### Generate the slotting layout
-
-1. Confirm that every rack has a zone.
-2. Confirm the SKU CSV and output paths.
-3. Select the handling unit and rack capacity.
-4. Click **Generate slotting layout**.
-
-The **basic** strategy:
-
-1. Calculates the directed route distance from each rack to every workstation.
-2. Uses the average distance across all workstations as the rack score.
-3. Sorts SKUs by A, B, C class and then by descending pick frequency.
-4. Assigns the highest-velocity SKUs to positions with the lowest average route
-   distance.
-
-If a rack cannot reach every workstation through the directed RMF graph, it is
-marked unreachable and is not used for assignment.
-
-### Inspect the result
-
-After generation:
-
-- Red racks contain class A inventory.
-- Orange racks contain class B inventory.
-- Green racks contain class C inventory.
-- Grey racks are unused.
-- Blue diamonds are workstations.
-
-Click a rack to view all assigned SKUs and their complete static and dynamic
-addresses. Use **Show all assignments** to return to the complete table.
-
-The generated `.slotting.json` is self-contained. It stores the building map,
-zone assignments, strategy settings, inventory assignments, and operation log.
-
-## 3. Inventory Operations Demo tab
-
-### Load a slotting layout
-
-1. Confirm or browse for the `.slotting.json` file.
-2. Click **Load layout**.
-3. Click any occupied rack to display every SKU in that rack.
-
-### Search for a SKU
-
-1. Enter a complete SKU or part of a SKU in **Find SKU**.
-2. Click **Search**.
-
-The application highlights the current rack and shows the SKU's static address,
-dynamic address, handling-unit ID, and RMF grid position.
-
-### Swap two SKU slots
-
-1. Select **SKU slot** as the swap type.
-2. Click a rack and select the first SKU row. It fills **Source SKU**.
-3. Click another rack if required and select the second SKU row. It fills
-   **Target SKU**.
-4. Review both values.
-5. Click **Execute mock swap**.
-
-The two SKU records exchange their complete location assignments. Selecting the
-rows does not change inventory; the change occurs only after Execute is clicked.
-
-### Swap two AMR shelves
-
-Whole-shelf swapping is available only for layouts generated with **AMR shelf**.
-
-1. Select **Whole shelf** as the swap type.
-2. Click the first occupied rack point. Its shelf becomes the source.
-3. Click the second occupied rack point. Its shelf becomes the target.
-4. Confirm that both selected racks have orange rings and both shelf IDs appear
-   in the source and target fields.
-5. Click **Execute mock swap**.
-
-Every SKU remains tied to its movable shelf ID while the two shelves exchange
-fixed rack positions. Static and dynamic addresses are recalculated.
-
-Tote and pallet layouts do not use whole-shelf swap because their movable IDs
-exist at slot level.
-
-### Save operation changes
-
-Operations are held in memory until saved. Click **Save changes as…** to write a
-new `.slotting.json` containing the modified assignments and timestamped
-operation log.
-
-## Inventory address rules
-
-Every assigned SKU has a static address and a dynamic address.
-
-### Static address
-
-The static address always describes a fixed warehouse position:
-
-```text
-ZONE/AISLE/FIXED-BAY/LEVEL/SLOT
-Z01/A05/BAY-G611/L01/S01
-```
-
-### AMR shelf: dynamic at bay level
-
-An AMR shelf is the movable bay. Every SKU position on the shelf shares the
-same shelf ID:
-
-```text
-Static:  Z01/A05/BAY-G611/L01/S01
-Dynamic: Z01/A05/BAY-SHELF_001/L01/S01
-```
-
-### Tote and pallet: dynamic at slot level
-
-Each tote or pallet has an independent ID at the storage-slot layer:
-
-```text
-Static:         Z01/A05/BAY-G611/L01/S01
-Tote dynamic:   Z01/A05/BAY-G611/L01/SLOT-TOTE_001
-Pallet dynamic: Z01/A05/BAY-G611/L01/SLOT-PALLET_001
-```
-
-The JSON field `dynamic_address_level` records `bay` for an AMR shelf and
-`slot` for a tote or pallet.
-
-## Command-line map generation
-
-The script can generate a map without opening the GUI.
-
-Create an empty 20 m × 15 m grid with 1 m spacing:
+Run the copied current-heat planner on the native grid, with store/day tasks
+released at time zero using the AMR workload rules:
 
 ```bash
-python3 rmf_grid_map_editor.py --generate \
-  --width 20 \
-  --length 15 \
-  --spacing 1 \
-  --name warehouse_grid \
-  --level L1 \
-  --output resources/map/new_warehouse.building.yaml
+python3 -m current_heat_simulation.pygame_simulator
 ```
 
-Add markers using `ROLE,COLUMN,ROW,ENDPOINT_ID`:
+See [current_heat_simulation/README.md](current_heat_simulation/README.md) for
+date, layout, fleet, headless-run, and output options. Pygame is required.
+
+## Compare four slotting layouts
+
+Run all observed order dates with 40 AMRs and one persistent worker per layout:
 
 ```bash
-python3 rmf_grid_map_editor.py --generate \
-  --width 20 --length 15 --spacing 1 \
-  --marker rack,3,4,RACK_001 \
-  --marker workstation,0,2,WS_OUTBOUND \
-  --output resources/map/new_warehouse.building.yaml
+python3 amr_simulation/run_simulation.py \
+  --mode batch \
+  --grid resources/map/map1_1.grid.json \
+  --orders "resources/data/Sample Data.xlsx" \
+  --config amr_simulation/config/default.json \
+  --layout resources/map/map1_basic.slotting.json \
+  --layout resources/map/map1_pure_affinity.slotting.json \
+  --layout resources/map/map1_traffic_zone_balance_off.slotting.json \
+  --layout resources/map/map1_traffic_zone_balance_on.slotting.json \
+  --amrs 40 \
+  --workers 4 \
+  --output amr_simulation/results/all_layouts_40_amrs
 ```
 
-Valid marker roles are `rack` and `workstation`. The bottom-left point is
-column 0, row 0.
-
-## Files and folders
+Open the final comparison:
 
 ```text
-layout_management_master/
-├── README.md
-├── rmf_grid_map_editor.py                         Application launcher only
-├── sku_velocity_analysis.py
-├── warehouse_layout/
-│   ├── cli.py                                     CLI application controller
-│   ├── config.py                                  Paths and schema constants
-│   ├── domain.py                                  Grid domain models
-│   ├── gui.py                                     Tkinter application class
-│   ├── inventory.py                               Search and swap service
-│   ├── rmf.py                                     RMF/project persistence service
-│   └── slotting.py                                Routing, addressing and slotting
-├── tests/
-│   └── test_services.py                           Service regression tests
-├── docs/
-│   ├── README.md                                  Documentation index
-│   ├── rmf-grid-map-editor.md                     Additional editor notes
-│   └── sku-velocity-analysis.md                   ABC analysis guide
-└── resources/
-    ├── data/
-    │   ├── Sample Data.xlsx                     Optional local input (ignored)
-    │   ├── basic_slotting_layout.slotting.json  Generated output (ignored)
-    │   └── sku_velocity_output/
-    │       ├── sku_velocity_summary.csv
-    │       └── demand_plots/
-    ├── map/
-    │   ├── demo.building.yaml
-    │   └── v6.building.yaml
-    └── others/
+amr_simulation/results/all_layouts_40_amrs/layout_comparison.csv
 ```
 
-## Code architecture
+Useful batch options:
 
-`rmf_grid_map_editor.py` is intentionally a minimal launcher. Application code
-is organized by responsibility inside the `warehouse_layout` package:
+- `--workers N`: maximum parallel layout workers.
+- `--amrs N`: fleet size from 1 to 40 using configured spawn nodes.
+- `--start-date YYYY-MM-DD --end-date YYYY-MM-DD`: limit the date range.
+- `--event-log`: export detailed events; omit it for faster runs.
 
-| Module | Main class | Responsibility |
-|---|---|---|
-| `domain.py` | `GridProject`, `GridSpec`, `Marker` | Grid state, validation and RMF dictionary construction |
-| `rmf.py` | `RmfMapService` | Load/save editable projects and import/export building YAML |
-| `slotting.py` | `SlottingService` | Rack routing, zone-local aisles, dynamic addresses and basic slotting |
-| `slotting.py` | `SlottingLayoutRepository` | Read/write self-contained slotting JSON |
-| `inventory.py` | `InventoryService` | SKU lookup, SKU-slot swap and AMR-shelf swap |
-| `gui.py` | `GridMapEditorApp` | Tkinter widgets and user interaction |
-| `cli.py` | `GridMapEditorCommand` | Command-line parsing and application startup |
-
-Run the service regression tests from the repository root:
+## Run the live simulation
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 amr_simulation/run_simulation.py \
+  --mode debug \
+  --grid resources/map/map1_1.grid.json \
+  --orders "resources/data/Sample Data.xlsx" \
+  --config amr_simulation/config/default.json \
+  --layout resources/map/map1_basic.slotting.json \
+  --date 2023-01-03 \
+  --speed 120 \
+  --output amr_simulation/results/live_demo
 ```
 
-On Linux, run the automated three-tab GUI workflow with a virtual display:
+The window includes play/pause, next-event, restart, and speed controls. Use
+`--speed 1` for wall-clock playback.
 
-```bash
-sudo apt install xvfb
-xvfb-run -a python3 -m tests.gui_workflow_smoke
-```
+## Workflow
 
-The GUI smoke test covers grid editing, map loading and drawing, rectangle zone
-selection, all handling-unit address models, rack inspection, SKU search,
-SKU-slot swap, AMR-shelf swap, and operation-layout saving.
+1. Create the grid, racks, workstations, zones, and lanes in **Grid Map Editor**.
+2. Analyze orders in **SKU Affinity** and calculate stock requirements.
+3. Generate a layout in **Inventory Slotting**.
+4. Improve it with **Traffic-Aware Slotting** or **Global Traffic Optimizer**.
+5. Compare throughput in batch mode, then inspect one date in live mode.
+
+## Simulator behavior
+
+- Directed and bidirectional lanes are honored by deterministic A* routing.
+- A* plans only the active pickup, delivery, or rack-return stage.
+- Every workstation processes one robot at a time; arrivals queue physically.
+- AMRs reserve available straight-path nodes and release each node after crossing.
+- Blocked AMRs reroute after five simulated seconds using stage-local tabu nodes.
+- A rack stays reserved until it returns home and jack-down finishes.
+- Original order lines complete at jack-down; quantities do not multiply lines.
+- All tasks for a selected date start at simulation time zero.
+
+V1 uses node ownership rather than a time-expanded reservation table.
+
+## Outputs
+
+Each layout directory contains:
+
+- `daily_metrics.csv`
+- `summary.json`
+- `config_snapshot.json`
+- `store_workstation_mapping.json`
+- `validation_report.json`
+
+Multiple layouts also produce `layout_comparison.csv`. Detailed runs add
+`event_log.csv`.
+
+## Main files
+
+| Path | Purpose |
+|---|---|
+| `rmf_grid_map_editor.py` | Launch the desktop app |
+| `warehouse_layout/` | Grid, slotting, traffic, and GUI code |
+| `amr_simulation/` | Simulator, debugger, CLI, and default config |
+| `resources/map/` | Grid and slotting layout files |
+| `resources/data/` | Orders, SKU attributes, and stock inputs |
+| `tests/` | Automated tests |
 
 ## Troubleshooting
 
-### `No module named yaml`
-
-Install PyYAML:
+**Missing Python module**
 
 ```bash
-python3 -m pip install PyYAML
+python3 -m pip install PyYAML openpyxl matplotlib ortools
 ```
 
-### `No module named tkinter`
-
-On Ubuntu or Debian:
+**Tkinter is missing**
 
 ```bash
 sudo apt install python3-tk
 ```
 
-### Width or length is not an exact multiple
+**Simulation validation fails**
 
-Change the warehouse dimension or grid distance so division produces a whole
-number. For example, 20 m works with 1 m spacing, while 20 m does not work with
-3 m spacing.
+Open `validation_report.json`. It identifies invalid spawns, stations, racks,
+routes, and unmapped SKUs.
 
-### Building YAML has no racks or workstations
+**Batch run is slow**
 
-The slotting input requires:
+Use `--workers 4`, omit `--event-log`, and confirm the workload cache exists at
+`amr_simulation/.cache/`.
 
-- at least one `pickup_dispenser` rack vertex; and
-- at least one `dropoff_ingestor` workstation vertex.
+**Need more detail**
 
-Return to Grid Map Editor, add the missing markers, and export the YAML again.
-
-### Slotting says racks remain unassigned
-
-Every rack must belong to a zone. Enable **Rectangle zone selection** and group
-the remaining grey rack points before generating.
-
-### Some racks are unreachable
-
-Check RMF lane directions and graph continuity. The basic strategy requires a
-directed route from each usable rack to every workstation.
-
-### Whole-shelf swap is unavailable
-
-Whole-shelf swap applies only to **AMR shelf** layouts. Tote and pallet dynamic
-identities are stored at slot level.
-
-### Existing JSON still shows an older address format
-
-Return to Inventory Slotting and regenerate the `.slotting.json`. Existing
-generated files are not automatically migrated when address rules change.
-
-## Related documentation
-
-- [SKU velocity analysis](docs/sku-velocity-analysis.md)
-- [Additional RMF editor notes](docs/rmf-grid-map-editor.md)
+See [`docs/`](docs/) for detailed map editor, traffic optimizer, and slotting
+documentation.
