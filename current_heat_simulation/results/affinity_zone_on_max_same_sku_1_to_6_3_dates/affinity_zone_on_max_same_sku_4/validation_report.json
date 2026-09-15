@@ -1,0 +1,10 @@
+{
+  "errors": [],
+  "valid": true,
+  "warnings": [
+    {
+      "code": "reservation_model",
+      "message": "node ownership prevents overlap but does not use time-expanded reservations"
+    }
+  ]
+}

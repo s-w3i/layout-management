@@ -1,7 +1,9 @@
 # SKU Velocity Analysis
 
 `sku_velocity_analysis.py` reads transaction rows from an Excel workbook,
-classifies SKUs by pick frequency, and plots daily demand for every SKU.
+classifies SKUs by pick frequency, extracts conservative one-unit physical
+profiles, plots daily demand for every SKU, and creates a deterministic chilled
+requirements demo.
 
 ## Default input and output
 
@@ -9,6 +11,7 @@ classifies SKUs by pick frequency, and plots daily demand for every SKU.
 |---|---|
 | Transaction workbook | `resources/data/Sample Data.xlsx` (supply locally) |
 | ABC summary | `resources/data/sku_velocity_output/sku_velocity_summary.csv` |
+| Chilled demo | `resources/data/demo_chilled_requirements.csv` |
 | Demand charts | `resources/data/sku_velocity_output/demand_plots/` |
 
 Raw workbooks and generated demand plots are ignored by Git because they may be
@@ -19,12 +22,22 @@ analysis. It must contain these columns:
 - `Item or SKU`
 - `Quantity (in EA)`
 
+Physical extraction also uses `Length`, `Width`, `Height`, and `Weight` when
+present. Zero, negative, and blank values are ignored. The maximum positive
+value observed for each SKU is retained without unit conversion.
+
 ## Run the analysis
 
 From the repository root:
 
 ```bash
 python3 sku_velocity_analysis.py
+```
+
+Use `--skip-plots` when only the CSV inputs need refreshing:
+
+```bash
+python3 sku_velocity_analysis.py --skip-plots
 ```
 
 Install the required packages if necessary:
@@ -49,8 +62,26 @@ python3 sku_velocity_analysis.py \
   --input resources/data/Sample\ Data.xlsx \
   --output resources/data/sku_velocity_output \
   --a-limit 0.80 \
-  --b-limit 0.95
+  --b-limit 0.95 \
+  --chilled-output resources/data/demo_chilled_requirements.csv \
+  --chilled-rate 0.10 \
+  --chilled-seed 42
 ```
+
+The summary includes `req_max_item_length`, `req_max_item_width`,
+`req_max_item_height`, `req_max_item_weight`, `physical_data_status`, and
+`physical_storage_class`. Source dimensions are converted from centimetres to
+metres and source weights from grams to kilograms. Against the calibrated demo
+slot limits of 1.9 × 0.5 × 1.0 m and 12.5 kg, complete SKUs are classified as
+standard, oversize, overweight, or
+both. Missing weight is conservatively classified as overweight, missing size
+as oversize, and missing both usable size and weight as oversize plus
+overweight; the data status remains `MISSING`. During inventory slotting,
+weight `0` also disables the ergonomic weight heuristic for that SKU.
+
+The chilled demo selects 10% of sorted unique SKU IDs uniformly with seed 42.
+For the included 1,524-SKU summary this produces exactly 152 selected-only rows;
+SKUs absent from that file are ambient.
 
 The generated summary is the default SKU input for the Inventory Slotting tab
 in `rmf_grid_map_editor.py`.

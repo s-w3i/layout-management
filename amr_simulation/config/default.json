@@ -1,0 +1,27 @@
+{
+  "schema": "amr_simulation_config/v1",
+  "amr_count": 40,
+  "spawn_nodes": [
+    "G17_10", "G18_10", "G20_10", "G18_9", "G20_9",
+    "G0_0", "G0_1", "G0_10", "G0_11", "G0_12", "G0_13", "G0_14", "G0_15",
+    "G0_2", "G0_3", "G0_4", "G0_5", "G0_6", "G0_7", "G0_8", "G0_9",
+    "G11_1", "G11_10", "G11_12", "G11_13", "G11_14", "G11_15", "G11_2",
+    "G11_4", "G11_5", "G11_6", "G11_7", "G11_8", "G11_9",
+    "G12_1", "G12_10", "G12_12", "G12_13", "G12_14", "G12_15"
+  ],
+  "initial_heading_degrees": 0.0,
+  "workstations": ["WS_2_20", "WS_8_20", "WS_13_20", "WS_19_20", "WS_25_20", "WS_30_20"],
+  "store_workstation_overrides": {},
+  "jack_up_seconds": 4.0,
+  "jack_down_seconds": 4.0,
+  "service_seconds": 10.0,
+  "reservation_wait_seconds": 5.0,
+  "dram_conflict_wait_seconds": 15.0,
+  "motion": {
+    "max_linear_speed_mps": 1.5,
+    "linear_acceleration_mps2": 0.75,
+    "max_angular_speed_degps": 90.0,
+    "angular_acceleration_degps2": 90.0
+  },
+  "detailed_event_log": false
+}

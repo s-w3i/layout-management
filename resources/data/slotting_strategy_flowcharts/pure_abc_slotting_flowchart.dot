@@ -1,0 +1,41 @@
+digraph G {
+
+  graph [rankdir=TD, bgcolor="white", pad="0.35", nodesep="0.45", ranksep="0.55"];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=18, margin="0.18,0.12", color="#2563eb", fillcolor="#eff6ff", penwidth=2];
+  edge [fontname="Arial", fontsize=14, color="#475569", arrowsize=0.8, penwidth=1.6];
+
+  title [label="Pure ABC Slotting Strategy", shape=box, style="rounded,filled", fillcolor="#1e3a8a", fontcolor="white", color="#1e3a8a", fontsize=24, margin="0.25,0.16"];
+
+  start [label="Start slotting"];
+  load [label="Load SKU velocity data"];
+  abc [label="Classify SKU into ABC rank"];
+  sort [label="Sort by ABC priority\nand picking frequency"];
+  choose [label="Choose nearest available\nbuffer / rack"];
+  hard [label="Hard rules pass?", shape=diamond, fillcolor="#fef3c7", color="#d97706"];
+  next [label="Try next valid slot", fillcolor="#fff7ed", color="#ea580c"];
+  place [label="Place SKU"];
+  cap [label="Rack has remaining capacity?", shape=diamond, fillcolor="#fef3c7", color="#d97706"];
+  fill [label="Continue filling same rack"];
+  move [label="Move to next rack"];
+  done [label="All SKU processed?", shape=diamond, fillcolor="#fef3c7", color="#d97706"];
+  rank [label="Rank racks by assigned\npick frequency"];
+  output [label="Output slotting layout", fillcolor="#dcfce7", color="#16a34a"];
+  rules [label="Hard rules\n• chilled / ambient match\n• standard / exception segment match\n• real overweight only level 2\n• capacity available", fillcolor="#f8fafc", color="#64748b"];
+
+  title -> start;
+  start -> load -> abc -> sort -> choose -> hard;
+  hard -> next [label="No"];
+  next -> hard;
+  hard -> place [label="Yes"];
+  place -> cap;
+  cap -> fill [label="Yes"];
+  fill -> hard;
+  cap -> move [label="No"];
+  move -> choose;
+  place -> done;
+  done -> sort [label="No"];
+  done -> rank [label="Yes"];
+  rank -> output;
+  hard -> rules [style=dashed, arrowhead=none];
+
+}

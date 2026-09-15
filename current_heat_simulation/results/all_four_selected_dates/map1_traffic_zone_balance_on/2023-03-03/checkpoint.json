@@ -1,0 +1,11 @@
+{
+  "files": {
+    "blocking_hotspots.csv": "c1dba33c44e00dfdf5ddf07f66598df08ec018a1109843efc1e913194cdab1d2",
+    "rack_jobs.csv": "d58971ae84f97d49ad955d1880a8e61a9ff5d805b16e898884183dbe96ba0b1c",
+    "robots.csv": "0f0e71add7ffd7669b93fcfd7dcb23899945f4fa5e47d90e313d1ec46383832d",
+    "summary.json": "77d190b56d396b08aeb6f75552acf3a0b299fe732e74ab691ffb2665e80b936f",
+    "tasks.csv": "502145ce7b65447a4c9df76b0b02fa46ca21d40705a2fb99920268c57679c784",
+    "workstations.csv": "9fbdd3f7a0d040f1f4195029994012bef856249c87d3e9f3a13226033ab47ff3"
+  },
+  "fingerprint": "355e1f1e63affcdc583b37482a475c19f699802c9b30a084820c35d097dbf60d"
+}
