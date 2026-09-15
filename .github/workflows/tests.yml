@@ -16,5 +16,5 @@ jobs:
         with:
           python-version: '${{ matrix.python }}'
       - run: sudo apt-get update && sudo apt-get install -y python3-tk
-      - run: python -m pip install pytest PyYAML openpyxl numpy matplotlib pygame ortools
+      - run: python -m pip install pytest PyYAML openpyxl numpy matplotlib pygame ortools tqdm
       - run: python -m pytest -q
