@@ -382,6 +382,7 @@ class SlottingService:
             if stock is not None:
                 for key in (
                     "total_required_ea",
+                    "total_slotted_ea",
                     "units_per_slot",
                     "slots_per_unit",
                     "required_slots",
@@ -396,10 +397,12 @@ class SlottingService:
             for row in result:
                 try:
                     quantity = float(row["total_required_ea"])
+                    slotted = float(row["total_slotted_ea"])
                     slots = float(row["required_slots"])
                     valid = (
                         math.isfinite(quantity) and math.isfinite(slots)
-                        and quantity >= 0 and slots >= 0
+                        and math.isfinite(slotted)
+                        and quantity >= 0 and slotted >= 0 and slots >= 0
                         and (quantity == 0) == (slots == 0)
                     )
                 except (KeyError, TypeError, ValueError):

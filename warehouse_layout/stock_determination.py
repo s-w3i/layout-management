@@ -20,12 +20,20 @@ CSV_FIELDS = (
     "observation_end",
     "observation_days",
     "total_demand_ea",
+    "total_demand_uom",
     "average_daily_demand_ea",
+    "average_daily_demand_uom",
     "minimum_stock_days",
     "minimum_stock_ea",
+    "minimum_stock_uom",
     "buffer_stock_days",
     "minimum_buffer_stock_ea",
+    "minimum_buffer_stock_uom",
     "total_required_ea",
+    "total_slotted_ea",
+    "uom_conversion_qty",
+    "total_required_uom",
+    "total_slotted_uom",
     "attribute_combination",
     "units_per_slot",
     "slots_per_unit",
@@ -74,7 +82,7 @@ def _sku_value(value) -> str:
     return str(value).strip()
 
 
-def read_demand_workbook(path: Path) -> Iterator[tuple[str, date, float]]:
+def read_demand_workbook(path: Path) -> Iterator[tuple[str, date, float, float]]:
     """Yield valid ``(sku, date, nonnegative demand)`` rows from an XLSX file."""
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
@@ -96,6 +104,7 @@ def read_demand_workbook(path: Path) -> Iterator[tuple[str, date, float]]:
                 + ", ".join(REQUIRED_COLUMNS)
             )
 
+        conversion_index = positions.get("UOM ConversionQty")
         for values in rows:
             sku_index = positions["Item or SKU"]
             date_index = positions["Date"]
@@ -113,10 +122,15 @@ def read_demand_workbook(path: Path) -> Iterator[tuple[str, date, float]]:
                 )
             except (TypeError, ValueError):
                 quantity = 0.0
+            try:
+                conversion = float(values[conversion_index]) if conversion_index is not None and values[conversion_index] not in (None, "") else 1.0
+            except (TypeError, ValueError):
+                conversion = 1.0
+            if not math.isfinite(conversion) or conversion <= 0:
+                conversion = 1.0
             if sku and demand_date is not None:
-                yield sku, demand_date, (
-                    quantity if math.isfinite(quantity) and quantity > 0 else 0.0
-                )
+                quantity = quantity if math.isfinite(quantity) and quantity > 0 else 0.0
+                yield sku, demand_date, quantity, conversion
     finally:
         workbook.close()
 
@@ -148,9 +162,12 @@ def calculate_stock_requirements(
         raise ValueError("buffer stock days cannot be negative")
 
     totals: dict[str, float] = defaultdict(float)
+    max_conversions: dict[str, float] = defaultdict(float)
     first_date = None
     last_date = None
-    for sku, demand_date, quantity in transactions:
+    for transaction in transactions:
+        sku, demand_date, quantity = transaction[:3]
+        conversion = transaction[3] if len(transaction) > 3 else 1.0
         sku = _sku_value(sku)
         if not sku or not isinstance(demand_date, date):
             continue
@@ -158,7 +175,14 @@ def calculate_stock_requirements(
             quantity = float(quantity)
         except (TypeError, ValueError):
             quantity = 0.0
+        try:
+            conversion = float(conversion)
+        except (TypeError, ValueError):
+            conversion = 1.0
+        if not math.isfinite(conversion) or conversion <= 0:
+            conversion = 1.0
         totals[sku] += quantity if math.isfinite(quantity) and quantity > 0 else 0.0
+        max_conversions[sku] = max(max_conversions[sku], conversion)
         first_date = (
             demand_date if first_date is None else min(first_date, demand_date)
         )
@@ -170,7 +194,10 @@ def calculate_stock_requirements(
     results = []
     for sku in sorted(totals, key=lambda value: (value.casefold(), value)):
         total = totals[sku]
+        conversion = max_conversions[sku] or 1.0
+        total_uom = total / conversion
         daily = total / observation_days
+        daily_uom = total_uom / observation_days
         minimum = math.ceil(daily * minimum_stock_days)
         # Round the complete coverage target once. Rounding the minimum and
         # buffer independently can add an unnecessary unit and therefore an
@@ -179,18 +206,32 @@ def calculate_stock_requirements(
             daily * (minimum_stock_days + buffer_stock_days)
         )
         buffer = total_required - minimum
+        # Convert the authoritative EA targets after rounding. This keeps UOM
+        # targets aligned with the rack-sizing quantity.
+        minimum_uom = math.ceil(minimum / conversion)
+        total_required_uom = math.ceil(total_required / conversion)
+        total_slotted_uom = total_required_uom
+        total_slotted_ea = math.ceil(total_slotted_uom * conversion)
         results.append({
             "sku": sku,
             "observation_start": first_date.isoformat(),
             "observation_end": last_date.isoformat(),
             "observation_days": observation_days,
             "total_demand_ea": round(total, 4),
+            "total_demand_uom": round(total_uom, 4),
             "average_daily_demand_ea": round(daily, 4),
+            "average_daily_demand_uom": round(daily_uom, 4),
             "minimum_stock_days": minimum_stock_days,
             "minimum_stock_ea": minimum,
+            "minimum_stock_uom": minimum_uom,
             "buffer_stock_days": buffer_stock_days,
             "minimum_buffer_stock_ea": buffer,
+            "minimum_buffer_stock_uom": total_required_uom - minimum_uom,
             "total_required_ea": total_required,
+            "total_slotted_ea": total_slotted_ea,
+            "uom_conversion_qty": round(conversion, 4),
+            "total_required_uom": total_required_uom,
+            "total_slotted_uom": total_slotted_uom,
         })
     return results
 
@@ -561,7 +602,7 @@ def calculate_rack_requirements(
                     status = "CALCULATED_MULTI_SLOT"
                 else:
                     status = "ITEM_DOES_NOT_FIT"
-        total_required = max(0, int(math.ceil(float(row["total_required_ea"]))))
+        total_required = max(0, int(math.ceil(float(row["total_slotted_ea"]))))
         if slot_max_weight is not None:
             weight_units_per_slot = (
                 max(1, math.floor(slot_max_weight / item_weight))

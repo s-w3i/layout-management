@@ -72,7 +72,7 @@ class ZoneWorkloadTests(unittest.TestCase):
         self.assertEqual(balanced_zone_candidates(candidates, {}, {"small": 2, "large": 4}, 0), candidates)
 
     def test_replica_demand_is_not_double_counted(self):
-        self.skus = [dict(self.skus[0], pick_frequency=90, required_slots=2, total_required_ea=3, slots_per_unit=1)]
+        self.skus = [dict(self.skus[0], pick_frequency=90, required_slots=2, total_required_ea=3, total_slotted_ea=3, slots_per_unit=1)]
         rows, summary = self.generate("basic", zone_workload_enabled=True)
         self.assertEqual(len(rows), 2)
         self.assertEqual(sorted(v["demand"] for v in summary["zone_workload"].values()), [0, 90])
@@ -82,8 +82,8 @@ class ZoneWorkloadTests(unittest.TestCase):
 
     def test_same_sku_fills_rack_contiguously_until_limit(self):
         self.skus = [
-            dict(self.skus[0], required_slots=5, total_required_ea=5, slots_per_unit=1),
-            dict(self.skus[1], required_slots=1, total_required_ea=1, slots_per_unit=1),
+            dict(self.skus[0], required_slots=5, total_required_ea=5, total_slotted_ea=5, slots_per_unit=1),
+            dict(self.skus[1], required_slots=1, total_required_ea=1, total_slotted_ea=1, slots_per_unit=1),
         ]
         for strategy in ("basic", "abc_affinity"):
             with self.subTest(strategy=strategy):
@@ -109,7 +109,7 @@ class ZoneWorkloadTests(unittest.TestCase):
 
     def test_same_sku_moves_to_another_level_when_level_is_full(self):
         self.skus = [dict(
-            self.skus[0], required_slots=3, total_required_ea=3,
+            self.skus[0], required_slots=3, total_required_ea=3, total_slotted_ea=3,
             slots_per_unit=1,
         )]
         rows, _ = self.generate(
@@ -132,7 +132,7 @@ class ZoneWorkloadTests(unittest.TestCase):
         requirements = {key: 0.5 for key in PHYSICAL_ATTRIBUTE_KEYS}
         requirements["max_item_width"] = 3.0
         self.skus = [dict(
-            self.skus[0], required_slots=6, total_required_ea=2,
+            self.skus[0], required_slots=6, total_required_ea=2, total_slotted_ea=2,
             slots_per_unit=3, sku_requirements=requirements,
         )]
         rows, _ = self.generate(

@@ -78,7 +78,7 @@ def expand_quantity_slot_loads(sku_rows: list[dict]) -> tuple[list[dict], dict]:
             row.setdefault("inventory_load_id", legacy_id)
             row.setdefault("quantity_load_index", 1)
             row.setdefault("quantity_load_count", 1)
-            row.setdefault("quantity_ea", row.get("total_required_ea", ""))
+            row.setdefault("quantity_ea", row.get("total_slotted_ea", ""))
             expanded.append(row)
             continue
         try:
@@ -87,7 +87,7 @@ def expand_quantity_slot_loads(sku_rows: list[dict]) -> tuple[list[dict], dict]:
                 1, int(math.ceil(float(row.get("slots_per_unit") or 1)))
             )
             total_required = max(
-                0, int(math.ceil(float(row.get("total_required_ea") or 0)))
+                0, int(math.ceil(float(row["total_slotted_ea"] or 0)))
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(

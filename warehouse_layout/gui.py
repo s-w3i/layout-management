@@ -741,8 +741,6 @@ class GridMapEditorApp:
 
     def _build_stock_tab(self, parent):
         self.stock_input_path = tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
-        self.stock_minimum_days = tk.StringVar(value="2")
-        self.stock_buffer_days = tk.StringVar(value="1")
         self.stock_slot_length = tk.StringVar(
             value=str(self.project.warehouse_storage_defaults["max_item_length"])
         )
@@ -772,6 +770,8 @@ class GridMapEditorApp:
             value=f"{default_slot_load_weight:g}"
         )
         self.stock_storage_system = tk.StringVar(value=self.grid_storage_system.get())
+        self.stock_minimum_days = tk.StringVar(value="2")
+        self.stock_buffer_days = tk.StringVar(value="1")
         self.stock_machine_capacity_values = {
             key: tk.StringVar(
                 value=(
@@ -825,26 +825,10 @@ class GridMapEditorApp:
             row=1, column=0, columnspan=3, sticky="w", pady=(5, 4)
         )
         ttk.Label(day_controls, text="Minimum stock coverage").pack(side="left")
-        ttk.Spinbox(
-            day_controls,
-            from_=1,
-            to=365,
-            increment=1,
-            textvariable=self.stock_minimum_days,
-            width=6,
-        ).pack(side="left", padx=(6, 3))
+        ttk.Spinbox(day_controls, from_=1, to=365, textvariable=self.stock_minimum_days, width=6).pack(side="left", padx=(6, 3))
         ttk.Label(day_controls, text="days").pack(side="left")
-        ttk.Label(day_controls, text="Buffer stock coverage").pack(
-            side="left", padx=(20, 0)
-        )
-        ttk.Spinbox(
-            day_controls,
-            from_=0,
-            to=365,
-            increment=1,
-            textvariable=self.stock_buffer_days,
-            width=6,
-        ).pack(side="left", padx=(6, 3))
+        ttk.Label(day_controls, text="Buffer stock coverage").pack(side="left", padx=(20, 0))
+        ttk.Spinbox(day_controls, from_=0, to=365, textvariable=self.stock_buffer_days, width=6).pack(side="left", padx=(6, 3))
         ttk.Label(day_controls, text="days").pack(side="left")
         self.stock_calculate_button = ttk.Button(
             day_controls,
@@ -863,7 +847,8 @@ class GridMapEditorApp:
             controls,
             text=(
                 "Formula: ceil(average daily demand × (minimum + buffer days)). "
-                "The workbook's inclusive calendar span supplies the daily average."
+                "The workbook's inclusive calendar span supplies the daily average. "
+                "UOM values use Quantity (in EA) ÷ UOM ConversionQty."
             ),
             foreground="#4d646d",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 1))
@@ -977,33 +962,23 @@ class GridMapEditorApp:
         results.columnconfigure(0, weight=1)
         results.rowconfigure(0, weight=1)
         columns = (
-            "sku", "daily", "minimum_days", "minimum", "buffer_days",
-            "buffer", "total", "units_slot", "slots_unit",
-            "required_slots", "required_racks", "status",
+            "sku", "minimum", "buffer", "total", "uom_needed", "conversion", "slotted",
         )
         self.stock_tree = ttk.Treeview(
             results, columns=columns, show="headings", height=20
         )
         headings = {
             "sku": "SKU",
-            "daily": "Avg daily demand (EA)",
-            "minimum_days": "Minimum days",
             "minimum": "Minimum stock (EA)",
-            "buffer_days": "Buffer days",
             "buffer": "Buffer stock (EA)",
             "total": "Total required (EA)",
-            "units_slot": "EA / slot",
-            "slots_unit": "Slots / EA",
-            "required_slots": "Required slots",
-            "required_racks": "Required racks",
-            "status": "Rack status",
+            "uom_needed": "UOM needed",
+            "conversion": "UOM conversion qty",
+            "slotted": "Total slotted (EA)",
         }
         widths = {
-            "sku": 190, "daily": 145, "minimum_days": 105,
-            "minimum": 140, "buffer_days": 95, "buffer": 135,
-            "total": 140,
-            "units_slot": 90, "slots_unit": 90,
-            "required_slots": 105, "required_racks": 105, "status": 165,
+            "sku": 190, "minimum": 140, "buffer": 140, "total": 140,
+            "uom_needed": 120, "conversion": 150, "slotted": 140,
         }
         for column in columns:
             self.stock_tree.heading(column, text=headings[column])
@@ -1218,17 +1193,12 @@ class GridMapEditorApp:
         for row in rows:
             self.stock_tree.insert("", "end", values=(
                 row["sku"],
-                f'{row["average_daily_demand_ea"]:g}',
-                row["minimum_stock_days"],
                 row["minimum_stock_ea"],
-                row["buffer_stock_days"],
                 row["minimum_buffer_stock_ea"],
                 row["total_required_ea"],
-                row["units_per_slot"] or "—",
-                row["slots_per_unit"] or "—",
-                row["required_slots"] if row["required_slots"] != "" else "—",
-                row["required_racks"] if row["required_racks"] != "" else "—",
-                row["rack_calculation_status"],
+                row["total_required_uom"],
+                row["uom_conversion_qty"],
+                row["total_slotted_ea"],
             ))
         for row in combinations:
             self.stock_combination_tree.insert("", "end", values=(
