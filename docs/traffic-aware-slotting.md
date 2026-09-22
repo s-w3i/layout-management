@@ -52,10 +52,11 @@ traffic optimization while unassigned rows are excluded, retained unchanged,
 and reported. A layout with no assigned inventory still stops.
 
 C&TBSA follows Lee, Chung, and Yoon (2020): Stage 1 clusters inventory items and
-Stage 2 assigns the clusters
-to storage areas. For this AMR warehouse, one complete shelf is one storage
-area and its levels/slots are the paper's individual storage locations.
-Physical-exception or incomplete-data shelves remain fixed and are reported.
+Stage 2 assigns the clusters to storage areas. For AMR, one complete shelf is
+one storage area. For Mini-load and Pallet ASRS, one rack is a storage area and
+its tote or pallet slots are the paper's individual storage locations.
+Physical-exception, multi-slot, or incomplete-data racks remain fixed and are
+reported.
 
 ## Hard constraints
 
@@ -98,10 +99,10 @@ The paper model enforces:
 4. `x(j,k)` is binary. The permutation chromosome and fixed-capacity section
    boundaries preserve the first two constraints during NSGA-II operations.
 
-The warehouse implementation adds non-paper safety constraints: AMR-shelf
-storage only, unique occupied addresses, separation by every map-active SKU
-attribute profile, inherited attribute compatibility, and physical capacity
-checks. Oversize, overweight,
+The warehouse implementation adds non-paper safety constraints: supported AMR
+shelf or ASRS slot storage, unique occupied addresses, separation by every
+map-active SKU attribute profile, inherited attribute compatibility, and
+physical capacity checks. Oversize, overweight,
 multi-slot, incomplete-data, or otherwise exceptional racks remain fixed because
 the paper assumes one SKU occupies one ordinary storage location. These additions
 restrict feasibility but do not change either paper objective. Quantity support
@@ -173,16 +174,16 @@ its quantity loads. Loads of the same SKU have no artificial self-correlation;
 correlation with other SKUs remains inherited from `N(j,j')`. The original
 maximum-cluster-demand and correlation objectives are otherwise unchanged.
 
-A chromosome is a permutation divided into shelf-capacity sections. Empty shelf
+A chromosome is a permutation divided into rack-capacity sections. Empty rack
 slots are zero-demand dummy genes. NSGA-II uses the paper's final settings:
 population 100, PMX crossover probability 0.9, 2-opt swap mutation probability
 0.1, and 50,000 generations. Five evenly distributed Pareto representatives
 are retained and balanced solution `C&TBSA3` is selected by default.
 
-In Stage 2, clusters are sorted by decreasing demand and assigned to shelves in
-increasing average workstation distance. Load order within a shelf is randomized
+In Stage 2, clusters are sorted by decreasing demand and assigned to racks in
+increasing average workstation distance. Load order within a rack is randomized
 with a recorded seed. Chilled inventory uses a separate feasibility stratum;
-oversize, overweight, multi-slot, or incomplete-data exception shelves remain
+oversize, overweight, multi-slot, or incomplete-data exception racks remain
 fixed so each exceptional load retains its required physical footprint.
 
 Expected lane load is calculated only after placement. It is a static diagnostic

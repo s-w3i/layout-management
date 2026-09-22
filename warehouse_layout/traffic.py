@@ -965,9 +965,11 @@ class TrafficAwareSlottingService:
     ) -> TrafficOptimizationResult:
         """Run the paper's two-stage C&TBSA method."""
         baseline_rows = copy.deepcopy(payload.get("assignments") or [])
-        if str(payload.get("handling_unit_type", "")) != "AMR shelf":
+        handling_unit_type = str(payload.get("handling_unit_type", ""))
+        if handling_unit_type not in {"AMR shelf", "Tote", "Pallet"}:
             raise ValueError(
-                "paper-replication C&TBSA currently requires AMR shelf storage"
+                "paper-replication C&TBSA requires AMR shelf, Tote, or Pallet "
+                "storage"
             )
         rack_capacity = payload.get("rack_capacity") or {}
         levels = int(rack_capacity.get("levels") or 1)
@@ -985,6 +987,7 @@ class TrafficAwareSlottingService:
             analysis,
             levels_per_rack=levels,
             slots_per_level=slots,
+            handling_unit_type=handling_unit_type,
             zone_assignments=payload.get("zone_assignments") or {},
             location_attributes=payload.get("location_attributes") or {},
             attribute_catalog=payload.get("attribute_catalog"),
@@ -1016,7 +1019,7 @@ class TrafficAwareSlottingService:
             source_rows,
             levels,
             slots,
-            "AMR shelf",
+            handling_unit_type,
             zone_assignments=payload.get("zone_assignments") or {},
             attribute_catalog=payload.get("attribute_catalog"),
             location_attributes=copy.deepcopy(

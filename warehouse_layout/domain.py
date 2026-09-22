@@ -90,6 +90,53 @@ STORAGE_SYSTEMS = {
 }
 
 
+def build_slot_geometry(
+    rack_id: str,
+    rack_x: float,
+    rack_y: float,
+    spacing_x: float,
+    spacing_y: float,
+    rack_height_m: float,
+    levels_per_rack: int,
+    slots_per_level: int,
+    clearance_m: float = 0.05,
+) -> list[dict[str, Any]]:
+    """Return physical slot cuboids whose coordinates identify their centres."""
+    values = (rack_x, rack_y, spacing_x, spacing_y, rack_height_m, clearance_m)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not math.isfinite(value) for value in values):
+        raise ValueError("slot geometry dimensions and coordinates must be finite numbers")
+    if clearance_m < 0:
+        raise ValueError("slot clearance cannot be negative")
+    if spacing_x <= 2 * clearance_m or spacing_y <= 2 * clearance_m:
+        raise ValueError("grid spacing must exceed twice the slot clearance")
+    if rack_height_m <= 2 * clearance_m:
+        raise ValueError("rack height must exceed twice the slot clearance")
+    if levels_per_rack < 1 or slots_per_level < 1:
+        raise ValueError("storage levels and slots per level must be at least 1")
+
+    rack_width = spacing_x - 2 * clearance_m
+    rack_length = spacing_y - 2 * clearance_m
+    usable_height = rack_height_m - 2 * clearance_m
+    slot_width = rack_width / slots_per_level
+    slot_height = usable_height / levels_per_rack
+    return [
+        {
+            "rack_id": rack_id,
+            "level": level,
+            "slot": slot,
+            "center_x": rack_x - rack_width / 2 + (slot - 0.5) * slot_width,
+            "center_y": rack_y,
+            "center_z": clearance_m + (level - 0.5) * slot_height,
+            "length": rack_length,
+            "width": slot_width,
+            "height": slot_height,
+        }
+        for level in range(1, levels_per_rack + 1)
+        for slot in range(1, slots_per_level + 1)
+    ]
+
+
 @dataclass
 class StorageLayout:
     """Empty static buffers generated from rack markers in an editable project."""
@@ -97,6 +144,9 @@ class StorageLayout:
     system_type: str = "AMR"
     levels_per_rack: int = 3
     slots_per_level: int = 4
+    rack_height_m: float = 3.1
+    clearance_m: float = 0.05
+    slots: list[dict[str, Any]] = field(default_factory=list)
     buffers: list[dict[str, Any]] = field(default_factory=list)
     machine_carrying_capacity: dict[str, float | None] = field(default_factory=dict)
 
@@ -113,6 +163,25 @@ class StorageLayout:
             raise ValueError(f"unsupported storage system: {self.system_type}")
         if self.levels_per_rack < 1 or self.slots_per_level < 1:
             raise ValueError("storage levels and slots per level must be at least 1")
+        if (
+            not math.isfinite(self.rack_height_m)
+            or not math.isfinite(self.clearance_m)
+            or self.clearance_m < 0
+            or self.rack_height_m <= 2 * self.clearance_m
+        ):
+            raise ValueError("rack height must exceed twice the non-negative clearance")
+        slot_keys = set()
+        for item in self.slots:
+            key = (str(item.get("rack_id", "")), int(item.get("level", 0)), int(item.get("slot", 0)))
+            if not key[0] or key[1] < 1 or key[2] < 1 or key in slot_keys:
+                raise ValueError("storage slot geometry has an invalid or duplicate address")
+            slot_keys.add(key)
+            for field_name in ("center_x", "center_y", "center_z", "length", "width", "height"):
+                value = item.get(field_name)
+                if not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError(f"storage slot {field_name} must be finite")
+                if field_name in {"length", "width", "height"} and value <= 0:
+                    raise ValueError(f"storage slot {field_name} must be greater than zero")
         identifiers: set[str] = set()
         for item in self.buffers:
             if not isinstance(item, dict):
@@ -139,16 +208,26 @@ class StorageLayout:
             "handling_unit_type": self.handling_unit_type,
             "levels_per_rack": self.levels_per_rack,
             "slots_per_level": self.slots_per_level,
+            "rack_height_m": self.rack_height_m,
+            "clearance_m": self.clearance_m,
+            "slots": [dict(item) for item in self.slots],
             "machine_carrying_capacity": dict(self.machine_carrying_capacity),
             "buffers": [dict(item) for item in self.buffers],
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "StorageLayout":
+        levels = int(value.get("levels_per_rack", 3))
         layout = cls(
             system_type=str(value.get("system_type", "AMR")),
-            levels_per_rack=int(value.get("levels_per_rack", 3)),
+            levels_per_rack=levels,
             slots_per_level=int(value.get("slots_per_level", 4)),
+            rack_height_m=float(value.get(
+                "rack_height_m",
+                levels * DEFAULT_SLOT_CAPACITY["max_item_height"] + 0.10,
+            )),
+            clearance_m=float(value.get("clearance_m", 0.05)),
+            slots=[dict(item) for item in value.get("slots", [])],
             buffers=[dict(item) for item in value.get("buffers", [])],
             machine_carrying_capacity=dict(
                 value.get("machine_carrying_capacity") or {}
@@ -343,6 +422,17 @@ class GridProject:
             )
             if len(self.storage_layout.buffers) != len(rack_positions) * expected_per_rack:
                 raise ValueError("storage buffer catalog is incomplete for its capacity")
+            expected_slot_count = (
+                len(rack_positions)
+                * self.storage_layout.levels_per_rack
+                * self.storage_layout.slots_per_level
+            )
+            if len(self.storage_layout.slots) != expected_slot_count:
+                raise ValueError("storage slot geometry is incomplete for its capacity")
+            if {item["rack_id"] for item in self.storage_layout.slots} != {
+                self.vertex_name(*position) for position in rack_positions
+            }:
+                raise ValueError("storage slot geometry must match rack grid vertices")
             for item in self.storage_layout.buffers:
                 column, row = int(item["column"]), int(item["row"])
                 waypoint = self.vertex_name(column, row)
@@ -701,19 +791,48 @@ class GridProject:
                     and key != "oversize_capable"
                 ]
             )
+        if project.storage_layout is not None and not project.storage_layout.slots:
+            project.refresh_slot_geometry()
         project.validate()
         return project
 
+    def refresh_slot_geometry(self) -> None:
+        """Recalculate persisted slot cuboids from current rack coordinates."""
+        layout = self.storage_layout
+        if layout is None:
+            return
+        layout.slots = []
+        for position, marker in sorted(self.markers.items()):
+            if marker.role != "rack":
+                continue
+            rack_id = self.vertex_name(*position)
+            rack_x, rack_y = self.coordinates(*position)
+            layout.slots.extend(build_slot_geometry(
+                rack_id, rack_x, rack_y,
+                self.grid.spacing_m, self.grid.spacing_y_m,
+                layout.rack_height_m, layout.levels_per_rack,
+                layout.slots_per_level, layout.clearance_m,
+            ))
+
     def assign_storage_buffers(
-        self, system_type: str, levels_per_rack: int, slots_per_level: int
+        self, system_type: str, levels_per_rack: int, slots_per_level: int,
+        rack_height_m: float | None = None, clearance_m: float = 0.05,
     ) -> StorageLayout:
         """Replace the project buffer catalog using the current rack markers."""
+        rack_height = (
+            levels_per_rack * DEFAULT_SLOT_CAPACITY["max_item_height"] + 0.10
+            if rack_height_m is None else rack_height_m
+        )
         layout = StorageLayout(
-            system_type,
-            levels_per_rack,
-            slots_per_level,
+            system_type=system_type,
+            levels_per_rack=levels_per_rack,
+            slots_per_level=slots_per_level,
+            rack_height_m=rack_height,
+            clearance_m=clearance_m,
             machine_carrying_capacity=dict(self.machine_carrying_capacity),
         )
+        if self.grid.spacing_m <= 2 * clearance_m or self.grid.spacing_y_m <= 2 * clearance_m:
+            raise ValueError("grid spacing must exceed twice the slot clearance")
         for (column, row), marker in sorted(
             self.markers.items(), key=lambda item: (item[0][1], item[0][0])
         ):
@@ -740,8 +859,9 @@ class GridProject:
                         "level": level,
                         "slot": slot,
                     })
-        layout.validate()
         self.storage_layout = layout
+        self.refresh_slot_geometry()
+        layout.validate()
         return layout
 
     def to_building_dict(self) -> dict:

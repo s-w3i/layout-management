@@ -198,6 +198,15 @@ class GridMapEditorApp:
         self.grid_storage_slots = tk.StringVar(
             value=str(storage_layout.slots_per_level if storage_layout else 4)
         )
+        self.grid_rack_height = tk.StringVar(
+            value=str(storage_layout.rack_height_m if storage_layout else 3.1)
+        )
+        self.grid_clearance = tk.StringVar(
+            value=str(storage_layout.clearance_m if storage_layout else 0.05)
+        )
+        self.grid_slot_recommendation = tk.StringVar()
+        self.grid_view_mode = tk.StringVar(value="2D")
+        self.grid_slot_detail = tk.StringVar(value="Select a slot to inspect it.")
         self.grid_buffer_summary = tk.StringVar(
             value=(
                 f"{len(storage_layout.buffers)} empty {storage_layout.buffer_level} buffer(s)"
@@ -216,6 +225,12 @@ class GridMapEditorApp:
         self.status = tk.StringVar(value="Bottom-left grid point is (0, 0)")
         self.canvas_viewports = {}
         self._build_ui()
+        for variable in (
+            self.spacing, self.spacing_y, self.grid_storage_levels,
+            self.grid_storage_slots, self.grid_rack_height, self.grid_clearance,
+        ):
+            variable.trace_add("write", lambda *_args: self.update_slot_recommendation())
+        self.update_slot_recommendation()
         self.sync_grid_sku_overlay_attribute_list()
         self.root.bind_all("<Control-z>", self.undo)
         self.root.bind_all("<Control-y>", self.redo)
@@ -477,7 +492,7 @@ class GridMapEditorApp:
             self.grid_map_panes, padding=(0, 12, 12, 12)
         )
         canvas_frame.columnconfigure(0, weight=1)
-        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.rowconfigure(1, weight=1)
         self.grid_map_panes.add(sidebar, weight=0)
         self.grid_map_panes.add(canvas_frame, weight=1)
 
@@ -595,10 +610,22 @@ class GridMapEditorApp:
         )
         buffer_capacity = ttk.Frame(left)
         buffer_capacity.grid(row=27, column=0, columnspan=2, sticky="w", pady=3)
-        ttk.Label(buffer_capacity, text="Levels").pack(side="left")
-        ttk.Spinbox(buffer_capacity, from_=1, to=100, textvariable=self.grid_storage_levels, width=4).pack(side="left", padx=(4, 8))
-        ttk.Label(buffer_capacity, text="Slots/level").pack(side="left")
-        ttk.Spinbox(buffer_capacity, from_=1, to=100, textvariable=self.grid_storage_slots, width=4).pack(side="left", padx=(4, 0))
+        ttk.Label(buffer_capacity, text="Levels").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(buffer_capacity, from_=1, to=100, textvariable=self.grid_storage_levels, width=4).grid(row=0, column=1, padx=(4, 8))
+        ttk.Label(buffer_capacity, text="Slots/level").grid(row=0, column=2, sticky="w")
+        ttk.Spinbox(buffer_capacity, from_=1, to=100, textvariable=self.grid_storage_slots, width=4).grid(row=0, column=3, padx=(4, 0))
+        ttk.Label(buffer_capacity, text="Rack H (m)").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(buffer_capacity, textvariable=self.grid_rack_height, width=6).grid(row=1, column=1, sticky="w", padx=(4, 8), pady=(4, 0))
+        ttk.Label(buffer_capacity, text="Clearance").grid(row=1, column=2, sticky="w", pady=(4, 0))
+        ttk.Entry(buffer_capacity, textvariable=self.grid_clearance, width=6).grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(4, 0))
+        ttk.Label(
+            buffer_capacity, textvariable=self.grid_slot_recommendation,
+            foreground="#315b66",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Button(
+            buffer_capacity, text="Apply recommended dimensions",
+            command=self.apply_recommended_slot_dimensions,
+        ).grid(row=3, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         ttk.Label(left, textvariable=self.grid_machine_capacity_label).grid(
             row=28, column=0, sticky="w", pady=3
         )
@@ -697,17 +724,44 @@ class GridMapEditorApp:
         )
         self.update_machine_capacity_ui()
 
+        view_bar = ttk.Frame(canvas_frame)
+        view_bar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        ttk.Label(view_bar, text="View").pack(side="left")
+        for mode in ("2D", "3D"):
+            ttk.Radiobutton(
+                view_bar, text=mode, value=mode, variable=self.grid_view_mode,
+                command=self.show_grid_view,
+            ).pack(side="left", padx=(5, 0))
+        ttk.Label(
+            view_bar, textvariable=self.grid_slot_detail, foreground="#315b66",
+        ).pack(side="left", padx=(16, 0))
+
         self.canvas = tk.Canvas(canvas_frame, background="white", highlightthickness=1, highlightbackground="#9aa8ae")
-        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas.grid(row=1, column=0, sticky="nsew")
         self.canvas.bind("<Button-1>", self.canvas_click)
         self.canvas.bind("<B1-Motion>", self.canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
         self.canvas.bind("<Delete>", self.delete_selected_grid_point)
         self.canvas.bind("<Configure>", lambda _event: self.redraw())
         self.enable_canvas_viewport(self.canvas)
-        ttk.Label(canvas_frame, textvariable=self.status).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.grid_3d_frame = ttk.Frame(canvas_frame)
+        self.grid_3d_canvas = None
+        self.grid_3d_azimuth = math.radians(40)
+        self.grid_3d_elevation = math.radians(28)
+        self.grid_3d_zoom = 1.0
+        self.grid_3d_drag = None
+        self.grid_3d_pan = None
+        self.grid_3d_offset = (0.0, 0.0)
+        self.grid_3d_quality = "idle"
+        self.grid_3d_redraw_after = None
+        self.grid_3d_idle_after = None
+        self.grid_3d_cache = None
+        self.grid_3d_canvas_size = None
+        self.grid_3d_items = {}
+        self.grid_3d_text_items = {}
+        ttk.Label(canvas_frame, textvariable=self.status).grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self.grid_dot_legend = ttk.Frame(canvas_frame)
-        self.grid_dot_legend.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.grid_dot_legend.grid(row=3, column=0, sticky="w", pady=(4, 0))
         self.grid_dot_legend_labels = []
         for column, (colour, label) in enumerate((
             ("#f3a712", "Unassigned rack"),
@@ -5765,6 +5819,7 @@ class GridMapEditorApp:
                 item for item in self.project.storage_layout.buffers
                 if (int(item["column"]), int(item["row"])) in self.project.markers
             ]
+            self.project.refresh_slot_geometry()
         self.selected = None
         self.selected_lane = None
         self.redraw()
@@ -5780,6 +5835,8 @@ class GridMapEditorApp:
         self.grid_storage_system.set(layout.system_type)
         self.grid_storage_levels.set(str(layout.levels_per_rack))
         self.grid_storage_slots.set(str(layout.slots_per_level))
+        self.grid_rack_height.set(str(layout.rack_height_m))
+        self.grid_clearance.set(str(layout.clearance_m))
         if hasattr(self, "stock_rack_levels"):
             self.stock_rack_levels.set(str(layout.levels_per_rack))
             self.stock_slots_per_level.set(str(layout.slots_per_level))
@@ -5790,6 +5847,7 @@ class GridMapEditorApp:
             f"dynamic unit {layout.handling_unit_type}"
         )
         self.update_machine_capacity_ui()
+        self.update_slot_recommendation()
 
     def update_machine_capacity_ui(self):
         """Show the carrying dimensions used by the selected machine type."""
@@ -5838,6 +5896,12 @@ class GridMapEditorApp:
         for key, variable in self.grid_warehouse_capacity_values.items():
             variable.set(str(self.project.warehouse_storage_defaults[key]))
         if hasattr(self, "stock_slot_weight"):
+            for key, variable in (
+                ("max_item_length", self.stock_slot_length),
+                ("max_item_width", self.stock_slot_width),
+                ("max_item_height", self.stock_slot_height),
+            ):
+                variable.set(str(self.project.warehouse_storage_defaults[key]))
             slot_weight = self.project.warehouse_storage_defaults[
                 "max_item_weight"
             ]
@@ -5904,11 +5968,14 @@ class GridMapEditorApp:
             self.grid_buffer_summary.set(
                 "Rack markers changed; assign storage buffers again."
             )
+            self.grid_slot_detail.set("Assign storage buffers to generate the 3D view.")
 
     def assign_grid_buffers(self):
         try:
             levels = int(self.grid_storage_levels.get())
             slots = int(self.grid_storage_slots.get())
+            rack_height = float(self.grid_rack_height.get())
+            clearance = float(self.grid_clearance.get())
             if not any(marker.role == "rack" for marker in self.project.markers.values()):
                 raise ValueError("place at least one rack pickup before assigning buffers")
             machine_capacity = self.parse_machine_capacity(
@@ -5918,7 +5985,8 @@ class GridMapEditorApp:
             self.push_undo()
             self.project.machine_carrying_capacity = machine_capacity
             self.project.assign_storage_buffers(
-                self.grid_storage_system.get(), levels, slots
+                self.grid_storage_system.get(), levels, slots,
+                rack_height_m=rack_height, clearance_m=clearance,
             )
             self.project.validate()
         except (TypeError, ValueError) as exc:
@@ -5928,6 +5996,319 @@ class GridMapEditorApp:
         self.status.set(
             f"Assigned {len(self.project.storage_layout.buffers)} empty "
             f"{self.project.storage_layout.buffer_level} storage buffer(s)."
+        )
+
+    def recommended_slot_dimensions(self):
+        levels = int(self.grid_storage_levels.get())
+        slots = int(self.grid_storage_slots.get())
+        rack_height = float(self.grid_rack_height.get())
+        clearance = float(self.grid_clearance.get())
+        if levels < 1 or slots < 1:
+            raise ValueError("levels and slots per level must be positive")
+        spacing_x = float(self.spacing.get())
+        spacing_y = float(self.spacing_y.get())
+        if spacing_x <= 2 * clearance or spacing_y <= 2 * clearance:
+            raise ValueError("grid spacing must exceed twice the clearance")
+        if rack_height <= 2 * clearance:
+            raise ValueError("rack height must exceed twice the clearance")
+        return (
+            spacing_y - 2 * clearance,
+            (spacing_x - 2 * clearance) / slots,
+            (rack_height - 2 * clearance) / levels,
+        )
+
+    def update_slot_recommendation(self):
+        try:
+            length, width, height = self.recommended_slot_dimensions()
+            self.grid_slot_recommendation.set(
+                f"Recommended L/W/H: {length:.3f} / {width:.3f} / {height:.3f} m"
+            )
+        except (TypeError, ValueError):
+            self.grid_slot_recommendation.set("Recommended L/W/H: enter valid geometry")
+
+    def apply_recommended_slot_dimensions(self):
+        try:
+            values = self.recommended_slot_dimensions()
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("Recommended slot dimensions", str(exc))
+            return
+        for key, value in zip(
+            ("max_item_length", "max_item_width", "max_item_height"), values
+        ):
+            self.grid_warehouse_capacity_values[key].set(f"{value:.9g}")
+        self.apply_grid_warehouse_storage_defaults()
+
+    @staticmethod
+    def slot_cuboid_faces(slot):
+        x, y, z = (float(slot[name]) for name in ("center_x", "center_y", "center_z"))
+        dx, dy, dz = (float(slot[name]) / 2 for name in ("width", "length", "height"))
+        p = [
+            (x - dx, y - dy, z - dz), (x + dx, y - dy, z - dz),
+            (x + dx, y + dy, z - dz), (x - dx, y + dy, z - dz),
+            (x - dx, y - dy, z + dz), (x + dx, y - dy, z + dz),
+            (x + dx, y + dy, z + dz), (x - dx, y + dy, z + dz),
+        ]
+        return [[p[i] for i in face] for face in (
+            (0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
+            (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7),
+        )]
+
+    def show_grid_view(self):
+        if self.grid_view_mode.get() == "2D":
+            self.cancel_grid_3d_redraws()
+            self.grid_3d_frame.grid_remove()
+            self.canvas.grid(row=1, column=0, sticky="nsew")
+            self.grid_dot_legend.grid()
+            return
+        self.canvas.grid_remove()
+        self.grid_dot_legend.grid_remove()
+        self.grid_3d_frame.grid(row=1, column=0, sticky="nsew")
+        self.draw_grid_3d()
+
+    def draw_grid_3d(self):
+        layout = self.project.storage_layout
+        if layout is None or not layout.slots:
+            if self.grid_3d_canvas is not None:
+                self.grid_3d_canvas.delete("all")
+                self.grid_3d_items.clear()
+                self.grid_3d_text_items.clear()
+            self.grid_slot_detail.set("Assign storage buffers to generate the 3D view.")
+            return
+        if self.grid_3d_canvas is None:
+            self.grid_3d_canvas = tk.Canvas(
+                self.grid_3d_frame, background="#f7fafb", highlightthickness=1,
+                highlightbackground="#9aa8ae",
+            )
+            self.grid_3d_canvas.pack(fill="both", expand=True)
+            self.grid_3d_canvas.bind("<Configure>", self.on_grid_3d_configure)
+            self.grid_3d_canvas.bind("<ButtonPress-1>", self.start_grid_3d_rotation)
+            self.grid_3d_canvas.bind("<B1-Motion>", self.rotate_grid_3d)
+            self.grid_3d_canvas.bind("<ButtonRelease-1>", self.end_grid_3d_rotation)
+            self.grid_3d_canvas.bind("<ButtonPress-3>", self.start_grid_3d_pan)
+            self.grid_3d_canvas.bind("<B3-Motion>", self.pan_grid_3d)
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.grid_3d_canvas.bind(sequence, self.zoom_grid_3d)
+        canvas = self.grid_3d_canvas
+        width = max(300, canvas.winfo_width())
+        height = max(250, canvas.winfo_height())
+        cache = self.get_grid_3d_cache(layout)
+        all_points = cache["points"]
+        centre = cache["centre"]
+        rotated = [self.project_grid_3d(point, centre) for point in all_points]
+        span_x = max(value[0] for value in rotated) - min(value[0] for value in rotated)
+        span_y = max(value[1] for value in rotated) - min(value[1] for value in rotated)
+        scale = self.grid_3d_zoom * min((width - 80) / max(span_x, 1), (height - 80) / max(span_y, 1))
+
+        def screen(point):
+            x, y, depth = self.project_grid_3d(point, centre)
+            return (
+                width / 2 + self.grid_3d_offset[0] + x * scale,
+                height / 2 + self.grid_3d_offset[1] - y * scale,
+                depth,
+            )
+
+        colour = "#e7bd55" if layout.system_type == "AMR" else "#70add1"
+        faces = []
+        rack_tops = {}
+        face_indexes = (1, 3, 5) if self.grid_3d_quality == "interactive" else range(6)
+        render_groups = self.grid_3d_zoom < 1.3 and self.grid_3d_quality == "idle"
+        render_items = cache["groups"] if render_groups else cache["slots"]
+        for index, item in enumerate(render_items):
+            slot = item["slot"]
+            for face_index in face_indexes:
+                face = item["faces"][face_index]
+                projected = [screen(point) for point in face]
+                key = ("group" if render_groups else "slot", index, face_index)
+                faces.append((sum(point[2] for point in projected) / 4, key, projected))
+            rack_tops[slot["rack_id"]] = (
+                slot["center_x"], slot["center_y"], layout.rack_height_m
+            )
+        active_items = set()
+        for _depth, key, face in sorted(faces):
+            active_items.add(key)
+            coordinates = [coordinate for point in face for coordinate in point[:2]]
+            tags = ("slot3d", f"slot3d_{key[1]}") if key[0] == "slot" else ("lod3d",)
+            item_id = self.grid_3d_items.get(key)
+            if item_id is None:
+                item_id = canvas.create_polygon(
+                    coordinates, fill=colour, outline="#30434a", width=1,
+                    tags=tags,
+                )
+                self.grid_3d_items[key] = item_id
+            else:
+                canvas.coords(item_id, coordinates)
+                canvas.itemconfigure(item_id, state="normal", fill=colour, outline="#30434a")
+        for key, item_id in self.grid_3d_items.items():
+            if key not in active_items:
+                canvas.itemconfigure(item_id, state="hidden")
+        if self.grid_3d_quality == "idle":
+            for rack_id, (x, y, z) in rack_tops.items():
+                sx, sy, _depth = screen((x, y, z))
+                text_id = self.grid_3d_text_items.get(("rack", rack_id))
+                if text_id is None:
+                    text_id = canvas.create_text(sx, sy - 8, text=rack_id, anchor="s", fill="#20343d")
+                    self.grid_3d_text_items[("rack", rack_id)] = text_id
+                else:
+                    canvas.coords(text_id, sx, sy - 8)
+                    canvas.itemconfigure(text_id, state="normal")
+            help_id = self.grid_3d_text_items.get(("help", ""))
+            help_text = f"{layout.system_type} · drag to rotate · right-drag to pan · wheel to zoom"
+            if help_id is None:
+                self.grid_3d_text_items[("help", "")] = canvas.create_text(
+                    12, 12, anchor="nw", fill="#4d646d", text=help_text,
+                )
+            else:
+                canvas.itemconfigure(help_id, state="normal", text=help_text)
+        else:
+            for item_id in self.grid_3d_text_items.values():
+                canvas.itemconfigure(item_id, state="hidden")
+        canvas.tag_bind("slot3d", "<Button-1>", self.on_grid_3d_pick)
+
+    def get_grid_3d_cache(self, layout):
+        signature = (
+            id(layout), len(layout.slots), layout.rack_height_m, layout.clearance_m,
+            tuple(tuple(slot.get(key) for key in (
+                "rack_id", "level", "slot", "center_x", "center_y", "center_z",
+                "length", "width", "height",
+            )) for slot in layout.slots),
+        )
+        if self.grid_3d_cache is not None and self.grid_3d_cache["signature"] == signature:
+            return self.grid_3d_cache
+        slots = [{"slot": slot, "faces": self.slot_cuboid_faces(slot)} for slot in layout.slots]
+        grouped = {}
+        for item in slots:
+            slot = item["slot"]
+            grouped.setdefault((slot["rack_id"], slot["level"]), []).append(item)
+        groups = []
+        for (rack_id, level), items in sorted(grouped.items()):
+            points = [point for item in items for face in item["faces"] for point in face]
+            min_x, max_x = min(point[0] for point in points), max(point[0] for point in points)
+            min_y, max_y = min(point[1] for point in points), max(point[1] for point in points)
+            min_z, max_z = min(point[2] for point in points), max(point[2] for point in points)
+            group_slot = {
+                "rack_id": rack_id, "level": level, "slot": 0,
+                "center_x": (min_x + max_x) / 2, "center_y": (min_y + max_y) / 2,
+                "center_z": (min_z + max_z) / 2, "length": max_y - min_y,
+                "width": max_x - min_x, "height": max_z - min_z,
+            }
+            groups.append({"slot": group_slot, "faces": self.slot_cuboid_faces(group_slot)})
+        points = [point for item in slots for face in item["faces"] for point in face]
+        self.grid_3d_cache = {
+            "signature": signature,
+            "slots": slots,
+            "groups": groups,
+            "points": points,
+            "centre": (
+                sum(point[0] for point in points) / len(points),
+                sum(point[1] for point in points) / len(points),
+                0.0,
+            ),
+        }
+        return self.grid_3d_cache
+
+    def invalidate_grid_3d_cache(self):
+        self.grid_3d_cache = None
+
+    def cancel_grid_3d_redraws(self):
+        for name in ("grid_3d_redraw_after", "grid_3d_idle_after"):
+            callback = getattr(self, name)
+            if callback is not None:
+                self.root.after_cancel(callback)
+                setattr(self, name, None)
+
+    def schedule_grid_3d_redraw(self, *, interactive=None, idle=False):
+        if interactive is not None:
+            self.grid_3d_quality = "interactive" if interactive else "idle"
+        if idle:
+            if self.grid_3d_idle_after is not None:
+                self.root.after_cancel(self.grid_3d_idle_after)
+            self.grid_3d_idle_after = self.root.after(80, self.finish_grid_3d_interaction)
+            return
+        if self.grid_3d_redraw_after is None:
+            self.grid_3d_redraw_after = self.root.after(16, self.flush_grid_3d_redraw)
+
+    def flush_grid_3d_redraw(self):
+        self.grid_3d_redraw_after = None
+        if self.grid_view_mode.get() == "3D":
+            self.draw_grid_3d()
+
+    def finish_grid_3d_interaction(self):
+        self.grid_3d_idle_after = None
+        self.grid_3d_quality = "idle"
+        self.schedule_grid_3d_redraw()
+
+    def on_grid_3d_configure(self, event):
+        size = (event.width, event.height)
+        if size != self.grid_3d_canvas_size:
+            self.grid_3d_canvas_size = size
+            self.schedule_grid_3d_redraw()
+
+    def project_grid_3d(self, point, centre):
+        x, y, z = (point[index] - centre[index] for index in range(3))
+        cosine, sine = math.cos(self.grid_3d_azimuth), math.sin(self.grid_3d_azimuth)
+        horizontal = cosine * x - sine * y
+        depth_axis = sine * x + cosine * y
+        elevation_cosine = math.cos(self.grid_3d_elevation)
+        elevation_sine = math.sin(self.grid_3d_elevation)
+        return (
+            horizontal,
+            elevation_cosine * z - elevation_sine * depth_axis,
+            elevation_sine * z + elevation_cosine * depth_axis,
+        )
+
+    def start_grid_3d_rotation(self, event):
+        self.grid_3d_drag = (event.x, event.y)
+        self.schedule_grid_3d_redraw(interactive=True)
+
+    def rotate_grid_3d(self, event):
+        if self.grid_3d_drag is None:
+            return
+        old_x, old_y = self.grid_3d_drag
+        self.grid_3d_azimuth += (event.x - old_x) * 0.01
+        self.grid_3d_elevation = max(
+            math.radians(5), min(math.radians(85),
+                                 self.grid_3d_elevation + (event.y - old_y) * 0.01)
+        )
+        self.grid_3d_drag = (event.x, event.y)
+        self.schedule_grid_3d_redraw(interactive=True)
+        self.schedule_grid_3d_redraw(idle=True)
+
+    def end_grid_3d_rotation(self, _event):
+        self.grid_3d_drag = None
+        self.schedule_grid_3d_redraw(idle=True)
+
+    def start_grid_3d_pan(self, event):
+        self.grid_3d_pan = (event.x, event.y)
+
+    def pan_grid_3d(self, event):
+        if self.grid_3d_pan is None:
+            return
+        old_x, old_y = self.grid_3d_pan
+        self.grid_3d_offset = (
+            self.grid_3d_offset[0] + event.x - old_x,
+            self.grid_3d_offset[1] + event.y - old_y,
+        )
+        self.grid_3d_pan = (event.x, event.y)
+        self.schedule_grid_3d_redraw()
+
+    def zoom_grid_3d(self, event):
+        zoom_in = event.num == 4 or getattr(event, "delta", 0) > 0
+        self.grid_3d_zoom = max(0.25, min(8.0, self.grid_3d_zoom * (1.1 if zoom_in else 1 / 1.1)))
+        self.schedule_grid_3d_redraw()
+
+    def on_grid_3d_pick(self, event):
+        tags = self.grid_3d_canvas.gettags("current")
+        index_tag = next((tag for tag in tags if tag.startswith("slot3d_")), None)
+        if index_tag is None or self.project.storage_layout is None:
+            return
+        slot = self.project.storage_layout.slots[int(index_tag.split("_", 1)[1])]
+        layout = self.project.storage_layout
+        unit = layout.handling_unit_type if layout else ""
+        self.grid_slot_detail.set(
+            f"{slot['rack_id']} L{slot['level']:02d}/S{slot['slot']:02d} · "
+            f"center ({slot['center_x']:.3f}, {slot['center_y']:.3f}, {slot['center_z']:.3f}) m · "
+            f"L/W/H {slot['length']:.3f}/{slot['width']:.3f}/{slot['height']:.3f} m · "
+            f"{unit} · EMPTY"
         )
 
     def calculate_grid_geometry(self):
@@ -6174,6 +6555,8 @@ class GridMapEditorApp:
         x0, y0 = self.physical_screen_point(0, 0)
         self.canvas.create_text(x0, y0+20, text="(0, 0)", anchor="n", fill="#087f8c", font=("TkDefaultFont", 9, "bold"))
         self.apply_canvas_viewport(self.canvas)
+        if self.grid_view_mode.get() == "3D":
+            self.schedule_grid_3d_redraw()
         self.draw_grid_demand_overlay()
         self.summary.set(
             f"{spec.columns} columns × {spec.rows} rows\n"
@@ -6190,7 +6573,11 @@ class GridMapEditorApp:
             return
         self.canvas.delete("grid_demand_overlay")
         summary = self.project.sku_attribute_summary or {}
-        combinations = summary.get("attribute_combinations") or []
+        combinations = (
+            list(getattr(self, "stock_combination_rows", None) or [])
+            or summary.get("attribute_combinations")
+            or []
+        )
         if not combinations:
             return
         layout = self.project.storage_layout
@@ -6230,6 +6617,11 @@ class GridMapEditorApp:
                 f" · {int(total_ea):,} EA"
                 if total_ea is not None else ""
             )
+            required_slots = combination.get("required_slots")
+            slot_text = (
+                f" · {int(required_slots):,} slots"
+                if required_slots not in (None, "") else ""
+            )
             unresolved = int(combination.get("unresolved_skus", 0))
             rack_text = (
                 f"{int(racks):,}{'+' if unresolved else ''} racks"
@@ -6237,7 +6629,7 @@ class GridMapEditorApp:
             )
             display_rows.append((
                 f"{combination.get('storage_type', 'STANDARD')} · {profile} · "
-                f"{sku_count:,} SKUs{demand_text} → {rack_text}",
+                f"{sku_count:,} SKUs{demand_text}{slot_text} → {rack_text}",
                 (
                     self.grid_demand_combination_is_covered(combination, int(racks))
                     if racks is not None and not unresolved else False

@@ -66,6 +66,19 @@ ASRS produces level/slot buffers. The YAML export is unchanged and continues to
 contain only RMF rack `pickup_dispenser` and workstation `dropoff_ingestor`
 metadata.
 
+Enter the physical rack height before assigning buffers. The editor subtracts
+the configured outer clearance (5 cm per side by default) from the X/Y grid
+spacing and rack height, then recommends slot length, width, and height. Every
+AMR and ASRS slot is saved with its cuboid dimensions and centre-point
+`center_x`, `center_y`, and `center_z` coordinates. AMR retains one movable
+grid-level shelf buffer; ASRS retains individual slot-level buffers.
+
+Use the **2D / 3D** selector above the map to inspect the generated geometry.
+In 3D, drag to rotate, right-drag to pan, use the mouse wheel to zoom, and click
+a slot to inspect its rack, level, slot, centre, and handling-unit type. Current
+Heat continues to route AMRs on the unchanged 2D grid and ignores the additional
+slot geometry.
+
 ## Command-line generation
 
 An empty 20 m × 15 m map with 1 m grid spacing:

@@ -1,0 +1,7 @@
+# Python >= 3.10; these are already used by the repository.
+numpy
+openpyxl
+PyYAML
+pygame
+matplotlib
+tqdm

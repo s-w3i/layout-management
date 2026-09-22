@@ -15,8 +15,18 @@ class MinimumRackTests(unittest.TestCase):
         for loads, expected in [(0, []), (1, [2]), (4, [2, 2]), (5, [2, 2, 2])]:
             self.assertEqual(cluster_capacities(loads, 5, 2, minimize_rack_count=True), expected)
         self.assertEqual(cluster_capacities(5, 5, 2), [2] * 5)
+        self.assertEqual(
+            cluster_capacities(
+                5, 5, 2, minimize_rack_count=True, minimum_cluster_count=5,
+            ),
+            [2] * 5,
+        )
         with self.assertRaises(ValueError):
             cluster_capacities(11, 5, 2, minimize_rack_count=True)
+        with self.assertRaises(ValueError):
+            cluster_capacities(
+                5, 4, 2, minimize_rack_count=True, minimum_cluster_count=5,
+            )
         with self.assertRaises(ValueError):
             CtbsaParameters(minimize_rack_count="false").validate()
 
@@ -104,6 +114,71 @@ class MinimumRackTests(unittest.TestCase):
         counts = Counter(plan.target_racks[value] for value in plan.optimized_loads)
         self.assertEqual(sorted(counts.values()), [1, 2, 2])
         self.assertEqual(plan.parameters["maximum_same_sku_slots_per_rack"], 2)
+
+    def test_asrs_handling_units_use_rack_clusters_and_fix_exceptions(self):
+        racks = [
+            dict(rack_id="R0", distance_m=1, zone_id="ambient"),
+            dict(rack_id="R1", distance_m=2, zone_id="ambient"),
+            dict(rack_id="R2", distance_m=3, zone_id="ambient"),
+        ]
+        attributes = SimpleNamespace(
+            physical_profile=lambda requirements: {
+                "data_status": "COMPLETE",
+                "storage_class": (
+                    "OVERSIZE" if requirements.get("oversize") else "STANDARD"
+                ),
+            },
+            configured_zone_attribute_keys=lambda _: set(),
+            normalize_catalog=lambda _: {},
+            effective_attributes=lambda *_: ({}, {}),
+        )
+        slotting = SimpleNamespace(
+            attributes=attributes,
+            rack_distances=lambda _: ("L1", racks, [], []),
+            apply_zone_local_aisles=lambda *args: None,
+        )
+        analysis = SimpleNamespace(
+            dataset=SimpleNamespace(skus=("A", "B", "X")),
+            sku_store_day_totals=np.array([10, 5, 1]),
+            shared_store_days=np.ones((3, 3), dtype=np.int64),
+        )
+        parameters = CtbsaParameters(
+            population_size=4, generations=2, minimize_rack_count=True,
+        )
+        for handling_unit_type in ("Tote", "Pallet"):
+            rows = [
+                dict(
+                    sku=sku,
+                    inventory_load_id=sku,
+                    rack_id=rack_id,
+                    assignment_status="ASSIGNED",
+                    occupied_slot_count=occupied,
+                    handling_unit_type=handling_unit_type,
+                    sku_requirements=requirements,
+                )
+                for sku, rack_id, occupied, requirements in (
+                    ("A", "R0", 1, {}),
+                    ("B", "R0", 1, {}),
+                    ("X", "R2", 2, {"oversize": True}),
+                )
+            ]
+            plan = CtbsaPlacementPlanner(slotting).build(
+                rows,
+                {},
+                analysis,
+                levels_per_rack=1,
+                slots_per_level=2,
+                handling_unit_type=handling_unit_type,
+                parameters=parameters,
+            )
+            self.assertEqual(set(plan.optimized_loads), {"A", "B"})
+            self.assertEqual(plan.fixed_loads, ("X",))
+            self.assertEqual(plan.target_racks["X"], "R2")
+            self.assertEqual(plan.parameters["cluster_unit"], handling_unit_type)
+            self.assertIn(
+                f"ASRS {handling_unit_type} slots",
+                plan.parameters["warehouse_hard_constraints"],
+            )
 
 
 if __name__ == "__main__":

@@ -12,10 +12,10 @@ From the repository root:
 
 ```bash
 python3 -m current_heat_simulation.pygame_simulator --headless \
-  --layout resources/map/map1_basic.slotting.json \
-  --layout resources/map/map1_pure_affinity.slotting.json \
-  --layout resources/map/map1_traffic_zone_balance_off.slotting.json \
-  --layout resources/map/map1_traffic_zone_balance_on.slotting.json \
+  --layout resources/map/amr/basic_zone_off.slotting.json \
+  --layout resources/map/amr/affinity_zone_off.slotting.json \
+  --layout resources/map/amr/traffic_zone_off.slotting.json \
+  --layout resources/map/amr/traffic_zone_on.slotting.json \
   --start-date 2023-01-03 --end-date 2023-01-04 \
   --workers 4 --output current_heat_simulation/results/layout_comparison
 ```
@@ -151,9 +151,9 @@ working directory. Defaults:
 
 | Input | Default |
 |---|---|
-| Native grid | `resources/map/map1_1.grid.json` |
+| Native grid | `resources/map/amr/map1_1.grid.json` |
 | Order workbook | `resources/data/Sample Data.xlsx` (local, not tracked) |
-| Slotting layout | `resources/map/map1_basic.slotting.json` |
+| Slotting layout | `resources/map/amr/basic_zone_off.slotting.json` |
 | Fleet, stations, handling/motion settings | `amr_simulation/config/default.json` |
 
 Override with `--grid`, `--orders`, `--layout`, and `--amr-config`.

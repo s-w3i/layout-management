@@ -1,0 +1,41 @@
+# Paths are relative to this YAML; command-line paths are relative to the shell.
+map_file: ../resources/map/asrs/asrs_grid.grid.json
+orders_file: ../resources/data/Sample Data.xlsx
+layout_files:
+  - ../resources/map/asrs/basic_zone_on_slotting_layout.slotting.json
+  - ../resources/map/asrs/affinity_slotting_layout.slotting.json
+  - ../resources/map/asrs/affinity_zone_on_slotting_layout.slotting.json
+baseline_layout: basic_zone_on_slotting_layout
+
+# One crane per aisle, with its own station. Rows are grid row indices.
+aisles:
+  - {id: ASRS_01, workstation: WS_21_1, rack_rows: [0, 2]}
+  - {id: ASRS_02, workstation: WS_21_4, rack_rows: [3, 5]}
+  - {id: ASRS_03, workstation: WS_21_7, rack_rows: [6, 8]}
+  - {id: ASRS_04, workstation: WS_21_10, rack_rows: [9, 11]}
+  - {id: ASRS_05, workstation: WS_21_13, rack_rows: [12, 14]}
+  - {id: ASRS_06, workstation: WS_21_16, rack_rows: [15, 17]}
+  - {id: ASRS_07, workstation: WS_21_19, rack_rows: [18, 20]}
+  - {id: ASRS_08, workstation: WS_21_22, rack_rows: [21, 23]}
+  - {id: ASRS_09, workstation: WS_21_25, rack_rows: [24, 26]}
+
+# Engineering assumptions, not manufacturer specifications. Equal acceleration/deceleration.
+# X = rail travel; Z = lift (concurrent with X); Y = fork (only at rest).
+motion:
+  x: {speed_mps: 3.0, acceleration_mps2: 1.0}
+  y: {speed_mps: 0.5, acceleration_mps2: 0.5}
+  z: {speed_mps: 1.0, acceleration_mps2: 0.5}
+timing:
+  picking_seconds: 10.0 # Per tote presentation, including station handoff.
+  extraction_dwell_seconds: 0.0 # Additional dwell at full fork extension.
+  replacement_dwell_seconds: 0.0
+workstation_height_m: 0.5375
+simulation:
+  max_seconds: 86400.0
+  workers: 4
+  # Headless defaults to all observed dates; debug defaults to earliest date.
+display:
+  width: 1400
+  height: 900
+  fps: 60
+  time_scale: 100.0

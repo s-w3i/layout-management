@@ -83,7 +83,12 @@ class CtbsaPlacementPlan:
 
 
 def cluster_capacities(
-    load_count: int, rack_count: int, capacity: int, *, minimize_rack_count: bool = False,
+    load_count: int,
+    rack_count: int,
+    capacity: int,
+    *,
+    minimize_rack_count: bool = False,
+    minimum_cluster_count: int = 0,
 ) -> list[int]:
     """Choose the slot-capacity minimum per compatible profile, or all racks.
 
@@ -92,11 +97,16 @@ def cluster_capacities(
     Physical exceptions are excluded by the caller and final feasibility is
     still checked by the slot allocator.
     """
-    if load_count < 0 or rack_count < 0 or capacity < 1:
+    if load_count < 0 or rack_count < 0 or capacity < 1 or minimum_cluster_count < 0:
         raise ValueError("invalid load count, rack count, or rack capacity")
     if load_count > rack_count * capacity:
         raise ValueError("inventory loads exceed available rack capacity")
-    count = (load_count + capacity - 1) // capacity if minimize_rack_count else rack_count
+    count = (
+        max((load_count + capacity - 1) // capacity, minimum_cluster_count)
+        if minimize_rack_count else rack_count
+    )
+    if count > rack_count:
+        raise ValueError("minimum cluster count exceeds available racks")
     return [capacity] * count
 
 
@@ -364,7 +374,7 @@ class CtbsaNsga2:
 
 
 class CtbsaPlacementPlanner:
-    """Adapt the paper's equal-location storage areas to complete AMR shelves."""
+    """Adapt the paper's equal-location storage areas to warehouse racks."""
 
     def __init__(self, slotting_service):
         self.slotting = slotting_service
@@ -385,6 +395,7 @@ class CtbsaPlacementPlanner:
         *,
         levels_per_rack: int,
         slots_per_level: int,
+        handling_unit_type: str = "AMR shelf",
         zone_assignments: dict[str, str] | None = None,
         location_attributes: dict[str, dict] | None = None,
         attribute_catalog=None,
@@ -397,6 +408,10 @@ class CtbsaPlacementPlanner:
     ) -> CtbsaPlacementPlan:
         parameters = parameters or CtbsaParameters()
         parameters.validate()
+        if handling_unit_type not in {"AMR shelf", "Tote", "Pallet"}:
+            raise ValueError(
+                "C&TBSA handling unit must be AMR shelf, Tote, or Pallet"
+            )
         if levels_per_rack < 1 or slots_per_level < 1:
             raise ValueError("C&TBSA rack capacity must be positive")
         capacity = levels_per_rack * slots_per_level
@@ -450,7 +465,8 @@ class CtbsaPlacementPlanner:
                     profile["data_status"] != "COMPLETE"
                     or profile["storage_class"] != "STANDARD"
                     or int(row.get("occupied_slot_count") or 1) != 1
-                    or str(row.get("handling_unit_type", "")) != "AMR shelf"
+                    or str(row.get("handling_unit_type", ""))
+                    != handling_unit_type
                 ):
                     clean = False
                     break
@@ -468,7 +484,10 @@ class CtbsaPlacementPlanner:
             if str(row.get("inventory_load_id", ""))
         })
         if not optimized_loads:
-            raise ValueError("C&TBSA found no complete standard AMR-shelf SKUs to cluster")
+            raise ValueError(
+                f"C&TBSA found no complete standard {handling_unit_type} "
+                "inventory loads to cluster"
+            )
         optimized_skus = sorted({
             str(assigned_by_load[load_id].get("sku", ""))
             for load_id in optimized_loads
@@ -655,6 +674,12 @@ class CtbsaPlacementPlanner:
                 cluster_capacities(
                     len(group_loads), len(group_racks), capacity,
                     minimize_rack_count=parameters.minimize_rack_count,
+                    minimum_cluster_count=max(
+                        (
+                            count + maximum_same_sku_slots_per_rack - 1
+                        ) // maximum_same_sku_slots_per_rack
+                        for count in sku_counts.values()
+                    ),
                 ),
                 real_item_count=len(group_loads),
             )
@@ -802,16 +827,31 @@ class CtbsaPlacementPlanner:
                         f"C&TBSA could not place {load_id} within rack capacity "
                         "and the maximum same-SKU slot limit"
                     )
-                rack = min(
-                    eligible,
-                    key=lambda candidate: (
-                        str(candidate["rack_id"]) != preferred,
-                        -rack_sku_counts[str(candidate["rack_id"])][sku],
-                        len(rack_loads[str(candidate["rack_id"])]),
-                        float(candidate["distance_m"]),
-                        str(candidate["rack_id"]),
-                    ),
-                )
+                if handling_unit_type == "AMR shelf":
+                    rack = min(
+                        eligible,
+                        key=lambda candidate: (
+                            str(candidate["rack_id"]) != preferred,
+                            -rack_sku_counts[str(candidate["rack_id"])][sku],
+                            len(rack_loads[str(candidate["rack_id"])]),
+                            float(candidate["distance_m"]),
+                            str(candidate["rack_id"]),
+                        ),
+                    )
+                else:
+                    # Keep each ASRS SKU compact, but choose its next rack by
+                    # remaining capacity rather than the chromosome preference.
+                    # The latter can strand cells in a minimum-rack plan.
+                    rack = min(
+                        eligible,
+                        key=lambda candidate: (
+                            rack_sku_counts[str(candidate["rack_id"])][sku] == 0,
+                            len(rack_loads[str(candidate["rack_id"])]),
+                            str(candidate["rack_id"]) != preferred,
+                            float(candidate["distance_m"]),
+                            str(candidate["rack_id"]),
+                        ),
+                    )
                 rack_id = str(rack["rack_id"])
                 rack_loads[rack_id].append(load_id)
                 rack_sku_counts[rack_id][sku] += 1
@@ -859,7 +899,7 @@ class CtbsaPlacementPlanner:
                 "minimize_rack_count": parameters.minimize_rack_count,
                 "rack_count_scope": "slot_capacity_per_compatible_profile_plus_fixed_racks",
                 "optimized_rack_count": sum(bool(row["inventory_load_ids"]) for row in cluster_rows),
-                "cluster_unit": "AMR shelf",
+                "cluster_unit": handling_unit_type,
                 "storage_locations_per_cluster": capacity,
                 "maximum_same_sku_slots_per_rack": maximum_same_sku_slots_per_rack,
                 "active_zone_attribute_keys": active_attribute_keys,
@@ -877,6 +917,10 @@ class CtbsaPlacementPlanner:
                     "AMR shelf only; unique occupied addresses; map-active SKU "
                     "attribute profiles separated; physical exceptions and "
                     "incomplete-data racks fixed"
+                    if handling_unit_type == "AMR shelf" else
+                    f"ASRS {handling_unit_type} slots; unique occupied addresses; "
+                    "map-active SKU attribute profiles separated; physical "
+                    "exceptions and incomplete-data racks fixed"
                 ),
                 "simulation_validation": False,
                 "zone_workload_enabled": bool(zone_workload_enabled),

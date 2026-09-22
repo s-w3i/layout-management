@@ -37,13 +37,13 @@ Run all observed order dates with 40 AMRs and one persistent worker per layout:
 ```bash
 python3 amr_simulation/run_simulation.py \
   --mode batch \
-  --grid resources/map/map1_1.grid.json \
+  --grid resources/map/amr/map1_1.grid.json \
   --orders "resources/data/Sample Data.xlsx" \
   --config amr_simulation/config/default.json \
-  --layout resources/map/map1_basic.slotting.json \
-  --layout resources/map/map1_pure_affinity.slotting.json \
-  --layout resources/map/map1_traffic_zone_balance_off.slotting.json \
-  --layout resources/map/map1_traffic_zone_balance_on.slotting.json \
+  --layout resources/map/amr/basic_zone_off.slotting.json \
+  --layout resources/map/amr/affinity_zone_off.slotting.json \
+  --layout resources/map/amr/traffic_zone_off.slotting.json \
+  --layout resources/map/amr/traffic_zone_on.slotting.json \
   --amrs 40 \
   --workers 4 \
   --output amr_simulation/results/all_layouts_40_amrs
@@ -67,10 +67,10 @@ Useful batch options:
 ```bash
 python3 amr_simulation/run_simulation.py \
   --mode debug \
-  --grid resources/map/map1_1.grid.json \
+  --grid resources/map/amr/map1_1.grid.json \
   --orders "resources/data/Sample Data.xlsx" \
   --config amr_simulation/config/default.json \
-  --layout resources/map/map1_basic.slotting.json \
+  --layout resources/map/amr/basic_zone_off.slotting.json \
   --date 2023-01-03 \
   --speed 120 \
   --output amr_simulation/results/live_demo

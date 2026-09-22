@@ -6,10 +6,11 @@ import unittest
 
 from openpyxl import Workbook
 
-from amr_simulation.inputs import assign_workstations, load_workload
+from amr_simulation.inputs import assign_workstations, load_workload, racks_from_layout, validate_inputs
 from amr_simulation.models import MotionProfile, Rack, SimulationConfig, WorkloadTask, grid_name
 from warehouse_layout.domain import GridProject, GridSpec, Marker
 from warehouse_layout.rmf import RmfMapService
+from warehouse_layout.slotting_repository import SlottingLayoutRepository
 
 from current_heat_simulation.astar_planner import AStarPlanner, WarehouseMap
 from current_heat_simulation.sim_types import RobotSnapshot
@@ -38,6 +39,49 @@ def small_map(directory):
 
 
 class CurrentHeatTests(unittest.TestCase):
+    def test_generated_3d_slot_map_and_layout_run_current_heat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = GridProject(GridSpec(width_m=6, length_m=4))
+            project.markers = {
+                (0, 0): Marker("rack", "RACK"),
+                (6, 4): Marker("workstation", "WS"),
+            }
+            project.assign_storage_buffers("AMR", 2, 3, rack_height_m=2.5)
+            map_path = root / "grid.json"
+            layout_path = root / "layout.slotting.json"
+            RmfMapService().save_project(project, map_path)
+            SlottingLayoutRepository().save(
+                [{
+                    "sku": "x", "rack_id": "G0_0", "storage_level": 1,
+                    "storage_slot": 1, "assignment_status": "ASSIGNED",
+                }],
+                project.to_building_dict(), {}, layout_path,
+                strategy="basic", handling_unit_type="AMR shelf",
+                levels_per_rack=2, slots_per_level=3, zone_assignments={},
+                storage_layout=project.storage_layout,
+            )
+            warehouse = WarehouseMap(map_path)
+            payload = SlottingLayoutRepository().load(layout_path)
+            racks = racks_from_layout(payload["assignments"])
+            config = amr_config()
+            task = WorkloadTask("2023-01-03/A", date(2023, 1, 3), 0, "A", {"x": 1})
+            mapping = {"A": "WS"}
+            report = validate_inputs(
+                warehouse.project, warehouse.router, racks, [task], config, mapping
+            )
+            self.assertTrue(report.valid, report.to_dict())
+            self.assertEqual(payload["assignments"][0]["rack_id"], "G0_0")
+            self.assertIn("center_z", payload["assignments"][0])
+            system = WarehouseSystem(
+                {"conflicts": {"print_conflicts": False}}, warehouse,
+                [task], racks, mapping, config,
+            )
+            summary = system.run(
+                headless=True, output=root / "results", max_seconds=200
+            )
+            self.assertTrue(summary["success_flag"], summary)
+
     def test_workbook_groups_store_per_day_and_ignores_order_line_time(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/"orders.xlsx"
@@ -59,7 +103,7 @@ class CurrentHeatTests(unittest.TestCase):
             self.assertEqual(len(fresh.select(date(2023, 1, 3), date(2023, 1, 3))), 2)
 
     def test_native_map_preserves_directed_lanes_and_rack_obstacles(self):
-        warehouse = WarehouseMap(ROOT/"resources/map/map1_1.grid.json")
+        warehouse = WarehouseMap(ROOT/"resources/map/amr/map1_1.grid.json")
         edges = {(warehouse.vertices[a].name, warehouse.vertices[b].name) for a, b, _ in warehouse.adjacency_items()}
         expected = {(grid_name(a), grid_name(b)) for a, b in warehouse.project.iter_traversable_lane_positions()}
         self.assertEqual(edges, expected)

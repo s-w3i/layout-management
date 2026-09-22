@@ -1473,7 +1473,7 @@ sku,max_item_length,max_item_width,max_item_height,max_item_weight,chilled,table
 138936,0.071,0.094,0.06,0.05488,false,true,false
 138990,0.071,0.094,0.06,0.05488,false,false,true
 139021,0.071,0.094,0.06,0.05488,false,false,false
-139112,1.5,0.5,0.95,0.18,false,true,false
+139112,0.8,0.5,0.95,0.18,false,true,false
 139113,0.071,0.094,0.06,0.05488,false,true,false
 139114,0.071,0.094,0.06,0.05488,true,true,false
 139115,0.071,0.094,0.06,0.05488,false,false,false

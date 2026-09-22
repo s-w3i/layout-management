@@ -23,6 +23,39 @@ from .storage_planning import (
 class SlottingLayoutRepository:
     """Read and write self-contained inventory slotting layout documents."""
 
+    @staticmethod
+    def _rows_with_slot_geometry(rows: list[dict], storage_layout) -> list[dict]:
+        geometry = {
+            (str(item["rack_id"]), int(item["level"]), int(item["slot"])): item
+            for item in (storage_layout.slots if storage_layout is not None else [])
+        }
+        fields = ("center_x", "center_y", "center_z", "length", "width", "height")
+        result = []
+        for source in rows:
+            row = dict(source)
+            slot = geometry.get((
+                str(row.get("rack_id", "")),
+                int(row.get("storage_level") or 1),
+                int(row.get("storage_slot") or 1),
+            ))
+            if slot:
+                row.update({name: slot[name] for name in fields})
+            occupied = []
+            for source_unit in row.get("occupied_handling_units") or []:
+                unit = dict(source_unit)
+                unit_slot = geometry.get((
+                    str(unit.get("rack_id") or row.get("rack_id", "")),
+                    int(unit.get("storage_level") or 1),
+                    int(unit.get("storage_slot") or 1),
+                ))
+                if unit_slot:
+                    unit.update({name: unit_slot[name] for name in fields})
+                occupied.append(unit)
+            if occupied:
+                row["occupied_handling_units"] = occupied
+            result.append(row)
+        return result
+
     def save(
         self,
         rows: list[dict],
@@ -49,6 +82,7 @@ class SlottingLayoutRepository:
         chilled_demo_seed: int = 42,
         storage_layout=None,
     ) -> None:
+        rows = self._rows_with_slot_geometry(rows, storage_layout)
         occupied_units: dict[str, set[str]] = {}
         for row in rows:
             if row.get("assignment_status") != "ASSIGNED":

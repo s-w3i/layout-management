@@ -20,7 +20,7 @@ class DeadlockRecoveryTests(unittest.TestCase):
     def make_stalled_system(self, fixture='stalled_zone_off.json'):
         config = yaml.safe_load((ROOT/'current_heat_simulation/current_heat.yaml').read_text())
         amr = SimulationConfig.load(ROOT/'amr_simulation/config/default.json')
-        warehouse = WarehouseMap(ROOT/'resources/map/map1_1.grid.json')
+        warehouse = WarehouseMap(ROOT/'resources/map/amr/map1_1.grid.json')
         rack = 'G3_9'
         task = WorkloadTask('test', date(2023, 1, 3), 0, 'store', {'sku': 1})
         system = WarehouseSystem(config, warehouse, [task],

@@ -1,7 +1,7 @@
 method: current_heat
-map_file: ../resources/map/map1_1.grid.json
+map_file: ../resources/map/amr/map1_1.grid.json
 orders_file: ../resources/data/Sample Data.xlsx
-layout_file: ../resources/map/map1_basic.slotting.json
+layout_file: ../resources/map/amr/basic_zone_off.slotting.json
 amr_config: ../amr_simulation/config/default.json
 
 planner:
