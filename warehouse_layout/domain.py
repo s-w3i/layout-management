@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, Tuple
 
@@ -269,6 +270,32 @@ class GridProject:
     sku_attribute_source: str = ""
     sku_attribute_summary: dict[str, Any] = field(default_factory=dict)
     sku_overlay_attributes: list[str] = field(default_factory=list)
+    active_sku_attributes: list[str] = field(default_factory=list)
+
+    def resolve_attribute_catalog(self) -> list[dict[str, Any]]:
+        """Resolve cached CSV definitions without requiring a saved catalog."""
+        from .attributes import StorageAttributeService, OVERSIZE_CAPABLE_KEY
+        definitions = []
+        for key, item in self.sku_attribute_summary.get("attributes", {}).items():
+            if item.get("derived") or key == OVERSIZE_CAPABLE_KEY:
+                continue
+            definitions.append({
+                **item, "key": key, "choices": [],
+                "enabled": key in self.active_sku_attributes,
+            })
+        system = StorageAttributeService.starter_catalog()[OVERSIZE_CAPABLE_KEY]
+        definitions.append(system.to_dict())
+        self.attribute_catalog = definitions
+        self.sku_overlay_attributes = [
+            item["key"] for item in definitions
+            if item["enabled"] and item["value_type"] == "boolean"
+            and item["key"] != OVERSIZE_CAPABLE_KEY
+        ]
+        if self.sku_attribute_summary.get("attributes", {}).get("oversize", {}).get("derived"):
+            self.sku_overlay_attributes.append("oversize")
+        if self.sku_attribute_summary:
+            self.sku_attribute_summary["combination_attributes"] = list(self.sku_overlay_attributes)
+        return definitions
 
     def validate(self) -> None:
         self.grid.validate()
@@ -292,6 +319,10 @@ class GridProject:
                 raise ValueError(f"grid point {position} must have finite X and Y coordinates")
         if not isinstance(self.sku_attribute_summary, dict):
             raise ValueError("SKU attribute summary must be an object")
+        if (not isinstance(self.active_sku_attributes, list)
+            or any(not isinstance(key, str) or not key.strip() for key in self.active_sku_attributes)
+            or len(set(self.active_sku_attributes)) != len(self.active_sku_attributes)):
+            raise ValueError("Active SKU attributes must be a unique list of keys")
         if (
             not isinstance(self.sku_overlay_attributes, list)
             or any(
@@ -633,8 +664,7 @@ class GridProject:
             result["storage_layout"] = self.storage_layout.to_dict()
         if self.zone_assignments:
             result["zone_assignments"] = dict(sorted(self.zone_assignments.items()))
-        if self.attribute_catalog:
-            result["attribute_catalog"] = [dict(item) for item in self.attribute_catalog]
+        result["active_sku_attributes"] = list(self.active_sku_attributes)
         if self.location_attributes:
             result["location_attributes"] = {
                 path: dict(values)
@@ -683,10 +713,6 @@ class GridProject:
             result["sku_attribute_source"] = self.sku_attribute_source
         if self.sku_attribute_summary:
             result["sku_attribute_summary"] = self.sku_attribute_summary
-        if self.sku_attribute_source or self.sku_attribute_summary:
-            result["sku_overlay_attributes"] = list(
-                self.sku_overlay_attributes
-            )
         return result
 
     @classmethod
@@ -791,6 +817,28 @@ class GridProject:
                     and key != "oversize_capable"
                 ]
             )
+        if not project.sku_attribute_summary.get("attributes") and project.sku_attribute_source:
+            from .slotting import SlottingService
+            try:
+                _, project.sku_attribute_summary = SlottingService().inspect_sku_attribute_csv(
+                    Path(project.sku_attribute_source), project.attribute_catalog
+                )
+            except (OSError, ValueError, TypeError):
+                pass
+        if not project.sku_attribute_summary.get("attributes") and project.attribute_catalog:
+            project.sku_attribute_summary["attributes"] = {
+                item["key"]: dict(item) for item in project.attribute_catalog
+            }
+        if "active_sku_attributes" in data:
+            project.active_sku_attributes = list(data["active_sku_attributes"])
+        else:
+            project.active_sku_attributes = [
+                key for key, item in project.sku_attribute_summary.get("attributes", {}).items()
+                if not item.get("derived") and key != "oversize_capable"
+                and (item.get("value_type") == "number" or key in project.sku_overlay_attributes
+                     or "sku_overlay_attributes" not in data)
+            ]
+        project.resolve_attribute_catalog()
         if project.storage_layout is not None and not project.storage_layout.slots:
             project.refresh_slot_geometry()
         project.validate()

@@ -231,6 +231,32 @@ their hierarchy level controls editor organization and inheritance. It does not
 instruct slotting to subdivide a zone. Only length, width, height, and weight
 remain numeric capacity attributes.
 
+New projects expose only the built-in **Oversize-capable storage** flag. Import a
+SKU attributes CSV to discover attributes; all supported CSV attributes are
+initially enabled. Advanced attributes lets you enable or disable each Boolean
+or physical attribute and edit its hierarchy metadata. Zone settings shows the
+enabled attributes, supports Ctrl/Shift selection for bulk edits, and provides
+Apply and Clear controls for each value. Imported attributes do not initialize
+zone values. Saving with attributes unassigned at every zone offers **Back to
+edit** or **Save and make inactive**.
+
+Open **Layout attributes…** to import a CSV and select its attributes in one
+place. The header shows the filename, SKU count, and active CSV attribute count.
+Each row has a selection checkbox and a **Configured in X of Y zones** or
+**Unassigned** status; oversize-capable storage is marked as a required system
+attribute. **Configure zones…** opens the zone comparison table using the current
+selection. Returning from that dialog updates the configuration counts; save
+Layout Attributes to apply the selection and zone edits together.
+
+Grid projects save `active_sku_attributes` and cached CSV definitions in
+`sku_attribute_summary`, without requiring a persisted `attribute_catalog`.
+Older projects retain their saved zone values when migrated. CSV replacement
+preserves exclusions for matching columns, enables new columns, and keeps
+values for missing columns for recovery. Disabled attributes do not enforce
+layout compatibility; physical CSV data still feeds the existing oversize
+classification. Cached definitions allow editing when the CSV is unavailable,
+but allocation requires the source CSV.
+
 For `abc_affinity`, select the order-history workbook and an affinity weight.
 The weight directly balances same-bay affinity consolidation against ABC
 placement: 0% is pure ABC, 100% is pure affinity with no ABC placement

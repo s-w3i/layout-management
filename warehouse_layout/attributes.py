@@ -55,6 +55,7 @@ class AttributeDefinition:
     unit: str = ""
     choices: tuple[str, ...] = ()
     hierarchy_level: int | None = None
+    enabled: bool = True
 
     def validate(self) -> None:
         if not ATTRIBUTE_KEY_PATTERN.fullmatch(self.key):
@@ -109,6 +110,7 @@ class AttributeDefinition:
             "unit": self.unit,
             "choices": list(self.choices),
             "hierarchy_level": self.hierarchy_level,
+            "enabled": self.enabled,
         }
 
     @classmethod
@@ -128,6 +130,7 @@ class AttributeDefinition:
                 int(value["hierarchy_level"])
                 if value.get("hierarchy_level") not in (None, "") else None
             ),
+            enabled=bool(value.get("enabled", True)),
         )
         definition.validate()
         return definition
@@ -403,6 +406,8 @@ class StorageAttributeService:
         profile = physical_profile or self.physical_profile(
             requirements, standard_defaults
         )
+        effective = {key: value for key, value in effective.items()
+                     if key in definitions and definitions[key].enabled}
         issues: list[str] = []
 
         generic_requirements = {
@@ -535,6 +540,8 @@ class StorageAttributeService:
             if key == "chilled" or key in PHYSICAL_DIMENSION_KEYS:
                 continue
             definition = definitions.get(key)
+            if definition is not None and not definition.enabled:
+                continue
             if definition is None:
                 continue
             actual = (
@@ -708,6 +715,7 @@ class StorageAttributeService:
         location_attributes: dict[str, dict[str, Any]] | None,
         catalog,
         valid_paths: Iterable[str] | None = None,
+        *, ignore_unknown: bool = False,
     ) -> dict[str, dict[str, Any]]:
         definitions = self.normalize_catalog(catalog)
         allowed_paths = set(valid_paths) if valid_paths is not None else None
@@ -720,6 +728,8 @@ class StorageAttributeService:
             parsed: dict[str, Any] = {}
             for key, raw in values.items():
                 if key not in definitions:
+                    if ignore_unknown:
+                        continue
                     raise ValueError(f"location '{path}' uses unknown attribute '{key}'")
                 if key in PHYSICAL_ATTRIBUTE_KEYS and raw in (None, ""):
                     parsed[key] = None
@@ -763,6 +773,8 @@ class StorageAttributeService:
         issues: list[str] = []
         for key, required in (requirements or {}).items():
             definition = definitions.get(key)
+            if definition is not None and not definition.enabled:
+                continue
             if definition is None:
                 issues.append(f"unknown requirement '{key}'")
                 continue
@@ -807,6 +819,8 @@ class StorageAttributeService:
         issues: list[str] = []
         for key, required in (requirements or {}).items():
             definition = definitions.get(key)
+            if definition is not None and not definition.enabled:
+                continue
             if definition is None:
                 issues.append(f"Unknown requirement: {key}")
                 continue

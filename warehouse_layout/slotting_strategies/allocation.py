@@ -235,7 +235,11 @@ def allocate(
         racks, levels_per_rack, slots_per_level
     )
     local_attributes = service.attributes.validate_location_attributes(
-        location_attributes, catalog, valid_paths
+        {
+            path: {key: value for key, value in values.items()
+                   if key in catalog and catalog[key].enabled}
+            for path, values in (location_attributes or {}).items()
+        }, catalog, valid_paths
     )
     configured_map_attribute_keys: set[str] = set()
     configured_zones = {str(rack["zone_id"]) for rack in racks}
@@ -609,14 +613,6 @@ def allocate(
                             continue
                     except (TypeError, ValueError):
                         continue
-            missing_physical = [
-                key for key in PHYSICAL_ATTRIBUTE_KEYS
-                if key in requirements
-                and key in configured_map_attribute_keys
-                and key not in effective
-            ]
-            if missing_physical:
-                continue
             footprint = (1, 1)
             if known_volumetric_oversize and all(
                 key in effective for key in PHYSICAL_DIMENSION_KEYS
@@ -1305,17 +1301,6 @@ def allocate(
                         issues.append(
                             "Maximum item weight exceeds the configured zone capacity"
                         )
-                missing_physical = [
-                    key for key in PHYSICAL_ATTRIBUTE_KEYS
-                    if key in requirements
-                    and key in configured_map_attribute_keys
-                    and key not in effective
-                ]
-                if missing_physical:
-                    issues.extend(
-                        f"{catalog[key].label}: location value is not defined"
-                        for key in missing_physical
-                    )
                 if issues:
                     for issue in issues:
                         if issue not in hard_issues:
@@ -2058,8 +2043,8 @@ def allocate(
     rack_frequency_ranking = apply_rack_frequency_ranks(output)
 
     if location_attributes is not None:
-        location_attributes.clear()
-        location_attributes.update(local_attributes)
+        for path, values in local_attributes.items():
+            location_attributes.setdefault(path, {}).update(values)
 
     zone_storage_types = derive_zone_storage_types(
         output, {position["planned_zone_id"] for position in positions}

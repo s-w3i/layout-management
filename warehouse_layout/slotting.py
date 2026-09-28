@@ -190,6 +190,8 @@ class SlottingService:
             catalog[key] = self.infer_attribute_definition(
                 key, raw_values, level
             )
+            if OVERSIZE_CAPABLE_KEY in catalog and attribute_catalog is not None:
+                catalog[key] = replace(catalog[key], enabled=False)
 
         sku_ids = [str(row.get("sku", "")).strip() for row in rows]
         if any(not sku for sku in sku_ids):
@@ -215,6 +217,8 @@ class SlottingService:
                     ) from exc
             unique_values = sorted({str(value) for value in parsed_values})
             summary_attributes[key] = {
+                "unit": definition.unit,
+                "source_column": column,
                 "label": definition.label,
                 "value_type": definition.value_type,
                 "match_rule": definition.match_rule,

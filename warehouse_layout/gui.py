@@ -22,6 +22,7 @@ from .attribute_editor import HierarchyAttributeEditor
 from .attributes import (
     DERIVED_OVERSIZE_KEY,
     PHYSICAL_ATTRIBUTE_KEYS,
+    OVERSIZE_CAPABLE_KEY,
     STANDARD_STORAGE_DEFAULTS,
     StorageAttributeService,
 )
@@ -138,6 +139,7 @@ class GridMapEditorApp:
         self.inventory = InventoryService(self.slotting, self.attributes)
         self.traffic = TrafficAwareSlottingService(self.attributes, self.slotting)
         self.project = initial_project or GridProject()
+        self.project.resolve_attribute_catalog()
         self.attributes.set_standard_storage_defaults(
             self.project.warehouse_storage_defaults
         )
@@ -696,7 +698,7 @@ class GridMapEditorApp:
             command=self.open_grid_zone_storage_settings,
         ).pack(side="left", expand=True, fill="x")
         ttk.Button(
-            zone_buttons, text="Advanced attributes…",
+            zone_buttons, text="Layout attributes…",
             command=self.open_grid_attribute_editor,
         ).pack(side="left", expand=True, fill="x", padx=(4, 0))
         ttk.Button(
@@ -3012,7 +3014,7 @@ class GridMapEditorApp:
                 project.storage_layout.slots_per_level,
             )
             locations = self.attributes.validate_location_attributes(
-                project.location_attributes, catalog, paths
+                project.location_attributes, catalog, paths, ignore_unknown=True
             )
         except (
             OSError, ValueError, TypeError, KeyError, json.JSONDecodeError
@@ -4753,7 +4755,7 @@ class GridMapEditorApp:
                 project.storage_layout.slots_per_level,
             )
             local = self.attributes.validate_location_attributes(
-                project.location_attributes, catalog, paths
+                project.location_attributes, catalog, paths, ignore_unknown=True
             )
         except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError) as exc:
             messagebox.showerror("Grid project load failed",str(exc)); return
@@ -4914,6 +4916,8 @@ class GridMapEditorApp:
                 raise ValueError("load the selected grid project JSON before generating")
             if self.slot_grid_project is None or self.slot_grid_project.storage_layout is None:
                 raise ValueError("loaded grid project has no storage buffers")
+            if self.slot_grid_project.sku_attribute_source and not self.slot_chilled_path.get().strip():
+                raise ValueError("Select the SKU attributes CSV before generating allocation")
             self.attributes.set_standard_storage_defaults(
                 self.slot_grid_project.warehouse_storage_defaults
             )
@@ -5650,34 +5654,31 @@ class GridMapEditorApp:
             "Attributes discovered:\n" + " · ".join(details)
         )
 
-    def load_grid_sku_attributes_dialog(self):
+    def load_grid_sku_attributes_dialog(self, parent=None):
         path = filedialog.askopenfilename(
+            parent=parent or self.root,
             initialdir=str(DEFAULT_SKU_ATTRIBUTES_INPUT.parent),
             initialfile=DEFAULT_SKU_ATTRIBUTES_INPUT.name,
             filetypes=[("SKU attributes CSV", "*.csv"), ("All files", "*")],
         )
         if not path:
-            return
-        self.load_grid_sku_attributes(Path(path))
+            return False
+        return self.load_grid_sku_attributes(Path(path))
 
     def load_grid_sku_attributes(self, path: Path) -> bool:
+        old_keys = {key for key, item in self.project.sku_attribute_summary.get("attributes", {}).items()
+                    if not item.get("derived") and key != OVERSIZE_CAPABLE_KEY}
         self.attributes.set_standard_storage_defaults(
             self.project.warehouse_storage_defaults
         )
         try:
-            catalog, discovered_summary = self.slotting.inspect_sku_attribute_csv(
-                path, self.project.attribute_catalog
-            )
+            catalog, discovered_summary = self.slotting.inspect_sku_attribute_csv(path)
             available = list(
                 discovered_summary.get("available_combination_attributes") or []
             )
-            selected = (
-                [
-                    key for key in self.project.sku_overlay_attributes
-                    if key in available
-                ]
-                if self.project.sku_attribute_source else available
-            )
+            selected = [key for key in available
+                        if key == DERIVED_OVERSIZE_KEY or key in self.project.active_sku_attributes
+                        or key not in old_keys]
             catalog, summary = self.slotting.inspect_sku_attribute_csv(
                 path, catalog, selected
             )
@@ -5688,19 +5689,19 @@ class GridMapEditorApp:
         self.project.attribute_catalog = self.attributes.serialize_catalog(catalog)
         self.project.sku_attribute_source = str(path.resolve())
         self.project.sku_attribute_summary = copy.deepcopy(summary)
-        self.project.sku_overlay_attributes = list(
-            summary.get("combination_attributes") or []
+        available_csv = {key for key, item in summary["attributes"].items()
+                         if not item.get("derived") and key != OVERSIZE_CAPABLE_KEY}
+        # Preserve explicit exclusions and enable newly discovered CSV columns.
+        self.project.active_sku_attributes = sorted(
+            (set(self.project.active_sku_attributes) & available_csv)
+            | (available_csv - old_keys)
         )
+        self.project.resolve_attribute_catalog()
         self.grid_sku_attributes_path.set(self.project.sku_attribute_source)
         self.grid_sku_attribute_summary.set(
             self.format_sku_attribute_summary(summary)
         )
         self.sync_grid_sku_overlay_attribute_list()
-        active_physical = set(PHYSICAL_ATTRIBUTE_KEYS) & set(catalog)
-        for zone in set(self.project.zone_assignments.values()):
-            values = self.project.location_attributes.setdefault(zone, {})
-            for key in active_physical:
-                values.setdefault(key, self.project.warehouse_storage_defaults[key])
         self.status.set(
             f"Loaded attributes for {summary['sku_count']:,} SKUs. "
             "Configure the listed values in warehouse zone settings."
@@ -5738,6 +5739,8 @@ class GridMapEditorApp:
             summary.get("combination_attributes") or []
         )
         self.project.sku_attribute_summary = copy.deepcopy(summary)
+        self.project.active_sku_attributes = [key for key in self.project.active_sku_attributes if key in PHYSICAL_ATTRIBUTE_KEYS] + [key for key in self.project.sku_overlay_attributes if key != DERIVED_OVERSIZE_KEY]
+        self.project.resolve_attribute_catalog()
         self.grid_sku_attribute_summary.set(
             self.format_sku_attribute_summary(summary)
         )
@@ -5822,6 +5825,7 @@ class GridMapEditorApp:
         sku_attribute_source = self.project.sku_attribute_source
         sku_attribute_summary = copy.deepcopy(self.project.sku_attribute_summary)
         sku_overlay_attributes = list(self.project.sku_overlay_attributes)
+        active_sku_attributes = list(self.project.active_sku_attributes)
         self.project = GridProject(
             spec,
             warehouse_storage_defaults=warehouse_defaults,
@@ -5831,6 +5835,8 @@ class GridMapEditorApp:
         self.project.sku_attribute_source = sku_attribute_source
         self.project.sku_attribute_summary = sku_attribute_summary
         self.project.sku_overlay_attributes = sku_overlay_attributes
+        self.project.active_sku_attributes = active_sku_attributes
+        self.project.resolve_attribute_catalog()
         self.attributes.set_standard_storage_defaults(warehouse_defaults)
         self.sync_grid_storage_controls()
         self.sync_grid_sku_attribute_controls()
@@ -6163,6 +6169,7 @@ class GridMapEditorApp:
             if self.grid_3d_canvas is not None:
                 self.grid_3d_canvas.delete("all")
                 self.grid_3d_items.clear()
+                self.grid_3d_active_items = set()
                 self.grid_3d_text_items.clear()
             self.grid_slot_detail.set("Assign storage buffers to generate the 3D view.")
             return
@@ -6184,12 +6191,20 @@ class GridMapEditorApp:
         width = max(300, canvas.winfo_width())
         height = max(250, canvas.winfo_height())
         cache = self.get_grid_3d_cache(layout)
-        all_points = cache["points"]
         centre = cache["centre"]
-        rotated = [self.project_grid_3d(point, centre) for point in all_points]
-        span_x = max(value[0] for value in rotated) - min(value[0] for value in rotated)
-        span_y = max(value[1] for value in rotated) - min(value[1] for value in rotated)
+        vertices = cache["vertices"] - centre
+        cosine, sine = math.cos(self.grid_3d_azimuth), math.sin(self.grid_3d_azimuth)
+        ec, es = math.cos(self.grid_3d_elevation), math.sin(self.grid_3d_elevation)
+        x, y, z = vertices[..., 0], vertices[..., 1], vertices[..., 2]
+        depth_axis = sine * x + cosine * y
+        rotated = np.stack((cosine * x - sine * y, ec * z - es * depth_axis,
+                            es * z + ec * depth_axis), axis=-1)
+        span_x = np.ptp(rotated[..., 0])
+        span_y = np.ptp(rotated[..., 1])
         scale = self.grid_3d_zoom * min((width - 80) / max(span_x, 1), (height - 80) / max(span_y, 1))
+        rotated[..., 0] = width / 2 + self.grid_3d_offset[0] + rotated[..., 0] * scale
+        rotated[..., 1] = height / 2 + self.grid_3d_offset[1] - rotated[..., 1] * scale
+        projected_slots = rotated.tolist()
 
         def screen(point):
             x, y, depth = self.project_grid_3d(point, centre)
@@ -6199,61 +6214,79 @@ class GridMapEditorApp:
                 depth,
             )
 
-        colour = "#e7bd55" if layout.system_type == "AMR" else "#70add1"
+        slot_colours = ("#e7bd55", "#f1d17b") if layout.system_type == "AMR" else ("#70add1", "#9bc9e2")
         faces = []
         rack_tops = {}
-        face_indexes = (1, 3, 5) if self.grid_3d_quality == "interactive" else range(6)
-        render_groups = self.grid_3d_zoom < 1.3 and self.grid_3d_quality == "idle"
-        render_items = cache["groups"] if render_groups else cache["slots"]
-        for index, item in enumerate(render_items):
+        interactive = self.grid_3d_quality == "interactive"
+        face_vertices = ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
+                         (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7))
+        # One continuous outline per slot keeps every slot visible during motion.
+        outline = (0, 1, 2, 3, 0, 4, 5, 1, 5, 6, 2, 6, 7, 3, 7, 4)
+        for index, item in enumerate(cache["slots"]):
             slot = item["slot"]
-            for face_index in face_indexes:
-                face = item["faces"][face_index]
-                projected = [screen(point) for point in face]
-                key = ("group" if render_groups else "slot", index, face_index)
-                faces.append((sum(point[2] for point in projected) / 4, key, projected))
+            points = projected_slots[index]
+            if interactive:
+                faces.append((0, ("wire", index, 0), [points[vertex] for vertex in outline]))
+            else:
+                for face_index, indices in enumerate(face_vertices):
+                    projected = [points[vertex] for vertex in indices]
+                    faces.append((sum(point[2] for point in projected) / 4,
+                                  ("slot", index, face_index), projected))
             rack_tops[slot["rack_id"]] = (
                 slot["center_x"], slot["center_y"], layout.rack_height_m
             )
         active_items = set()
+        previous_items = getattr(self, "grid_3d_active_items", set(self.grid_3d_items))
         for _depth, key, face in sorted(faces):
+            slot = cache["slots"][key[1]]["slot"]
+            colour = slot_colours[(int(slot["slot"]) - 1) % 2]
             active_items.add(key)
             coordinates = [coordinate for point in face for coordinate in point[:2]]
-            tags = ("slot3d", f"slot3d_{key[1]}") if key[0] == "slot" else ("lod3d",)
+            tags = ("slot3d", f"slot3d_{key[1]}", "scene3d")
             item_id = self.grid_3d_items.get(key)
             if item_id is None:
-                item_id = canvas.create_polygon(
-                    coordinates, fill=colour, outline="#30434a", width=1,
-                    tags=tags,
-                )
+                if interactive:
+                    item_id = canvas.create_line(coordinates, fill="#526b77", width=1, tags=tags)
+                else:
+                    item_id = canvas.create_polygon(
+                        coordinates, fill=colour, outline="#30434a", width=1, tags=tags,
+                    )
                 self.grid_3d_items[key] = item_id
             else:
                 canvas.coords(item_id, coordinates)
-                canvas.itemconfigure(item_id, state="normal", fill=colour, outline="#30434a")
-        for key, item_id in self.grid_3d_items.items():
-            if key not in active_items:
-                canvas.itemconfigure(item_id, state="hidden")
+                if key not in previous_items:
+                    canvas.itemconfigure(item_id, state="normal")
+                if not interactive:
+                    canvas.itemconfigure(item_id, fill=colour)
+            if not interactive:
+                canvas.tag_raise(item_id)
+        for key in previous_items - active_items:
+            canvas.itemconfigure(self.grid_3d_items[key], state="hidden")
+        self.grid_3d_active_items = active_items
         if self.grid_3d_quality == "idle":
             for rack_id, (x, y, z) in rack_tops.items():
                 sx, sy, _depth = screen((x, y, z))
                 text_id = self.grid_3d_text_items.get(("rack", rack_id))
                 if text_id is None:
-                    text_id = canvas.create_text(sx, sy - 8, text=rack_id, anchor="s", fill="#20343d")
+                    text_id = canvas.create_text(sx, sy - 8, text=rack_id, anchor="s", fill="#20343d", tags=("scene3d",))
                     self.grid_3d_text_items[("rack", rack_id)] = text_id
                 else:
                     canvas.coords(text_id, sx, sy - 8)
                     canvas.itemconfigure(text_id, state="normal")
+                canvas.tag_raise(text_id)
             help_id = self.grid_3d_text_items.get(("help", ""))
-            help_text = f"{layout.system_type} · drag to rotate · right-drag to pan · wheel to zoom"
+            help_text = f"{layout.system_type} · {len(layout.slots):,} slots · click a slot for details · drag to rotate · right-drag to pan · wheel to zoom"
             if help_id is None:
                 self.grid_3d_text_items[("help", "")] = canvas.create_text(
                     12, 12, anchor="nw", fill="#4d646d", text=help_text,
                 )
             else:
                 canvas.itemconfigure(help_id, state="normal", text=help_text)
-        else:
+                canvas.tag_raise(help_id)
+        elif getattr(self, "grid_3d_previous_quality", None) != "interactive":
             for item_id in self.grid_3d_text_items.values():
                 canvas.itemconfigure(item_id, state="hidden")
+        self.grid_3d_previous_quality = self.grid_3d_quality
         canvas.tag_bind("slot3d", "<Button-1>", self.on_grid_3d_pick)
 
     def get_grid_3d_cache(self, layout):
@@ -6267,29 +6300,12 @@ class GridMapEditorApp:
         if self.grid_3d_cache is not None and self.grid_3d_cache["signature"] == signature:
             return self.grid_3d_cache
         slots = [{"slot": slot, "faces": self.slot_cuboid_faces(slot)} for slot in layout.slots]
-        grouped = {}
-        for item in slots:
-            slot = item["slot"]
-            grouped.setdefault((slot["rack_id"], slot["level"]), []).append(item)
-        groups = []
-        for (rack_id, level), items in sorted(grouped.items()):
-            points = [point for item in items for face in item["faces"] for point in face]
-            min_x, max_x = min(point[0] for point in points), max(point[0] for point in points)
-            min_y, max_y = min(point[1] for point in points), max(point[1] for point in points)
-            min_z, max_z = min(point[2] for point in points), max(point[2] for point in points)
-            group_slot = {
-                "rack_id": rack_id, "level": level, "slot": 0,
-                "center_x": (min_x + max_x) / 2, "center_y": (min_y + max_y) / 2,
-                "center_z": (min_z + max_z) / 2, "length": max_y - min_y,
-                "width": max_x - min_x, "height": max_z - min_z,
-            }
-            groups.append({"slot": group_slot, "faces": self.slot_cuboid_faces(group_slot)})
         points = [point for item in slots for face in item["faces"] for point in face]
         self.grid_3d_cache = {
             "signature": signature,
             "slots": slots,
-            "groups": groups,
             "points": points,
+            "vertices": np.asarray([item["faces"][0] + item["faces"][1] for item in slots], dtype=float),
             "centre": (
                 sum(point[0] for point in points) / len(points),
                 sum(point[1] for point in points) / len(points),
@@ -6314,7 +6330,7 @@ class GridMapEditorApp:
         if idle:
             if self.grid_3d_idle_after is not None:
                 self.root.after_cancel(self.grid_3d_idle_after)
-            self.grid_3d_idle_after = self.root.after(80, self.finish_grid_3d_interaction)
+            self.grid_3d_idle_after = self.root.after(140, self.finish_grid_3d_interaction)
             return
         if self.grid_3d_redraw_after is None:
             self.grid_3d_redraw_after = self.root.after(16, self.flush_grid_3d_redraw)
@@ -6326,6 +6342,8 @@ class GridMapEditorApp:
 
     def finish_grid_3d_interaction(self):
         self.grid_3d_idle_after = None
+        if self.grid_3d_drag is not None:
+            return
         self.grid_3d_quality = "idle"
         self.schedule_grid_3d_redraw()
 
@@ -6349,6 +6367,9 @@ class GridMapEditorApp:
         )
 
     def start_grid_3d_rotation(self, event):
+        if self.grid_3d_idle_after is not None:
+            self.root.after_cancel(self.grid_3d_idle_after)
+            self.grid_3d_idle_after = None
         self.grid_3d_drag = (event.x, event.y)
         self.schedule_grid_3d_redraw(interactive=True)
 
@@ -6363,7 +6384,6 @@ class GridMapEditorApp:
         )
         self.grid_3d_drag = (event.x, event.y)
         self.schedule_grid_3d_redraw(interactive=True)
-        self.schedule_grid_3d_redraw(idle=True)
 
     def end_grid_3d_rotation(self, _event):
         self.grid_3d_drag = None
@@ -6380,13 +6400,14 @@ class GridMapEditorApp:
             self.grid_3d_offset[0] + event.x - old_x,
             self.grid_3d_offset[1] + event.y - old_y,
         )
+        self.grid_3d_canvas.move("scene3d", event.x - old_x, event.y - old_y)
         self.grid_3d_pan = (event.x, event.y)
-        self.schedule_grid_3d_redraw()
 
     def zoom_grid_3d(self, event):
         zoom_in = event.num == 4 or getattr(event, "delta", 0) > 0
         self.grid_3d_zoom = max(0.25, min(8.0, self.grid_3d_zoom * (1.1 if zoom_in else 1 / 1.1)))
-        self.schedule_grid_3d_redraw()
+        self.schedule_grid_3d_redraw(interactive=True)
+        self.schedule_grid_3d_redraw(idle=True)
 
     def on_grid_3d_pick(self, event):
         tags = self.grid_3d_canvas.gettags("current")
@@ -7343,14 +7364,7 @@ class GridMapEditorApp:
         )
 
     def ensure_grid_zone_defaults(self):
-        catalog = self.attributes.normalize_catalog(self.project.attribute_catalog)
-        for zone in sorted(set(self.project.zone_assignments.values())):
-            values = self.project.location_attributes.setdefault(zone, {})
-            for key in PHYSICAL_ATTRIBUTE_KEYS:
-                if key in catalog:
-                    values.setdefault(
-                        key, self.project.warehouse_storage_defaults[key]
-                    )
+        self.project.resolve_attribute_catalog()
 
     def apply_grid_warehouse_storage_defaults(self):
         try:
@@ -7435,9 +7449,11 @@ class GridMapEditorApp:
                 if path in paths
             }
         catalog = self.attributes.normalize_catalog(self.project.attribute_catalog)
-        self.project.location_attributes = self.attributes.validate_location_attributes(
-            self.project.location_attributes, catalog, paths
+        normalized = self.attributes.validate_location_attributes(
+            self.project.location_attributes, catalog, paths, ignore_unknown=True
         )
+        for path, values in normalized.items():
+            self.project.location_attributes.setdefault(path, {}).update(values)
         return paths
 
     def open_grid_zone_storage_settings(self):
@@ -7465,18 +7481,38 @@ class GridMapEditorApp:
         editor.grab_set()
 
     def apply_grid_zone_storage_settings(self, location_attributes):
+        unassigned = [key for key in self.project.active_sku_attributes
+                      if not any("/" not in path and values.get(key) is not None
+                                 for path, values in location_attributes.items())]
+        if unassigned:
+            from .attribute_editor import confirm_inactive_attributes
+            if not confirm_inactive_attributes(self.root, unassigned):
+                return False
         self.push_undo()
+        self.project.active_sku_attributes = [key for key in self.project.active_sku_attributes if key not in unassigned]
+        self.project.resolve_attribute_catalog()
         self.project.location_attributes = copy.deepcopy(location_attributes)
         self.update_grid_zone_summary()
+        self.sync_grid_sku_attribute_controls()
         self.redraw()
         self.status.set("Warehouse zone storage settings saved in the grid project.")
 
     def open_grid_attribute_editor(self):
         try:
-            paths = self.prepare_grid_attribute_hierarchy()
+            if self.project.storage_layout is not None and self.project.storage_layout.buffers and self.project.zone_assignments:
+                paths = self.prepare_grid_attribute_hierarchy()
+            else:
+                self.project.resolve_attribute_catalog()
+                paths = sorted(set(self.project.zone_assignments.values()))
         except (TypeError, ValueError) as exc:
             messagebox.showerror("Hierarchy attributes", str(exc))
             return
+        def import_csv():
+            if not self.load_grid_sku_attributes_dialog(parent=editor):
+                return None
+            return {"catalog": self.project.attribute_catalog,
+                    "source": self.project.sku_attribute_source,
+                    "summary": copy.deepcopy(self.project.sku_attribute_summary)}
         editor = HierarchyAttributeEditor(
             self.root,
             self.attributes,
@@ -7484,18 +7520,30 @@ class GridMapEditorApp:
             self.project.location_attributes,
             paths,
             self.apply_grid_attributes,
+            source=self.project.sku_attribute_source,
+            summary=self.project.sku_attribute_summary,
+            on_import=import_csv,
         )
         editor.grab_set()
 
     def apply_grid_attributes(self, catalog, location_attributes):
         self.push_undo()
+        self.project.active_sku_attributes = [key for key, item in catalog.items()
+                                              if item.enabled and key != OVERSIZE_CAPABLE_KEY]
+        for key, item in catalog.items():
+            if key in self.project.sku_attribute_summary.get("attributes", {}):
+                self.project.sku_attribute_summary["attributes"][key].update(item.to_dict())
         self.project.attribute_catalog = self.attributes.serialize_catalog(catalog)
         self.project.location_attributes = copy.deepcopy(location_attributes)
+        self.project.resolve_attribute_catalog()
         self.redraw()
         self.status.set(
             f"Saved {len(self.project.attribute_catalog)} warehouse attribute "
             f"definitions and {len(self.project.location_attributes)} local nodes."
         )
+        self.sync_grid_sku_attribute_controls()
+        if getattr(self, "stock_rows", None):
+            self.refresh_stock_rack_grouping()
 
     def clear_grid_zones(self):
         if not self.project.zone_assignments and not self.project.location_attributes:
@@ -7684,6 +7732,16 @@ class GridMapEditorApp:
     def save_project_dialog(self):
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Grid project", "*.json")], initialdir=str(DEFAULT_MAP_DIR), initialfile=f"{self.project.grid.map_name}.grid.json")
         if path:
+            unassigned = [key for key in self.project.active_sku_attributes
+                          if not any("/" not in node and values.get(key) is not None
+                                     for node, values in self.project.location_attributes.items())]
+            if unassigned:
+                from .attribute_editor import confirm_inactive_attributes
+                if not confirm_inactive_attributes(self.root, unassigned):
+                    return
+                self.push_undo()
+                self.project.active_sku_attributes = [key for key in self.project.active_sku_attributes if key not in unassigned]
+                self.project.resolve_attribute_catalog()
             try: self.project.validate(); self.rmf_maps.save_project(self.project, Path(path)); self.status.set(f"Project saved: {path}")
             except (OSError, ValueError) as exc: messagebox.showerror("Save failed", str(exc))
 

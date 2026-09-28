@@ -214,6 +214,9 @@ class InventoryService:
         effective, _sources = self.attributes.effective_attributes(
             target_address, location_attributes
         )
+        definitions = self.attributes.normalize_catalog(attribute_catalog)
+        effective = {key: value for key, value in effective.items()
+                     if key in definitions and definitions[key].enabled}
         requirements = row.get("sku_requirements", {})
         configured_keys = self.attributes.configured_zone_attribute_keys(
             location_attributes
@@ -269,7 +272,8 @@ class InventoryService:
                         "oversize location"
                     )
         overrides = self.attributes.required_local_overrides(
-            requirements, effective, attribute_catalog
+            {key: value for key, value in requirements.items()
+             if key in definitions and definitions[key].enabled}, effective, attribute_catalog
         )
         effective_after = {**effective, **overrides}
         issues = [

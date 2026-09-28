@@ -514,6 +514,8 @@ class CtbsaPlacementPlanner:
         definitions = self.slotting.attributes.normalize_catalog(
             attribute_catalog
         )
+        active_attribute_keys = [key for key in active_attribute_keys
+                                 if key in definitions and getattr(definitions[key], "enabled", True)]
 
         def rack_attribute_profile(rack: dict) -> tuple:
             zone = str(rack.get("zone_id", ""))

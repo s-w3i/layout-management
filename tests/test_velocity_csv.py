@@ -6,7 +6,7 @@ import unittest
 
 from openpyxl import Workbook
 
-from sku_velocity_analysis import generate_velocity_csv
+from warehouse_layout.sku_velocity_analysis import generate_velocity_csv
 from warehouse_layout.slotting import SlottingService
 
 
