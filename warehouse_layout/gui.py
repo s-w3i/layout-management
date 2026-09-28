@@ -42,7 +42,6 @@ from .config import (
 from .ctbsa import CtbsaParameters
 from .domain import GridLane, GridPosition, GridProject, GridSpec, Marker, StorageLayout
 from .inventory import InventoryService
-from .global_traffic_gui import GlobalTrafficOptimizerTab
 from .rmf import RmfMapService
 from .slotting import SlottingLayoutRepository, SlottingService
 from .storage_planning import combined_occupied_dynamic_address
@@ -431,20 +430,20 @@ class GridMapEditorApp:
         self.notebook = notebook
         notebook.grid(row=0, column=0, sticky="nsew")
         map_tab = ttk.Frame(notebook)
+        velocity_tab = ttk.Frame(notebook)
         affinity_tab = ttk.Frame(notebook)
         stock_tab = ttk.Frame(notebook)
         slotting_tab = ttk.Frame(notebook)
         slotting_layout_tab = ttk.Frame(notebook)
         traffic_tab = ttk.Frame(notebook)
-        global_traffic_tab = ttk.Frame(notebook)
         operations_tab = ttk.Frame(notebook)
         notebook.add(map_tab, text="Grid Map Editor")
+        notebook.add(velocity_tab, text="ABC Velocity")
         notebook.add(affinity_tab, text="SKU Affinity")
         notebook.add(stock_tab, text="Stock Requirements")
         notebook.add(slotting_tab, text="Inventory Slotting")
-        notebook.add(slotting_layout_tab, text="Interactive Slotting Layout")
         notebook.add(traffic_tab, text="Traffic-Aware Slotting")
-        notebook.add(global_traffic_tab, text="Global Traffic Optimizer")
+        notebook.add(slotting_layout_tab, text="Interactive Slotting Layout")
         notebook.add(operations_tab, text="Inventory Operations Demo")
         map_tab.columnconfigure(0, weight=1)
         map_tab.rowconfigure(0, weight=1)
@@ -783,14 +782,12 @@ class GridMapEditorApp:
             text="Colored outline + badge = assigned zone",
             foreground="#4d646d",
         ).grid(row=0, column=4, sticky="w")
+        self._build_velocity_tab(velocity_tab)
         self._build_affinity_tab(affinity_tab)
         self._build_stock_tab(stock_tab)
         self._build_slotting_tab(slotting_tab)
         self._build_interactive_slotting_tab(slotting_layout_tab)
         self._build_traffic_tab(traffic_tab)
-        self.global_traffic_ui = GlobalTrafficOptimizerTab(
-            global_traffic_tab, self
-        )
         self._build_operations_tab(operations_tab)
 
     def _build_stock_tab(self, parent):
@@ -1996,6 +1993,101 @@ class GridMapEditorApp:
             "Affinity export",
             "Created:\n"
             f"{json_path.name}\n{store_path.name}\n{pair_path.name}",
+        )
+
+    def _build_velocity_tab(self, parent):
+        self.velocity_input_path = tk.StringVar(value=str(DEFAULT_AFFINITY_INPUT))
+        self.velocity_output_path = tk.StringVar(value=str(DEFAULT_VELOCITY_INPUT))
+        self.velocity_a_limit = tk.StringVar(value="0.80")
+        self.velocity_b_limit = tk.StringVar(value="0.95")
+        self.velocity_status = tk.StringVar(value="Choose a transaction workbook to generate its ABC velocity CSV.")
+        self.velocity_messages = queue.Queue()
+        self.velocity_worker = None
+        parent.columnconfigure(0, weight=1)
+        form = ttk.LabelFrame(parent, text="ABC velocity CSV", padding=12)
+        form.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        form.columnconfigure(1, weight=1)
+        for row, (label, variable) in enumerate((
+            ("Transaction workbook", self.velocity_input_path),
+            ("Output CSV", self.velocity_output_path),
+            ("A cumulative share", self.velocity_a_limit),
+            ("B cumulative share", self.velocity_b_limit),
+        )):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+            ttk.Entry(form, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Button(form, text="Browse…", command=lambda: self.browse_slot_input(
+            self.velocity_input_path, [("Excel workbook", "*.xlsx"), ("All files", "*")]
+        )).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(form, text="Browse…", command=self.browse_velocity_output).grid(row=1, column=2, padx=(8, 0))
+        ttk.Label(form, text="Required columns: Date, Item or SKU, Quantity (in EA). Uses the active worksheet.\n"
+                  "Classes use cumulative pick frequency; defaults are A = 80%, B = 95%, C = the remainder.").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=8)
+        self.velocity_generate_button = ttk.Button(form, text="Generate ABC velocity CSV", command=self.generate_velocity_csv)
+        self.velocity_generate_button.grid(row=5, column=0, columnspan=3, sticky="w")
+        ttk.Label(parent, textvariable=self.velocity_status, wraplength=900).grid(row=1, column=0, sticky="w", padx=12, pady=8)
+
+    def browse_velocity_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Save ABC velocity CSV", defaultextension=".csv",
+            initialfile="sku_velocity_summary.csv", filetypes=[("CSV", "*.csv")],
+        )
+        if path:
+            self.velocity_output_path.set(path)
+
+    def generate_velocity_csv(self):
+        if self.velocity_worker is not None and self.velocity_worker.is_alive():
+            return
+        try:
+            input_path = Path(self.velocity_input_path.get().strip()).expanduser().resolve()
+            output_text = self.velocity_output_path.get().strip()
+            if not input_path.is_file():
+                raise ValueError("Choose an existing transaction workbook.")
+            if not output_text:
+                raise ValueError("Choose an output CSV path.")
+            output_path = Path(output_text).expanduser().resolve()
+            if output_path == input_path:
+                raise ValueError("Output CSV must differ from the input workbook.")
+            a_limit = float(self.velocity_a_limit.get())
+            b_limit = float(self.velocity_b_limit.get())
+            if not 0 < a_limit < b_limit <= 1:
+                raise ValueError("Require 0 < A cumulative share < B cumulative share <= 1.")
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("ABC velocity CSV", str(exc))
+            return
+        self.velocity_generate_button.configure(state="disabled")
+        self.velocity_status.set("Reading transactions and generating ABC velocity CSV…")
+
+        def worker():
+            try:
+                from sku_velocity_analysis import generate_velocity_csv
+                rows, _daily = generate_velocity_csv(input_path, output_path, a_limit, b_limit)
+                self.velocity_messages.put(("done", output_path, rows))
+            except (Exception, SystemExit) as exc:
+                self.velocity_messages.put(("error", str(exc)))
+
+        self.velocity_worker = threading.Thread(target=worker, daemon=True)
+        self.velocity_worker.start()
+        self.root.after(80, self.poll_velocity_generation)
+
+    def poll_velocity_generation(self):
+        try:
+            message = self.velocity_messages.get_nowait()
+        except queue.Empty:
+            self.root.after(80, self.poll_velocity_generation)
+            return
+        self.velocity_generate_button.configure(state="normal")
+        if message[0] == "error":
+            self.velocity_status.set("ABC velocity CSV generation failed.")
+            messagebox.showerror("ABC velocity CSV", message[1])
+            return
+        _, output_path, rows = message
+        self.slot_velocity_path.set(str(output_path))
+        self.traffic_velocity_path.set(str(output_path))
+        picks = sum(row["pick_frequency"] for row in rows)
+        counts = ", ".join(f"{label}: {sum(row['velocity_class'] == label for row in rows):,}" for label in ("A", "B", "C"))
+        self.velocity_status.set(
+            f"Generated {output_path}\n{picks:,} picks across {len(rows):,} SKUs ({counts}). "
+            "Inventory Slotting and Traffic-Aware Slotting now use this CSV."
         )
 
     def _build_slotting_tab(self, parent):

@@ -5,11 +5,11 @@ a deterministic discrete-event simulator.
 
 ## Quick start
 
-Requirements: Python 3.10+, Tkinter, PyYAML, openpyxl, matplotlib, and OR-Tools.
+Requirements: Python 3.10+, Tkinter, PyYAML, openpyxl, and matplotlib.
 
 ```bash
 sudo apt install python3 python3-tk python3-pip
-python3 -m pip install PyYAML openpyxl matplotlib ortools
+python3 -m pip install PyYAML openpyxl matplotlib
 git clone https://github.com/s-w3i/layout-management.git
 cd layout-management
 python3 rmf_grid_map_editor.py
@@ -82,9 +82,9 @@ The window includes play/pause, next-event, restart, and speed controls. Use
 ## Workflow
 
 1. Create the grid, racks, workstations, zones, and lanes in **Grid Map Editor**.
-2. Analyze orders in **SKU Affinity** and calculate stock requirements.
+2. Generate the dataset’s CSV in **ABC Velocity**, analyze orders in **SKU Affinity**, and calculate stock requirements.
 3. Generate a layout in **Inventory Slotting**.
-4. Improve it with **Traffic-Aware Slotting** or **Global Traffic Optimizer**.
+4. Improve it with **Traffic-Aware Slotting**.
 5. Compare throughput in batch mode, then inspect one date in live mode.
 
 ## Simulator behavior
@@ -129,7 +129,7 @@ Multiple layouts also produce `layout_comparison.csv`. Detailed runs add
 **Missing Python module**
 
 ```bash
-python3 -m pip install PyYAML openpyxl matplotlib ortools
+python3 -m pip install PyYAML openpyxl matplotlib
 ```
 
 **Tkinter is missing**

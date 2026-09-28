@@ -98,7 +98,8 @@ def read_transactions(input_path: Path):
             header = candidate
             break
     if not header:
-        raise ValueError("The workbook is empty.")
+        workbook.close()
+        raise ValueError("No worksheet header found with Date, Item or SKU, Quantity (in EA).")
     positions = {str(value).strip(): index for index, value in enumerate(header) if value is not None}
     required = {"Date", "Item or SKU", "Quantity (in EA)"}
     missing = required - positions.keys()
@@ -199,29 +200,18 @@ def plot_demand(daily_demand: dict[str, dict[date, float]], classes: dict[str, s
         plt.close(fig)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help="Input .xlsx transaction workbook")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Output folder (inside data folder by default)")
-    parser.add_argument("--a-limit", type=float, default=0.80, help="Cumulative pick-frequency share ending class A")
-    parser.add_argument("--b-limit", type=float, default=0.95, help="Cumulative pick-frequency share ending class B")
-    parser.add_argument("--chilled-output", type=Path, default=DEFAULT_CHILLED_OUTPUT, help="Deterministic demo chilled-requirements CSV")
-    parser.add_argument("--chilled-rate", type=float, default=0.10, help="Share of unique SKUs selected for the chilled demo")
-    parser.add_argument("--chilled-seed", type=int, default=42, help="Random seed for the chilled demo")
-    parser.add_argument("--skip-plots", action="store_true", help="Write CSV outputs without regenerating demand plot images")
-    args = parser.parse_args()
-    if not 0 < args.a_limit < args.b_limit <= 1:
-        parser.error("Require 0 < --a-limit < --b-limit <= 1")
-    if not 0 <= args.chilled_rate <= 1:
-        parser.error("Require 0 <= --chilled-rate <= 1")
-    if not args.input.exists():
-        parser.error(f"Input workbook not found: {args.input}")
-
+def generate_velocity_csv(
+    input_path: Path, summary_path: Path, a_limit: float = 0.80,
+    b_limit: float = 0.95,
+) -> tuple[list[dict], dict]:
+    """Write the ABC summary used by slotting and return rows and daily demand."""
+    if not 0 < a_limit < b_limit <= 1:
+        raise ValueError("Require 0 < A limit < B limit <= 1")
     frequency = defaultdict(int)
     quantity = defaultdict(float)
     daily_demand = defaultdict(lambda: defaultdict(float))
     physical_maxima = defaultdict(dict)
-    for sku, picked_date, qty, physical in read_transactions(args.input):
+    for sku, picked_date, qty, physical in read_transactions(input_path):
         frequency[sku] += 1
         quantity[sku] += qty
         daily_demand[sku][picked_date] += qty
@@ -253,9 +243,10 @@ def main() -> None:
             "physical_data_status": data_status,
             "physical_storage_class": storage_class,
         })
-    summary = classify(summary, args.a_limit, args.b_limit)
-    args.output.mkdir(parents=True, exist_ok=True)
-    summary_path = args.output / "sku_velocity_summary.csv"
+    if not summary:
+        raise ValueError("No valid transactions found; check Date and Item or SKU values.")
+    summary = classify(summary, a_limit, b_limit)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "sku", "pick_frequency", "total_quantity_ea", "active_days",
         "cumulative_frequency_share", "velocity_class",
@@ -266,13 +257,38 @@ def main() -> None:
         writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(summary)
+    return summary, daily_demand
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help="Input .xlsx transaction workbook")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Output folder (inside data folder by default)")
+    parser.add_argument("--a-limit", type=float, default=0.80, help="Cumulative pick-frequency share ending class A")
+    parser.add_argument("--b-limit", type=float, default=0.95, help="Cumulative pick-frequency share ending class B")
+    parser.add_argument("--chilled-output", type=Path, default=DEFAULT_CHILLED_OUTPUT, help="Deterministic demo chilled-requirements CSV")
+    parser.add_argument("--chilled-rate", type=float, default=0.10, help="Share of unique SKUs selected for the chilled demo")
+    parser.add_argument("--chilled-seed", type=int, default=42, help="Random seed for the chilled demo")
+    parser.add_argument("--skip-plots", action="store_true", help="Write CSV outputs without regenerating demand plot images")
+    args = parser.parse_args()
+    if not 0 < args.a_limit < args.b_limit <= 1:
+        parser.error("Require 0 < --a-limit < --b-limit <= 1")
+    if not 0 <= args.chilled_rate <= 1:
+        parser.error("Require 0 <= --chilled-rate <= 1")
+    if not args.input.exists():
+        parser.error(f"Input workbook not found: {args.input}")
+
+    summary_path = args.output / "sku_velocity_summary.csv"
+    summary, daily_demand = generate_velocity_csv(
+        args.input, summary_path, args.a_limit, args.b_limit
+    )
     chilled_count = write_chilled_demo(
-        args.chilled_output, frequency, args.chilled_rate, args.chilled_seed
+        args.chilled_output, (row["sku"] for row in summary), args.chilled_rate, args.chilled_seed
     )
     if not args.skip_plots:
         classes = {row["sku"]: row["velocity_class"] for row in summary}
         plot_demand(daily_demand, classes, args.output)
-    print(f"Processed {sum(frequency.values()):,} picks across {len(summary):,} SKUs.")
+    print(f"Processed {sum(row['pick_frequency'] for row in summary):,} picks across {len(summary):,} SKUs.")
     print(f"Summary: {summary_path}")
     print(
         f"Chilled: {args.chilled_output} ({chilled_count:,} SKUs; "

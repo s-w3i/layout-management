@@ -28,6 +28,11 @@ value observed for each SKU is retained without unit conversion.
 
 ## Run the analysis
 
+In the desktop app, open **ABC Velocity**, choose your transaction workbook and
+output CSV, adjust the cumulative A/B shares if needed, and click **Generate ABC
+velocity CSV**. The generated CSV is selected automatically in Inventory Slotting
+and Traffic-Aware Slotting. This action creates only the velocity CSV.
+
 From the repository root:
 
 ```bash
