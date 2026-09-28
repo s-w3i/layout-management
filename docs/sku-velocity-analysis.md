@@ -1,6 +1,6 @@
 # SKU Velocity Analysis
 
-`sku_velocity_analysis.py` reads transaction rows from an Excel workbook,
+`warehouse_layout/sku_velocity_analysis.py` reads transaction rows from an Excel workbook,
 classifies SKUs by pick frequency, extracts conservative one-unit physical
 profiles, plots daily demand for every SKU, and creates a deterministic chilled
 requirements demo.
@@ -36,13 +36,13 @@ and Traffic-Aware Slotting. This action creates only the velocity CSV.
 From the repository root:
 
 ```bash
-python3 sku_velocity_analysis.py
+python3 -m warehouse_layout.sku_velocity_analysis
 ```
 
 Use `--skip-plots` when only the CSV inputs need refreshing:
 
 ```bash
-python3 sku_velocity_analysis.py --skip-plots
+python3 -m warehouse_layout.sku_velocity_analysis --skip-plots
 ```
 
 Install the required packages if necessary:
@@ -63,7 +63,7 @@ pick-frequency share:
 Custom boundaries and paths can be supplied from the command line:
 
 ```bash
-python3 sku_velocity_analysis.py \
+python3 -m warehouse_layout.sku_velocity_analysis \
   --input resources/data/Sample\ Data.xlsx \
   --output resources/data/sku_velocity_output \
   --a-limit 0.80 \

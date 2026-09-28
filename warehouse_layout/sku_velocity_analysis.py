@@ -25,9 +25,10 @@ from warehouse_layout.attributes import (
 )
 
 
-DEFAULT_INPUT = Path("resources/data/Sample Data.xlsx")
-DEFAULT_OUTPUT = Path("resources/data/sku_velocity_output")
-DEFAULT_CHILLED_OUTPUT = Path("resources/data/demo_chilled_requirements.csv")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_INPUT = PROJECT_ROOT / "resources/data/Sample Data.xlsx"
+DEFAULT_OUTPUT = PROJECT_ROOT / "resources/data/sku_velocity_output"
+DEFAULT_CHILLED_OUTPUT = PROJECT_ROOT / "resources/data/demo_chilled_requirements.csv"
 
 
 def excel_date(value) -> date | None:

@@ -2059,7 +2059,7 @@ class GridMapEditorApp:
 
         def worker():
             try:
-                from sku_velocity_analysis import generate_velocity_csv
+                from .sku_velocity_analysis import generate_velocity_csv
                 rows, _daily = generate_velocity_csv(input_path, output_path, a_limit, b_limit)
                 self.velocity_messages.put(("done", output_path, rows))
             except (Exception, SystemExit) as exc:
