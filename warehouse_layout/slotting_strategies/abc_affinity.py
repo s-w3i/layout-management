@@ -174,6 +174,7 @@ class AbcAffinitySlottingStrategy:
                 auto_plan_oversize=auto_plan_oversize,
                 zone_workload_enabled=zone_workload_enabled,
                 maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
+                quantity_feasibility_seed=baseline_rows,
             )
             # Both strategies already use the same shared hard-rule allocator.
             # Preserve Basic's assignment coverage at every affinity weight;

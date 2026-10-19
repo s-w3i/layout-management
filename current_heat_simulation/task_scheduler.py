@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import math
 
 from amr_simulation.models import Rack, SimulationConfig, WorkloadTask, grid_position
+from warehouse_layout.rack_selection import rack_selection_key
 
 from .astar_planner import WarehouseMap
 from .sim_types import ExecuteTask, RobotSnapshot
@@ -93,7 +94,7 @@ class StoreDayScheduler:
                 rack = self.racks[rack_id]
                 covered = sorted(rack.skus & task.outstanding.keys())
                 x, y = self.map.point(rack_id)
-                candidates.append((-len(covered), math.hypot(station_x-x, station_y-y), rack_id, covered))
+                candidates.append((*rack_selection_key(len(covered), math.hypot(station_x-x, station_y-y), rack_id), covered))
             for _coverage, _distance, rack_id, covered in sorted(candidates):
                 choices = []
                 for name in available_robots:

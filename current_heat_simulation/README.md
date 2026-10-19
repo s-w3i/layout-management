@@ -337,3 +337,9 @@ presentations gives an unavailable value. On fully completed days this equals
 `lines_per_completed_rack_trip`. Daily summaries/CSVs include the KPI, and layout
 summaries, `layout_comparison.csv`, and the Markdown report include its arithmetic
 mean over the common completed dates.
+
+`daily_throughput_and_lines_per_presentation.png` overlays both daily metrics
+for each layout, with independent axes and a Pearson correlation over paired
+common dates. `throughput_presentation_correlation.csv` also splits observed
+log-throughput variation between lines/presentation and presentations/hour.
+These signed accounting shares are not causal estimates.

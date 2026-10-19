@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 
 from warehouse_layout.domain import GridProject
+from warehouse_layout.rack_selection import rack_selection_key
 
 from .conflict_solver import DramConflict, partial_conflicts
 from .models import (
@@ -865,7 +866,7 @@ class _Engine:
                     if covered:
                         # Rank racks without planning the future delivery stage.
                         distance = math.hypot(station_x - rack_x, station_y - rack_y)
-                        candidates.append((-len(covered), distance, rack_id, rack, covered))
+                        candidates.append((*rack_selection_key(len(covered), distance, rack_id), rack, covered))
                 for candidate in sorted(candidates):
                     rack = candidate[3]
                     owner = self.node_owners.get(rack.position)

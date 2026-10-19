@@ -5094,6 +5094,12 @@ class GridMapEditorApp:
                     f"{rack_touches['total_rack_touches']:,} "
                     f"({comparison['total_rack_touch_change_fraction'] * 100:+.2f}%)"
                 )
+            balance = summary.get("rack_zone_balance")
+            if balance is not None:
+                affinity_summary += (
+                    f" · zone balance: complete rack groups "
+                    f"({balance['moved_rack_group_count']} relocated)"
+                )
         quantity_summary = (
             f"Assigned {summary['assigned_load_count']:,}/"
             f"{summary['inventory_load_count']:,} inventory loads from "

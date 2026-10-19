@@ -11,7 +11,7 @@ import unittest
 from amr_simulation.models import WorkloadTask
 from asrs_simulation.engine import AxisMotion, Schedule
 from asrs_simulation.inputs import Crane, Tote, load_config, load_layout, load_map
-from asrs_simulation.reporting import aggregate, metrics, save_run, write_json
+from asrs_simulation.reporting import aggregate, generate_report, metrics, save_run, write_json
 from asrs_simulation.run_simulation import REQUIRED_FILES, check_resume, file_hash, read_checkpoint
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -288,6 +288,51 @@ class ASRSTests(unittest.TestCase):
         summaries, _, common = aggregate(results, ['a', 'b'], ['d1', 'd2'], 'a')
         self.assertEqual(common, [])
         self.assertIsNone(summaries[0]['mean_daily_throughput_lines_per_hour'])
+
+    def test_daily_crane_charts_use_paired_dates_and_include_idle_aisles(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        from matplotlib.figure import Figure
+        cfg, cranes, totes = fixture()
+        dates = ['2023-01-03', '2023-01-04', '2023-01-05']
+        results, plots = [], {}
+        original_savefig = Figure.savefig
+
+        def capture(figure, path, *args, **kwargs):
+            if Path(path).name in ('daily_crane_utilization.png', 'daily_crane_utilization_by_aisle.png'):
+                plots[Path(path).stem] = [[(line.get_label(), list(line.get_xdata()), list(line.get_ydata()))
+                                          for line in ax.lines] for ax in figure.axes]
+            return original_savefig(figure, path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td)
+            for name in ('a', 'b'):
+                for day, counts in zip(dates, ({'s1': 5}, {'s1': 5, 's3': 2})):
+                    daily_task = replace(task('1', counts), task_date=date.fromisoformat(day))
+                    schedule = Schedule(cfg, cranes, totes, [daily_task])
+                    schedule.run(86400)
+                    summary = save_run(output/name/day, schedule, 1.0)
+                    results.append({**summary, 'layout': name})
+                # Excluded days have no CSVs and must never be read or plotted.
+                results.append({**summary, 'layout': name, 'date': dates[2],
+                                'success_flag': False, 'status': 'incomplete', 'crane_utilization': .1})
+            with patch.object(Figure, 'savefig', capture):
+                generate_report(output, list(reversed(results)),
+                                {name: {'strategy': 'synthetic'} for name in ('a', 'b')}, dates, 'a')
+            fleet = plots['daily_crane_utilization'][0]
+            self.assertEqual([line[0] for line in fleet], ['a', 'b'])
+            for _, days, values in fleet:
+                self.assertEqual(days, dates[:2])
+                self.assertAlmostEqual(values[0], 50.)
+            for panel in plots['daily_crane_utilization_by_aisle']:
+                self.assertEqual([line[0] for line in panel], ['A', 'B'])
+                self.assertEqual(panel[0][1], dates[:2])
+                self.assertAlmostEqual(panel[0][2][0], 100.)
+                self.assertAlmostEqual(panel[1][2][0], 0.)
+            for stem in plots:
+                for extension in ('png', 'svg'):
+                    self.assertTrue((output/f'{stem}.{extension}').exists())
+                self.assertIn(f'{stem}.png', (output/'comparison_report.md').read_text())
 
     def test_pygame_renderer_and_event_loop(self):
         os.environ['SDL_VIDEODRIVER'] = 'dummy'

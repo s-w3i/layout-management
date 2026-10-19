@@ -12,7 +12,7 @@ import yaml
 
 from amr_simulation.models import Rack, WorkloadTask
 from current_heat_simulation.batch import execute_batch, fingerprint, read_checkpoint, run_day
-from current_heat_simulation.reporting import aggregate, generate_report, csv_rows
+from current_heat_simulation.reporting import aggregate, generate_report, csv_rows, throughput_presentation_chart
 from current_heat_simulation.run_metrics import TIME_CATEGORIES, write_json
 from current_heat_simulation.warehouse_system import WarehouseSystem
 from current_heat_simulation.diagnostics import DiagnosticLog
@@ -36,6 +36,21 @@ def shared_fixture(directory):
 
 
 class BatchTests(unittest.TestCase):
+    def test_throughput_presentation_chart_uses_paired_dates(self):
+        rows = [{"layout": "A", "date": day, "line_throughput_per_hour": rate,
+                 "completed_order_lines_per_rack_presentation": lines}
+                for day, rate, lines in [("2023-01-03", 20, 2), ("2023-01-04", 40, 4),
+                                         ("2023-01-05", 1000, 1)]]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, filename = throughput_presentation_chart(root, rows, ["A", "missing"], ["2023-01-03", "2023-01-04"])
+            self.assertTrue((root/"charts"/filename).exists())
+            a, missing = csv_rows(root/"throughput_presentation_correlation.csv")
+            self.assertEqual(int(a["paired_days"]), 2)
+            self.assertAlmostEqual(float(a["pearson_r"]), 1)
+            self.assertAlmostEqual(float(a["lines_per_presentation_log_variance_share"]), 1)
+            self.assertEqual(missing["pearson_r"], "")
+
     def test_all_layouts_finish_before_next_date_is_submitted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -165,7 +180,7 @@ class BatchTests(unittest.TestCase):
             (day_dir/"checkpoint.json").write_text("{interrupted")
             self.assertIsNone(read_checkpoint(day_dir, key))
             generate_report(root/"parallel", parallel, shared["layouts"], sorted(shared["days"]), "basic", small_map(root))
-            self.assertEqual(len(list((root/"parallel/charts").glob("*.png"))), 7)
+            self.assertEqual(len(list((root/"parallel/charts").glob("*.png"))), 8)
             self.assertTrue((root/"parallel/charts/completed_lines_per_rack_presentation.png").exists())
             summary = json.loads((root/"parallel/replica/summary.json").read_text())
             self.assertEqual(summary["throughput_improvement_percent"], 0)

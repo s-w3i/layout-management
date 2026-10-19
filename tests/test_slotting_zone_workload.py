@@ -52,7 +52,12 @@ class ZoneWorkloadTests(unittest.TestCase):
                 self.assertEqual(default, disabled)
                 rows, summary = self.generate(strategy, zone_workload_enabled=True)
                 self.assertEqual(summary["unassigned_count"], 0)
-                self.assertEqual([summary["zone_workload"][z]["demand"] for z in ("Z1", "Z2")], [200, 200])
+                if strategy == "basic":
+                    self.assertEqual([summary["zone_workload"][z]["demand"] for z in ("Z1", "Z2")], [200, 200])
+                else:
+                    self.assertEqual(len({row["rack_id"] for row in rows}), 1)
+                    self.assertEqual(summary["zone_balance_model"], "whole_rack_estimated_work")
+                    self.assertEqual(summary["rack_workload"]["total_presentations"], 1)
                 self.assertEqual(max(v["normalized_demand"] for v in disabled[1]["zone_workload"].values()), 100)
                 self.assertEqual(len({r["storage_location_address"] for r in rows}), 4)
                 with tempfile.TemporaryDirectory() as directory:
@@ -97,7 +102,10 @@ class ZoneWorkloadTests(unittest.TestCase):
                         continue
                     rack_slots.setdefault(row["rack_id"], []).append(row["storage_slot"])
                 self.assertEqual(sorted(map(len, rack_slots.values())), [2, 3])
-                self.assertIn([1, 2, 3], [sorted(value) for value in rack_slots.values()])
+                if strategy == "basic":
+                    self.assertIn([1, 2, 3], [sorted(value) for value in rack_slots.values()])
+                else:
+                    self.assertEqual(len({row["storage_location_address"] for row in rows}), len(rows))
                 self.assertEqual(summary["maximum_same_sku_slots_per_rack"], 3)
 
     def test_same_sku_limit_validation_and_default(self):

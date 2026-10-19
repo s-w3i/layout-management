@@ -703,6 +703,7 @@ class SlottingService:
         ctbsa_rank_by_sku: dict[str, int] | None = None,
         zone_workload_enabled: bool = False,
         maximum_same_sku_slots_per_rack: int | None = None,
+        quantity_feasibility_seed: list[dict] | None = None,
     ) -> tuple[list[dict], dict]:
         parameters = locals()
         service = parameters.pop("self")

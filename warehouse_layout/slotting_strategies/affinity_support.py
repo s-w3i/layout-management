@@ -7,6 +7,7 @@ import math
 import numpy as np
 
 from ..affinity import AffinityAnalysis
+from ..rack_selection import rack_selection_key
 
 
 def build_order_membership_masks(
@@ -51,59 +52,85 @@ def build_order_membership_masks(
     }, group_count
 
 
+def allocate_rack_visits(
+    rows: list[dict], order_masks: dict[str, int], group_count: int,
+) -> tuple[np.ndarray, dict[str, int], int]:
+    """Estimate dispatch with all racks available and mean station distances.
+
+    Like AMR dispatch, maximize distinct outstanding SKUs, then prefer distance
+    and rack ID. Stock is not depleted, matching the current simulator.
+    """
+    sku_bits = {sku: 1 << index for index, sku in enumerate(sorted(order_masks))}
+    groups = [0] * group_count
+    for sku, mask in order_masks.items():
+        while mask:
+            bit = mask & -mask
+            groups[bit.bit_length() - 1] |= sku_bits[sku]
+            mask ^= bit
+    contents: dict[str, int] = {}
+    distances = {}
+    for row in rows:
+        if row.get("assignment_status") != "ASSIGNED":
+            continue
+        rack = str(row.get("rack_id", ""))
+        if not rack:
+            continue
+        contents[rack] = contents.get(rack, 0) | sku_bits.get(str(row.get("sku", "")), 0)
+        distance = row.get("average_workstation_distance_m")
+        distances[rack] = float(distance) if distance not in (None, "") else math.inf
+    racks = sorted(contents, key=lambda rack: rack_selection_key(0, distances[rack], rack))
+    rack_contents = [(rack, contents[rack]) for rack in racks]
+    touches = np.zeros(group_count, dtype=np.int32)
+    visits = {rack: 0 for rack in racks}
+    cache = {}
+    uncovered_groups = 0
+    for group_index, required in enumerate(groups):
+        if required not in cache:
+            remaining = required
+            selected = []
+            candidates = [(rack, mask & required) for rack, mask in rack_contents if mask & required]
+            while remaining:
+                best_count, best_rack, best_mask = 0, None, 0
+                remaining_count = remaining.bit_count()
+                for rack, mask in candidates:
+                    covered = mask & remaining
+                    count = covered.bit_count()
+                    if count > best_count:
+                        best_count, best_rack, best_mask = count, rack, covered
+                        if count == remaining_count:
+                            break
+                if best_rack is None:
+                    break
+                selected.append(best_rack)
+                remaining &= ~best_mask
+            cache[required] = tuple(selected), bool(remaining)
+        selected, uncovered = cache[required]
+        touches[group_index] = len(selected)
+        uncovered_groups += uncovered
+        for rack in selected:
+            visits[rack] += 1
+    return touches, visits, uncovered_groups
+
+
 def order_rack_touch_metrics(
     analysis: AffinityAnalysis,
     rows: list[dict],
     order_masks: dict[str, int] | None = None,
 ) -> dict:
-    """Measure distinct handling-unit rack touches per store-day group."""
+    """Estimate joint rack selection per store/day; do not allocate SKUs independently."""
     if order_masks is None:
         order_masks, group_count = build_order_membership_masks(analysis)
     else:
         group_count = analysis.store_day_count
-    sku_rack_weights: dict[str, dict[str, float]] = {}
-    for row in rows:
-        if row.get("assignment_status") != "ASSIGNED":
-            continue
-        rack_id = str(row.get("rack_id", ""))
-        sku = str(row.get("sku", ""))
-        if rack_id and sku in order_masks:
-            try:
-                weight = float(row.get("quantity_ea") or 1)
-            except (TypeError, ValueError):
-                weight = 1.0
-            sku_rack_weights.setdefault(sku, {})[rack_id] = (
-                sku_rack_weights.setdefault(sku, {}).get(rack_id, 0.0)
-                + max(0.0, weight)
-            )
-    rack_masks: dict[str, int] = {}
-    for sku, rack_weights in sorted(sku_rack_weights.items()):
-        assigned = {rack_id: 0 for rack_id in rack_weights}
-        remaining = order_masks.get(sku, 0)
-        while remaining:
-            bit = remaining & -remaining
-            rack_id = min(
-                rack_weights,
-                key=lambda value: (
-                    (assigned[value] + 1) / (rack_weights[value] or 1.0),
-                    value,
-                ),
-            )
-            rack_masks[rack_id] = rack_masks.get(rack_id, 0) | bit
-            assigned[rack_id] += 1
-            remaining ^= bit
-    touches = np.zeros(group_count, dtype=np.int32)
-    for mask in rack_masks.values():
-        remaining = mask
-        while remaining:
-            least_bit = remaining & -remaining
-            touches[least_bit.bit_length() - 1] += 1
-            remaining ^= least_bit
+    touches, rack_visits, uncovered_groups = allocate_rack_visits(rows, order_masks, group_count)
     observed = touches[touches > 0]
     total = int(observed.sum()) if len(observed) else 0
     return {
         "fulfillment_group_count": int(len(observed)),
         "total_rack_touches": total,
+        "allocation_model": "amr_maximum_sku_coverage_all_racks_available_mean_station_distance",
+        "uncovered_group_count": uncovered_groups,
+        "rack_visit_counts": rack_visits,
         "average_racks_per_group": (
             float(observed.mean()) if len(observed) else 0.0
         ),
@@ -132,6 +159,36 @@ def handling_unit_visit_metrics(
     order_masks, _group_count = build_order_membership_masks(
         analysis, sku_names
     )
+    if handling_unit_type == "AMR shelf":
+        _touches, visits, _uncovered = allocate_rack_visits(rows, order_masks, _group_count)
+        locations = {
+            str(row["rack_id"]): row for row in rows
+            if row.get("assignment_status") == "ASSIGNED" and row.get("rack_id")
+        }
+        ranked = sorted((rack for rack in visits if visits[rack]), key=lambda rack: (-visits[rack], rack))
+        total = sum(visits.values())
+        cumulative = 0
+        units = []
+        for rank, rack in enumerate(ranked, 1):
+            previous_share = cumulative / total if total else 0
+            cumulative += visits[rack]
+            location = locations[rack]
+            units.append({
+                **{key: location.get(key, "") for key in (
+                    "handling_unit_id", "rack_id", "storage_level", "storage_slot",
+                )},
+                "visit_rank": rank, "visit_count": visits[rack],
+                "visit_rate": visits[rack] / analysis.store_day_count if analysis.store_day_count else 0,
+                "visit_share": visits[rack] / total if total else 0,
+                "cumulative_visit_share": cumulative / total if total else 0,
+                "movement_class": "A" if previous_share < .8 else "B" if previous_share < .95 else "C",
+            })
+        return {
+            "grouping": "Store ID + Date", "fulfillment_group_count": analysis.store_day_count,
+            "handling_unit_type": handling_unit_type, "ranking_level": "shelf",
+            "allocation_model": "amr_maximum_sku_coverage_all_racks_available_mean_station_distance",
+            "total_handling_unit_visits": total, "unit_count": len(units), "units": units,
+        }
     unit_masks: dict[str, int] = {}
     unit_locations: dict[str, dict] = {}
     sku_sources: dict[str, dict[str, dict]] = {}
@@ -469,39 +526,39 @@ def affinity_layout_metrics(
     minimum_affinity_score: float,
     coordinate_scale: float,
 ) -> dict:
+    assigned: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("assignment_status") == "ASSIGNED":
+            assigned.setdefault(str(row.get("sku", "")), []).append(row)
     assigned = {
-        str(row.get("sku", "")): row
-        for row in rows
-        if row.get("assignment_status") == "ASSIGNED"
+        sku: sorted(copies, key=lambda row: (
+            str(row.get("rack_id", "")), str(row.get("inventory_load_id", "")),
+            int(row.get("storage_level") or 0), int(row.get("storage_slot") or 0),
+        )) for sku, copies in sorted(assigned.items())
     }
     rack_by_id = {rack["rack_id"]: rack for rack in racks}
     dataset_index = {
         sku: index for index, sku in enumerate(analysis.dataset.skus)
     }
-    skus = [
+    skus = sorted(
         sku for sku in assigned
         if sku in dataset_index
-        and assigned[sku].get("rack_id") in rack_by_id
-    ]
+        and any(row.get("rack_id") in rack_by_id for row in assigned[sku])
+    )
     pair_weight = 0.0
     pair_distance = 0.0
     same_rack_weight = 0.0
     retained_pairs = 0
     if len(skus) >= 2:
         indices = np.array([dataset_index[sku] for sku in skus], dtype=np.int32)
-        coordinates = np.array(
-            [
-                [
-                    float(rack_by_id[assigned[sku]["rack_id"]]["x"]),
-                    float(rack_by_id[assigned[sku]["rack_id"]]["y"]),
-                ]
-                for sku in skus
-            ],
-            dtype=np.float64,
-        )
-        rack_ids = np.array(
-            [str(assigned[sku]["rack_id"]) for sku in skus]
-        )
+        rack_ids = sorted(rack_by_id)
+        rack_indices = {rack: index for index, rack in enumerate(rack_ids)}
+        coordinates = np.array([[rack_by_id[rack]["x"], rack_by_id[rack]["y"]] for rack in rack_ids], dtype=np.float64)
+        rack_distances = np.linalg.norm(coordinates[:, None, :] - coordinates[None, :, :], axis=2) * coordinate_scale
+        sku_racks = [sorted({rack_indices[row["rack_id"]] for row in assigned[sku] if row.get("rack_id") in rack_indices}) for sku in skus]
+        nearest_rack = np.array([rack_distances[locations].min(axis=0) for locations in sku_racks])
+        sku_distances = np.array([nearest_rack[:, locations].min(axis=1) for locations in sku_racks]).T
+        sku_rack_bits = [sum(1 << rack for rack in locations) for locations in sku_racks]
         shared = analysis.shared_store_days[np.ix_(indices, indices)]
         scores = analysis.similarity[np.ix_(indices, indices)]
         first, second = np.triu_indices(len(skus), 1)
@@ -516,24 +573,26 @@ def affinity_layout_metrics(
             shared[first, second].astype(np.float64)
             * scores[first, second].astype(np.float64)
         )
-        distances = np.linalg.norm(
-            coordinates[first] - coordinates[second], axis=1
-        ) * coordinate_scale
+        distances = sku_distances[first, second]
         pair_weight = float(weights.sum())
         pair_distance = float(weights @ distances)
-        same_rack_weight = float(weights[rack_ids[first] == rack_ids[second]].sum())
+        same_rack = np.array([bool(sku_rack_bits[int(a)] & sku_rack_bits[int(b)]) for a, b in zip(first, second)], dtype=bool)
+        same_rack_weight = float(weights[same_rack].sum())
         retained_pairs = len(weights)
     service_weight = 0.0
     service_distance = 0.0
-    for row in assigned.values():
-        raw_distance = row.get("average_workstation_distance_m")
-        if raw_distance in (None, ""):
-            continue
-        weight = float(row.get("pick_frequency") or 0)
-        service_weight += weight
-        service_distance += weight * float(raw_distance)
+    for copies in assigned.values():
+        quantities = [max(0, float(row.get("quantity_ea") or 1)) for row in copies]
+        total_quantity = sum(quantities) or len(copies)
+        for row, quantity in zip(copies, quantities):
+            raw_distance = row.get("average_workstation_distance_m")
+            if raw_distance in (None, ""):
+                continue
+            weight = float(row.get("pick_frequency") or 0) * quantity / total_quantity
+            service_weight += weight
+            service_distance += weight * float(raw_distance)
     classes_by_rack: dict[str, set[str]] = {}
-    for row in assigned.values():
+    for row in (row for copies in assigned.values() for row in copies):
         rack_id = str(row.get("rack_id", ""))
         if rack_id:
             classes_by_rack.setdefault(rack_id, set()).add(
@@ -543,6 +602,8 @@ def affinity_layout_metrics(
         len(classes - {""}) > 1 for classes in classes_by_rack.values()
     )
     return {
+        "pair_location_model": "minimum_distance_over_all_replica_racks",
+        "service_location_model": "quantity_weighted_replica_locations",
         "weighted_pair_distance_m": (
             pair_distance / pair_weight if pair_weight else 0.0
         ),

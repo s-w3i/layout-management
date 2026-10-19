@@ -29,6 +29,72 @@ def table(path, rows):
     write_csv(path, rows, fields)
 
 
+def throughput_presentation_chart(output, results, names, common):
+    """Compare the two daily metrics within each layout, using paired completed dates."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    days = sorted(common)
+    lookup = {(r["layout"], r["date"]): r for r in results}
+    columns = min(2, len(names))
+    fig, axes = plt.subplots((len(names)+columns-1)//columns, columns,
+                             figsize=(7*columns, 3.4*((len(names)+columns-1)//columns)), squeeze=False)
+    blue, orange = "#2166ac", "#d95f02"
+    all_rates = [r["line_throughput_per_hour"] for r in results
+                 if r["date"] in days and r.get("line_throughput_per_hour") is not None]
+    all_lines = [r["completed_order_lines_per_rack_presentation"] for r in results
+                 if r["date"] in days and r.get("completed_order_lines_per_rack_presentation") is not None]
+    correlations = []
+    for ax, name in zip(axes.flat, names):
+        rows = [lookup.get((name, day), {}) for day in days]
+        rates = np.array([r.get("line_throughput_per_hour") or np.nan for r in rows])
+        lines = np.array([r.get("completed_order_lines_per_rack_presentation") or np.nan for r in rows])
+        valid = np.isfinite(rates) & np.isfinite(lines) & (rates > 0) & (lines > 0)
+        q, c = rates[valid], lines[valid]
+        r = float(np.corrcoef(q, c)[0, 1]) if len(q)>1 and np.ptp(q)>0 and np.ptp(c)>0 else None
+        share = None
+        if len(q)>1 and np.ptp(q)>0:
+            log_q, log_c = np.log(q), np.log(c)
+            share = float(np.mean((log_q-log_q.mean())*(log_c-log_c.mean()))/np.var(log_q))
+        correlations.append({"layout": name, "paired_days": len(q), "pearson_r": r,
+                             "lines_per_presentation_log_variance_share": share,
+                             "presentations_per_hour_log_variance_share": 1-share if share is not None else None})
+        right = ax.twinx()
+        throughput_line, = ax.plot(range(len(days)), rates, "o-", color=blue, markersize=4)
+        presentation_line, = right.plot(range(len(days)), lines, "s--", color=orange, markersize=4)
+        ax.set_ylim(min(all_rates)*.85 if all_rates else 0, max(all_rates)*1.12 if all_rates else 1)
+        right.set_ylim(min(all_lines)*.85 if all_lines else 0, max(all_lines)*1.12 if all_lines else 1)
+        ax.set_ylabel("Completed lines/hour", color=blue)
+        right.set_ylabel("Lines per rack presentation", color=orange)
+        ax.tick_params(axis="y", colors=blue)
+        right.tick_params(axis="y", colors=orange)
+        ax.set_xticks(range(len(days)), [date.fromisoformat(day).strftime("%d %b") for day in days])
+        ax.tick_params(axis="x", labelrotation=35, labelsize=8)
+        correlation = f"r = {r:.2f}" if r is not None else "r unavailable"
+        ax.set_title(f"{name.replace('_', ' ')} | {correlation} | {len(q)} days", fontsize=11)
+        ax.grid(axis="y", alpha=.2)
+        if not len(q):
+            ax.text(.5, .5, "No paired completed dates", ha="center", transform=ax.transAxes)
+    for ax in list(axes.flat)[len(names):]:
+        ax.set_visible(False)
+    fig.suptitle("Daily throughput and completed lines per rack presentation", fontsize=16, y=.995)
+    fig.legend([throughput_line, presentation_line],
+               ["Throughput (left axis)", "Lines per presentation (right axis)"],
+               loc="upper center", bbox_to_anchor=(.5, .966), ncol=2)
+    fig.text(.5, .008, "Independent axis scales, consistent across layouts. Pearson r measures association, not causal effect.",
+             ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, .025, 1, .935))
+    directory = output/"charts"
+    directory.mkdir(exist_ok=True)
+    filename = "daily_throughput_and_lines_per_presentation.png"
+    fig.savefig(directory/filename, dpi=150)
+    plt.close(fig)
+    table(output/"throughput_presentation_correlation.csv", correlations)
+    return "Daily throughput and lines per rack presentation", filename
+
+
 def aggregate(results, layouts, dates, baseline):
     lookup = {(r["layout"], r["date"]): r for r in results}
     common = [day for day in sorted(dates) if all(
@@ -126,6 +192,7 @@ def generate_report(output: Path, results, layouts, dates, baseline, warehouse_m
               "- Throughput bars use sample standard deviation across days, not a confidence interval. One day has no measured between-day variation.",
               "- Completed order lines per rack presentation divides returned/jacked-down order lines by rack arrivals at workstation service. Unfinished returns contribute a presentation but no completed lines. No presentations means unavailable.",
               "- The mean presentation chart shows daily averages. The separate minimum/maximum chart shows the smallest/largest covered order-line count of any single completed rack job on the common dates. Repeated visits by the same rack count separately; unfinished jobs are excluded from these extrema.",
+              "- The daily throughput/presentation overlay uses independent axes and paired common dates. Pearson correlation is descriptive: both metrics share completed lines. The correlation CSV splits log-throughput variation between lines/presentation and presentations/hour; signed accounting shares are not causal estimates.",
               "- Weighted throughput is total completed lines divided by total simulation hours over the common dates.",
               "- Travel is actual substep displacement, split by loaded/empty state. Normalized travel and waits use completed source order lines, not units or distinct SKUs.",
               "- Robot time categories are mutually exclusive. Utilization includes active waiting; movement and waiting charts explain the difference.",
@@ -229,6 +296,7 @@ def _charts(output, results, summaries, common, warehouse_map):
     ax.tick_params(axis="x", labelrotation=45)
     ax.legend(fontsize=8)
     save(fig, "Daily throughput", "daily_throughput.png")
+    charts.append(throughput_presentation_chart(output, results, names, common))
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     for ax, key, title in zip(axes, ["travel_metres_per_completed_line", "rack_trips_per_1000_lines"],

@@ -225,6 +225,7 @@ def generate_report(output, results, layouts, dates, baseline):
              'Duplicate SKU locations are allocated by estimated completion time including queued work. Scheduling uses deterministic greedy allocation and nearest-next retrieval, not a global optimum.',
              'Picking is per tote presentation and includes workstation handoff. Source totes always return to their original slots. Cranes finish at their final return locations; there is no end-of-day homing leg.',
              'Travel distance is summed absolute X/Y/Z actuator travel (including the fork), not Euclidean carriage distance. X and Z move concurrently, so their motion times overlap. Stage time categories are exclusive and sum to crane busy time.',
+             'Daily crane utilization is busy time divided by that day\'s elapsed simulation time. The fleet curve averages all cranes, including idle aisles; the per-aisle chart shows each crane separately.',
              'Tote presentations count completed workstation picking delays, including totes not yet returned at a cutoff. Completed lines and jobs require completed return/retraction.', '',
              'Included dates: '+(', '.join(common) or 'none'), '', 'Excluded dates: '+(', '.join(excluded) or 'none')]
     if excluded:
@@ -284,15 +285,35 @@ def make_charts(output, results, summaries, common):
             fig.savefig(output/f'daily_throughput_and_time.{extension}', dpi=150)
         plt.close(fig)
         paths.append('daily_throughput_and_time.png')
+        fig, ax = plt.subplots(figsize=(14, 6))
+        for name in names:
+            rows = sorted((r for r in results if r['layout'] == name and r['date'] in common), key=lambda r: r['date'])
+            ax.plot([r['date'] for r in rows], [100*r['crane_utilization'] for r in rows],
+                    marker='.', label=name)
+        ax.set(title='Daily crane utilization | fleet average', xlabel='Order date',
+               ylabel='Utilization (% of daily simulated time)', ylim=(0, 101))
+        ax.tick_params(axis='x', rotation=45)
+        ax.xaxis.set_major_locator(plt.MaxNLocator(8))
+        ax.grid(alpha=.2)
+        fig.legend(*ax.get_legend_handles_labels(), fontsize=8, ncol=2,
+                   loc='lower center', bbox_to_anchor=(.5, .01))
+        fig.tight_layout(rect=(0, .16, 1, 1))
+        for extension in ('png', 'svg'):
+            fig.savefig(output/f'daily_crane_utilization.{extension}', dpi=150)
+        plt.close(fig)
+        paths.append('daily_crane_utilization.png')
         # Weight utilization by simulated duration, as in the current-heat station report.
         fig, axes = plt.subplots(1, 2, figsize=(15, 5), constrained_layout=True)
         fleet_rows = {}
+        daily_cranes = {}
         rack_counts = {}
         for name in names:
             fleet_rows[name], rack_counts[name] = defaultdict(lambda: defaultdict(float)), defaultdict(int)
-            for day in common:
+            daily_cranes[name] = defaultdict(list)
+            for day in sorted(common):
                 with (output/name/day/'cranes.csv').open(newline='') as stream:
                     for row in csv.DictReader(stream):
+                        daily_cranes[name][row['crane']].append((day, 100*float(row['utilization'])))
                         for key in ('busy_seconds', 'idle_seconds', 'picking_seconds'):
                             fleet_rows[name][row['crane']][key] += float(row[key])
                 with (output/name/day/'tote_jobs.csv').open(newline='') as stream:
@@ -315,6 +336,29 @@ def make_charts(output, results, summaries, common):
             fig.savefig(output/f'aisle_utilization.{extension}', dpi=150)
         plt.close(fig)
         paths.append('aisle_utilization.png')
+        panel_rows = (len(names)+1)//2
+        fig, axes = plt.subplots(panel_rows, min(2, len(names)), figsize=(15, 4*panel_rows+1),
+                                 sharex=True, sharey=True, squeeze=False)
+        for ax, name in zip(axes.flat, names):
+            for index, crane in enumerate(crane_names):
+                rows = daily_cranes[name][crane]
+                ax.plot([day for day, _ in rows], [value for _, value in rows], marker='.',
+                        label=crane, color=f'C{index % 10}')
+            ax.set(title=name.removesuffix('_slotting_layout').replace('_', ' '),
+                   xlabel='Order date', ylabel='Crane utilization (%)', ylim=(0, 101))
+            ax.tick_params(axis='x', rotation=45)
+            ax.xaxis.set_major_locator(plt.MaxNLocator(8))
+            ax.grid(alpha=.2)
+        for ax in list(axes.flat)[len(names):]:
+            ax.set_visible(False)
+        fig.suptitle('Daily crane utilization by aisle | common completed dates', y=.99)
+        fig.legend(*axes.flat[0].get_legend_handles_labels(), loc='upper center',
+                   bbox_to_anchor=(.5, .965), ncol=min(9, len(crane_names)), fontsize=9)
+        fig.tight_layout(rect=(0, 0, 1, .93))
+        for extension in ('png', 'svg'):
+            fig.savefig(output/f'daily_crane_utilization_by_aisle.{extension}', dpi=150)
+        plt.close(fig)
+        paths.append('daily_crane_utilization_by_aisle.png')
         fig, axes = plt.subplots(1, len(names), figsize=(6*len(names), 5), constrained_layout=True, squeeze=False)
         maximum = max((max(rows.values(), default=0) for rows in rack_counts.values()), default=1)
         for ax, name in zip(axes[0], names):

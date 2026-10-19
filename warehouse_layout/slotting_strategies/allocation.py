@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections import Counter, defaultdict
 
 import numpy as np
 
 from .zone_workload import balanced_zone_candidates
+from .rack_balance import balance_rack_groups, rack_workload
+from .quantity_feasibility import QuantityFeasibilityPlan
 
 from ..affinity import AffinityAnalysis
 from ..attributes import (
@@ -146,6 +149,7 @@ def allocate(
     ctbsa_rank_by_sku: dict[str, int] | None = None,
     zone_workload_enabled: bool = False,
     maximum_same_sku_slots_per_rack: int | None = None,
+    quantity_feasibility_seed: list[dict] | None = None,
 ) -> tuple[list[dict], dict]:
     if not isinstance(zone_workload_enabled, bool):
         raise ValueError("zone_workload_enabled must be a boolean")
@@ -171,10 +175,22 @@ def allocate(
         raise ValueError("minimum affinity score must be between 0 and 1")
     if maximum_service_distance_increase < 0:
         raise ValueError("maximum service-distance increase cannot be negative")
-    sku_rows, quantity_summary = expand_quantity_slot_loads(sku_rows)
     affinity_enabled = strategy == "abc_affinity"
+    amr_affinity = affinity_enabled and handling_unit_type == "AMR shelf" and affinity_weight > 0
     if affinity_enabled and affinity_analysis is None:
         raise ValueError("ABC + affinity strategy requires affinity analysis")
+    if amr_affinity and quantity_feasibility_seed is None:
+        quantity_feasibility_seed, _baseline_summary = service.generate_basic(
+            building, copy.deepcopy(sku_rows), levels_per_rack, slots_per_level,
+            handling_unit_type, zone_id, zone_assignments, attribute_catalog,
+            copy.deepcopy(location_attributes or {}),
+            strict_compatibility=strict_compatibility, storage_layout=storage_layout,
+            ergonomic_weight_heuristic=ergonomic_weight_heuristic,
+            auto_plan_oversize=auto_plan_oversize,
+            zone_workload_enabled=zone_workload_enabled,
+            maximum_same_sku_slots_per_rack=maximum_same_sku_slots_per_rack,
+        )
+    sku_rows, quantity_summary = expand_quantity_slot_loads(sku_rows)
     level_name, racks, workstation_count, unreachable_count = service.rack_distances(building)
     level = building["levels"][level_name]
     coordinate_scale = service._distance_scale(building, level)
@@ -523,14 +539,15 @@ def allocate(
     sku_group_order = {}
     for row in sorted_skus:
         sku_group_order.setdefault(str(row.get("sku", "")), len(sku_group_order))
-    sorted_skus = sorted(
-        sorted_skus,
-        key=lambda row: (
-            sku_group_order[str(row.get("sku", ""))],
-            int(row.get("quantity_load_index") or 1),
-            str(row.get("inventory_load_id", "")),
-        ),
-    )
+    if not amr_affinity:
+        sorted_skus = sorted(
+            sorted_skus,
+            key=lambda row: (
+                sku_group_order[str(row.get("sku", ""))],
+                int(row.get("quantity_load_index") or 1),
+                str(row.get("inventory_load_id", "")),
+            ),
+        )
     sku_load_counts = Counter(str(row.get("sku", "")) for row in sorted_skus)
 
     def position_key(position: dict) -> tuple[str, int, int]:
@@ -641,6 +658,8 @@ def allocate(
                     int(candidate["slot"]) + slot_span,
                 )
             )
+            if len(footprint_keys) > maximum_same_sku_slots_per_rack:
+                continue
             if footprint_keys in seen_footprints or any(
                 key not in position_by_key for key in footprint_keys
             ):
@@ -825,6 +844,15 @@ def allocate(
             occupied_reservations.update(footprint)
             if record["spread_quantity"]:
                 quantity_reservations_by_sku[record["sku"]].append(footprint)
+    if amr_affinity:
+        # Anchor exceptional footprints to the complete feasible stock seed.
+        seed_by_load = {str(row["inventory_load_id"]): row for row in quantity_feasibility_seed}
+        reserved_footprints_by_row_id = {
+            id(row): tuple((str(unit["rack_id"]), int(unit["storage_level"]), int(unit["storage_slot"]))
+                           for unit in seed_by_load[str(row["inventory_load_id"] )]["occupied_handling_units"])
+            for row in sorted_skus
+            if seed_by_load[str(row["inventory_load_id"])].get("constrained_feasibility_reserved")
+        }
     reserved_owner_by_position = {
         key: row_id
         for row_id, footprint in reserved_footprints_by_row_id.items()
@@ -901,7 +929,17 @@ def allocate(
             not math.isfinite(rack_max_weight) or rack_max_weight <= 0
         ):
             rack_max_weight = None
-    assigned_affinity_positions: dict[str, dict] = {}
+    quantity_plan = QuantityFeasibilityPlan(
+        quantity_feasibility_seed, positions, maximum_same_sku_slots_per_rack, rack_max_weight,
+    ) if amr_affinity else None
+    assigned_affinity_positions: dict[str, list[dict]] = defaultdict(list)
+    affinity_rack_indices = {str(rack["rack_id"]): index for index, rack in enumerate(racks)}
+    affinity_rack_coordinates = np.array([[rack["x"], rack["y"]] for rack in racks], dtype=np.float64)
+    affinity_rack_distances = np.linalg.norm(
+        affinity_rack_coordinates[:, None, :] - affinity_rack_coordinates[None, :, :], axis=2,
+    ) * coordinate_scale
+    nearest_affinity_distances = {}
+    placement_zone_demands = {}
     quantity_rack_counts: dict[str, dict[str, int]] = defaultdict(
         lambda: defaultdict(int)
     )
@@ -922,6 +960,7 @@ def allocate(
             quantity_weights[id(sku)] / quantity_totals[current_sku]
             if quantity_totals[current_sku] else 1 / quantity_counts[current_sku]
         )
+        placement_zone_demands[str(sku.get("inventory_load_id", ""))] = zone_demand
         current_order_mask = order_membership_masks.get(current_sku, 0)
         requirements = sku.get("sku_requirements")
         if not isinstance(requirements, dict):
@@ -1354,8 +1393,7 @@ def allocate(
                         *candidate_key[:4], 0, *candidate_key[5:]
                     )
                 if (
-                    sku_load_counts[current_sku] > 1
-                    and quantity_rack_counts[current_sku][
+                    quantity_rack_counts[current_sku][
                         str(candidate["rack_id"])
                     ] + len(occupied_positions)
                     > maximum_same_sku_slots_per_rack
@@ -1369,6 +1407,20 @@ def allocate(
                     occupied_positions,
                     missing_override_keys,
                 ))
+            quantity_moves = {}
+
+            def feasible_candidate(record):
+                if quantity_plan is None:
+                    return True
+                if record[1] not in quantity_moves:
+                    quantity_moves[record[1]] = quantity_plan.propose(str(sku["inventory_load_id"]), record[4])
+                return quantity_moves[record[1]] is not None
+
+            if quantity_plan is not None and hard_candidates:
+                if not any(feasible_candidate(record) for record in sorted(hard_candidates, key=lambda record: record[0])):
+                    if str(sku["inventory_load_id"]) in quantity_plan.placements:
+                        raise ValueError(f"feasible stock seed lost its valid candidate for {sku['inventory_load_id']}")
+                    hard_candidates = []
             if hard_candidates:
                 spread_candidates = hard_candidates
                 if sku_load_counts[current_sku] > 1:
@@ -1382,7 +1434,7 @@ def allocate(
                         record for record in spread_candidates
                         if rack_counts[str(record[2]["rack_id"])] > 0
                     ]
-                    if same_sku_racks:
+                    if same_sku_racks and not amr_affinity:
                         spread_candidates = same_sku_racks
                     prior_positions = quantity_positions_by_sku[current_sku]
 
@@ -1401,16 +1453,15 @@ def allocate(
                     )
                 else:
                     selection_key = lambda record: record[0]
-                if zone_workload_enabled and not any(
+                if zone_workload_enabled and not amr_affinity and not any(
                     quantity_rack_counts[current_sku][str(record[2]["rack_id"])] > 0
                     for record in spread_candidates
                 ):
                     spread_candidates = balanced_zone_candidates(
                         spread_candidates, zone_workloads, zone_capacities, zone_demand,
                     )
-                baseline_candidate = min(
-                    spread_candidates, key=selection_key
-                )
+                baseline_candidate = next(record for record in sorted(spread_candidates, key=selection_key)
+                                          if feasible_candidate(record))
                 selected_candidate = baseline_candidate
                 related_assigned = [
                     (related_sku, weight, assigned_affinity_positions[related_sku])
@@ -1466,47 +1517,26 @@ def allocate(
                             continue
                         eligible.append(candidate_record)
                     if eligible:
-                        candidate_coordinates = np.array(
-                            [
-                                [float(item[2]["x"]), float(item[2]["y"])]
-                                for item in eligible
-                            ],
-                            dtype=np.float64,
-                        )
-                        related_coordinates = np.array(
-                            [
-                                [float(item[2]["x"]), float(item[2]["y"])]
-                                for item in related_assigned
-                            ],
-                            dtype=np.float64,
-                        )
+                        candidate_rack_ids = np.array([str(item[2]["rack_id"]) for item in eligible])
+                        candidate_rack_indices = np.array([affinity_rack_indices[rack] for rack in candidate_rack_ids])
                         relationship_weights = np.array(
                             [float(item[1]) for item in related_assigned],
                             dtype=np.float64,
                         )
-                        pair_distances = (
-                            np.linalg.norm(
-                                candidate_coordinates[:, None, :]
-                                - related_coordinates[None, :, :],
-                                axis=2,
-                            ) * coordinate_scale
-                            if related_assigned
-                            else np.zeros((len(eligible), 0), dtype=np.float64)
-                        )
+                        pair_distances = np.column_stack([
+                            nearest_affinity_distances[item[0]][candidate_rack_indices]
+                            for item in related_assigned
+                        ]) if related_assigned else np.zeros((len(eligible), 0), dtype=np.float64)
                         affinity_distances = (
                             (pair_distances @ relationship_weights)
                             / float(relationship_weights.sum())
                             if related_assigned else np.zeros(len(eligible))
                         )
-                        candidate_rack_ids = np.array(
-                            [str(item[2]["rack_id"]) for item in eligible]
-                        )
-                        related_rack_ids = np.array(
-                            [str(item[2]["rack_id"]) for item in related_assigned]
-                        )
                         different_bay = (
-                            candidate_rack_ids[:, None]
-                            != related_rack_ids[None, :]
+                            np.array([
+                                ~np.isin(candidate_rack_ids, [str(position["rack_id"]) for position in item[2]])
+                                for item in related_assigned
+                            ], dtype=bool).T
                             if related_assigned
                             else np.zeros((len(eligible), 0), dtype=bool)
                         )
@@ -1520,19 +1550,32 @@ def allocate(
                         )
                         same_bay_fractions = 1.0 - different_bay_fractions
                         scores = []
+                        def other_order_mask(state):
+                            mask = 0
+                            for other_sku, other_mask in state.get("sku_order_masks", {}).items():
+                                if other_sku != current_sku:
+                                    mask |= other_mask
+                            return mask
+
+                        satisfied_groups = 0
+                        if amr_affinity:
+                            for prior_position in assigned_affinity_positions.get(current_sku, []):
+                                satisfied_groups |= other_order_mask(rack_state.get(str(prior_position["rack_id"]), {}))
+                        unsatisfied_groups = current_order_mask & ~satisfied_groups if amr_affinity else current_order_mask
                         for candidate_number, candidate_record in enumerate(eligible):
                             service_distance = float(
                                 candidate_record[2]["distance_m"]
                             )
                             candidate_abc_cost = float(candidate_record[0][3])
-                            rack_order_mask = rack_state.get(
+                            candidate_state = rack_state.get(
                                 str(candidate_record[2]["rack_id"]), {}
-                            ).get("order_mask", 0)
+                            )
+                            rack_order_mask = other_order_mask(candidate_state) if amr_affinity else candidate_state.get("order_mask", 0)
                             covered_orders = (
-                                current_order_mask & rack_order_mask
+                                unsatisfied_groups & rack_order_mask
                             ).bit_count()
                             candidate_affinity_cost = 1.0 - (
-                                covered_orders / current_order_mask.bit_count()
+                                covered_orders / max(1, unsatisfied_groups.bit_count())
                             )
                             combined = (
                                 (1.0 - affinity_weight) * candidate_abc_cost
@@ -1565,7 +1608,8 @@ def allocate(
                             _candidate_key,
                             selected_number,
                             selected_candidate,
-                        ) = min(scores, key=lambda item: item[:7])
+                        ) = next(item for item in sorted(scores, key=lambda item: item[:7])
+                                 if feasible_candidate(item[-1]))
                         affinity_neighbors_used = [
                             item[0] for item in related_assigned
                         ]
@@ -1582,6 +1626,8 @@ def allocate(
                     _key, selected_index, position, auto_overrides,
                     occupied_positions, missing_override_keys,
                 ) = selected_candidate
+                if quantity_plan is not None:
+                    quantity_plan.commit(str(sku["inventory_load_id"]), quantity_moves[selected_index])
                 zone_workloads[str(position["zone_id"])] += zone_demand
                 occupied_ids = {id(item) for item in occupied_positions}
                 available_positions = [
@@ -1728,6 +1774,7 @@ def allocate(
                     },
                 )
                 selected_state["order_mask"] |= current_order_mask
+                selected_state.setdefault("sku_order_masks", {})[current_sku] = current_order_mask
                 if inventory_load_weight is not None:
                     selected_state["cumulative_weight_kg"] += inventory_load_weight
                 selected_state["velocity_classes"].add(
@@ -1764,19 +1811,18 @@ def allocate(
                     f"Auto slot override: {key}={value}"
                     for key, value in sorted(auto_overrides.items())
                 )
-                assigned_affinity_positions[current_sku] = position
-                if sku_load_counts[current_sku] > 1:
-                    quantity_rack_counts[current_sku][
-                        str(position["rack_id"])
-                    ] += len(occupied_positions)
-                    quantity_positions_by_sku[current_sku].extend(
-                        (
-                            str(item["rack_id"]),
-                            int(item["level"]),
-                            int(item["slot"]),
-                        )
-                        for item in occupied_positions
+                if not any(prior["rack_id"] == position["rack_id"] for prior in assigned_affinity_positions[current_sku]):
+                    assigned_affinity_positions[current_sku].append(position)
+                    distances = affinity_rack_distances[:, affinity_rack_indices[str(position["rack_id"])]]
+                    nearest_affinity_distances[current_sku] = np.minimum(
+                        nearest_affinity_distances.get(current_sku, distances), distances,
                     )
+                rack_id = str(position["rack_id"])
+                quantity_rack_counts[current_sku][rack_id] += len(occupied_positions)
+                quantity_positions_by_sku[current_sku].extend(
+                    (str(item["rack_id"]), int(item["level"]), int(item["slot"]))
+                    for item in occupied_positions
+                )
             else:
                 mismatch_details = hard_issues
         if position:
@@ -2039,6 +2085,15 @@ def allocate(
             for field in ("static_address", "storage_location_address"):
                 if field in unit:
                     unit[field] = rename_aisle(unit[field])
+    rack_balance_summary = None
+    if amr_affinity and zone_workload_enabled:
+        output, rack_balance_summary = balance_rack_groups(
+            output, positions, order_membership_masks, affinity_analysis.store_day_count, level_name,
+        )
+        zone_workloads.clear()
+        for row in output:
+            if row.get("assignment_status") == "ASSIGNED":
+                zone_workloads[str(row["zone_id"])] += placement_zone_demands[str(row["inventory_load_id"])]
     output.sort(key=lambda row: int(row.get("sku_rank") or 10**9))
     rack_frequency_ranking = apply_rack_frequency_ranks(output)
 
@@ -2242,6 +2297,15 @@ def allocate(
         "ergonomic_weight_heuristic": ergonomic_weight_heuristic,
         "rack_frequency_ranking": rack_frequency_ranking,
     }
+    summary["zone_balance_model"] = (
+        "whole_rack_estimated_work" if amr_affinity else "quantity_weighted_pick_frequency_per_zone_slot"
+    )
+    if amr_affinity:
+        summary["rack_workload"] = (
+            rack_balance_summary["after"] if rack_balance_summary is not None
+            else rack_workload(output, positions, order_membership_masks, affinity_analysis.store_day_count)
+        )
+        summary["rack_zone_balance"] = rack_balance_summary
     if affinity_analysis is not None:
         affinity_metrics = affinity_layout_metrics(
             output,
