@@ -149,6 +149,14 @@ export async function management(
   if (method === "POST") {
     const value = await c.body(req);
     if (
+      !external &&
+      route[0] === "workspaces" &&
+      route[1] &&
+      route[2] === "sku-details" &&
+      route.length === 3
+    )
+      return send(await call("completePlanningSku", route[1], value));
+    if (
       route[0] === "warehouses" &&
       route[1] &&
       route[2] === "inventory" &&

@@ -2,6 +2,14 @@
 
 The web application prepares warehouse geometry, inventory data and slotting. External warehouse systems consume published releases and may post confirmed inventory operations. The [ASRS simulation](ASRS.md) consumes this API and maintains separate simulated stock. Integration inventory operations represent confirmed real operations; they do not control equipment motion.
 
+## Historical data preparation
+
+Use **Historical data & analysis** before the four generation steps. **Data preparation** imports orders, bounds dates to the dataset, calculates demand and lists SKUs missing positive dimensions (metres) or weight (kilograms). **SKU velocity** provides ABC filtering, sorting and CSV export. **SKU affinity** explores a selected SKU and its strongest store-day co-order neighbors, with a minimum shared-day threshold, a displayed neighbor limit, keyboard navigation, a sortable table and SVG export. The graph queries all calculated pairs, including pairs outside the legacy top-100 relationship list.
+
+**Save SKU details** atomically updates the current workspace and SKU master, preserving existing names, units and other master attributes. It replaces embedded imported physical requirements and invalidates the workspace's stock calculation and layout. **Proceed without changes** acknowledges incomplete profiles for the current inputs; changed demand or physical data requires another review. An assignment with incomplete physical data remains physically unverified.
+
+The local-only `POST /api/manage/workspaces/{workspaceId}/sku-details` accepts `sku`, `values` (positive physical attribute numbers), `workspace_revision` and `master_revision` (or `null` for a new master SKU). It returns the updated workspace and rejects stale workspace or master revisions with HTTP 409. The integration API does not expose this planning edit endpoint.
+
 ## Connect
 
 1. Start the application and open **Data & inventory → Overview**.

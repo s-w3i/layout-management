@@ -427,6 +427,44 @@ json analyze(const json &request) {
                              {"shared_store_days", p.shared},
                              {"cosine", p.cosine}});
   }
+  const auto focus = text(settings, "affinity_focus_sku",
+                          rows.empty() ? "" : text(rows[0], "sku"));
+  const double shared_value = num(settings, "affinity_minimum_shared", 1),
+               limit_value = num(settings, "affinity_neighbor_limit", 12);
+  if (!std::isfinite(shared_value) || !std::isfinite(limit_value) ||
+      shared_value < 1 || shared_value > 1000000000 || limit_value < 1 ||
+      limit_value > 24 || std::floor(shared_value) != shared_value ||
+      std::floor(limit_value) != limit_value)
+    throw std::runtime_error(
+        "Affinity requires at least one shared store-day and 1–24 neighbors");
+  const int minimum_shared = int(shared_value),
+            neighbor_limit = int(limit_value);
+  if (!focus.empty() && !indices.count(focus))
+    throw std::runtime_error("Selected SKU is absent from this date range");
+  json graph_edges = json::array();
+  size_t eligible = 0;
+  for (const auto &p : ranked) {
+    const auto &a = names[p.key >> 32], &b = names[p.key & 0xffffffff];
+    if ((a != focus && b != focus) || p.shared < minimum_shared)
+      continue;
+    ++eligible;
+    if (graph_edges.size() < size_t(neighbor_limit))
+      graph_edges.push_back({{"sku_a", a},
+                             {"sku_b", b},
+                             {"shared_store_days", p.shared},
+                             {"cosine", p.cosine}});
+  }
+  std::set<std::string> graph_skus{focus};
+  for (const auto &edge : graph_edges) {
+    graph_skus.insert(text(edge, "sku_a"));
+    graph_skus.insert(text(edge, "sku_b"));
+  }
+  json graph_nodes = json::array();
+  for (const auto &row : rows)
+    if (graph_skus.count(text(row, "sku")))
+      graph_nodes.push_back({{"sku", row["sku"]},
+                             {"velocity_class", row["velocity_class"]},
+                             {"pick_frequency", row["pick_frequency"]}});
   json classes = {{"A", 0}, {"B", 0}, {"C", 0}};
   double lines = 0;
   for (auto &row : rows) {
@@ -437,6 +475,15 @@ json analyze(const json &request) {
   for (auto &s : storeSet)
     stores.push_back(s);
   return {{"rows", rows},
+          {"affinity_graph",
+           {{"date_start", first},
+            {"date_end", last},
+            {"nodes", graph_nodes},
+            {"focus_sku", focus},
+            {"minimum_shared", minimum_shared},
+            {"neighbor_limit", neighbor_limit},
+            {"eligible_relationship_count", eligible},
+            {"relationships", graph_edges}}},
           {"relationships", relationships},
           {"summary",
            {{"sku_count", rows.size()},

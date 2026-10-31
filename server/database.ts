@@ -8,7 +8,8 @@ import {
   stockStatuses,
   exactQuantity,
 } from "../shared/inventory.js";
-import type { Row } from "../shared/model.js";
+import { physicalKeys, type Row } from "../shared/model.js";
+import { correctSkuRows, skuRequirements } from "../shared/preparation.js";
 import { orderDateBounds, validDate } from "../shared/dates.js";
 import { createTaskId, taskTypeForId } from "../shared/tasks.js";
 
@@ -703,6 +704,52 @@ export class WarehouseDatabase {
         r.sku,
       ),
     }));
+  }
+  completePlanningSku(id: string, value: Row) {
+    return this.transaction(() => {
+      const state = this.getWorkspace(id);
+      if (state._save_revision !== value.workspace_revision)
+        throw new DataError(
+          "Workspace changed. Reload before saving SKU details.",
+          409,
+        );
+      const sku = text(value.sku, "SKU", 120);
+      const source = state.velocity.find((r: Row) => r.sku === sku);
+      if (!source)
+        throw new DataError("SKU is absent from this workspace demand");
+      const values = object(value.values, "Physical details");
+      if (
+        !Object.keys(values).length ||
+        Object.keys(values).some((k) => !physicalKeys.includes(k))
+      )
+        throw new DataError("Supply physical SKU details only");
+      for (const [key, quantity] of Object.entries(values))
+        positive(quantity, key);
+      const previous = this.listSkus(sku).find((r) => r.sku === sku);
+      if (previous) this.auditRevision(previous, value.master_revision);
+      else if (value.master_revision != null)
+        throw new DataError("SKU master changed. Reload it.", 409);
+      const requirements = skuRequirements(source, state.attributes);
+      this.saveSkuRow({
+        ...previous,
+        sku,
+        attributes: { ...(previous?.attributes || requirements), ...values },
+        uoms: previous?.uoms.map((u: Row) => ({
+          uom: u.uom,
+          factor: exactQuantity(u.factor_micro),
+        })),
+      });
+      state.attributes[sku] = { ...requirements, ...values };
+      state.velocity = correctSkuRows(state.velocity, sku, values);
+      if (state.analysis?.rows)
+        state.analysis.rows = correctSkuRows(state.analysis.rows, sku, values);
+      state.stockStale = true;
+      state.result = null;
+      delete state.preparationAcknowledged;
+      state._save_revision++;
+      this.saveWorkspace(id, state);
+      return state;
+    });
   }
   private saveSkuRow(value: Row, imported = false) {
     const sku = text(value.sku, "SKU", 120),

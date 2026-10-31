@@ -27,6 +27,7 @@ import {
   PackageCheck,
   Database,
   Activity,
+  Network,
 } from "lucide-react";
 import {
   defaultSettings,
@@ -42,6 +43,12 @@ import LayoutViewer from "./LayoutViewer";
 import InventoryOperations from "./InventoryOperations";
 import DataManagement from "./DataManagement";
 import AsrsSimulation from "./AsrsSimulation";
+import HistoricalData from "./HistoricalData";
+import {
+  applySkuAttributes,
+  incompleteSkus,
+  preparationKey,
+} from "../../shared/preparation";
 import { dateRangeError } from "../../shared/dates";
 import { stockGeometryKey } from "../../shared/editor";
 import {
@@ -77,6 +84,7 @@ interface Workspace {
   demandStale: boolean;
   example: boolean;
   step: number;
+  preparationAcknowledged?: string;
 }
 const blank = (): Workspace => ({
   name: "Untitled warehouse",
@@ -169,7 +177,7 @@ export default function App() {
     [geometry, setGeometry] = useState<Row | null>(null),
     [geometryError, setGeometryError] = useState("");
   const [geometryUpdating, setGeometryUpdating] = useState(false);
-  const [area, setArea] = useState("planning");
+  const [area, setArea] = useState("history");
   const [operationsOpened, setOperationsOpened] = useState(false);
   const [simulationOpened, setSimulationOpened] = useState(false);
   const [selected, setSelected] = useState(""),
@@ -188,9 +196,22 @@ export default function App() {
   const errorRef = useRef<HTMLDivElement>(null),
     titleRef = useRef<HTMLHeadingElement>(null),
     helpRef = useRef<HTMLDialogElement>(null);
+  const [historyView, setHistoryView] = useState("prepare");
+  // Preserve saved workspace step indices while moving demand into its own area.
+  const generationSteps = [0, 2, 3, 4];
+  const generationIndex = generationSteps.indexOf(workspace.step);
+  const historyNames: Record<string, string> = {
+    prepare: "Data preparation",
+    velocity: "SKU velocity",
+    affinity: "SKU affinity",
+  };
   const saveVersion = useRef(0);
   const skipInitialSave = useRef(false);
+  const autosaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
   const saveNow = async () => {
+    clearTimeout(autosaveTimer.current);
     const revision = ++saveVersion.current;
     await api(`/api/workspaces/${workspaceId}`, {
       method: "PUT",
@@ -212,7 +233,8 @@ export default function App() {
       ...saved,
       settings: { ...defaultSettings, ...saved.settings },
     });
-    setArea("planning");
+    setArea(saved.step === 1 ? "history" : "planning");
+    setHistoryView("prepare");
   };
   const w = workspace,
     step = w.step;
@@ -257,7 +279,7 @@ export default function App() {
       return;
     }
     setSaveStatus("Saving…");
-    const timer = setTimeout(() => {
+    const timer = (autosaveTimer.current = setTimeout(() => {
       const revision = ++saveVersion.current;
       api(`/api/workspaces/${workspaceId}`, {
         method: "PUT",
@@ -278,7 +300,7 @@ export default function App() {
           setSaveStatus("Save failed");
           setError(`The workspace could not be saved: ${e.message}`);
         });
-    }, 700);
+    }, 700));
     return () => clearTimeout(timer);
   }, [w, workspaceId, ready]);
   useEffect(() => {
@@ -403,6 +425,26 @@ export default function App() {
   const patch = (values: Partial<Workspace>) =>
     setWorkspace((current) => ({ ...current, ...values }));
   const go = (next: number) => {
+    const needsReview =
+      workspace.velocity.length > 0 &&
+      incompleteSkus(workspace.velocity, workspace.attributes).length > 0 &&
+      workspace.preparationAcknowledged !==
+        preparationKey(
+          workspace.velocity,
+          workspace.attributes,
+          workspace.settings,
+        );
+    if (next === 1 || needsReview) {
+      if (next === 1) setError("");
+      setArea("history");
+      setHistoryView("prepare");
+      if (needsReview && next !== 1)
+        setError(
+          "Review incomplete SKU data, then save corrections or choose Proceed without changes.",
+        );
+      setTimeout(() => titleRef.current?.focus(), 0);
+      return;
+    }
     setArea("planning");
     patch({ step: Math.max(0, Math.min(4, next)) });
     setError("");
@@ -438,14 +480,14 @@ export default function App() {
         stockStale: current.stockStale || physical,
       };
     });
-  const run = async (
+  const run = async <T,>(
     label: string,
-    action: (progress: (text: string, id: string) => void) => Promise<void>,
+    action: (progress: (text: string, id: string) => void) => Promise<T>,
   ) => {
     setBusy({ label, text: "Starting…", id: "" });
     setError("");
     try {
-      await action((text, id) => setBusy({ label, text, id }));
+      return await action((text, id) => setBusy({ label, text, id }));
     } catch (e) {
       if ((e as Error).name !== "AbortError") setError((e as Error).message);
     } finally {
@@ -504,6 +546,7 @@ export default function App() {
         });
       if (kind === "attributes")
         patch({
+          velocity: applySkuAttributes(w.velocity, result.attributes),
           attributes: result.attributes,
           project: augmentCatalog(w.project, result.attributes),
           stockStale: true,
@@ -542,7 +585,8 @@ export default function App() {
       }
       if (kind === "session") {
         setOperationsOpened(false);
-        setArea("planning");
+        setArea("history");
+        setHistoryView("prepare");
         patch({
           ...blank(),
           ...result.data,
@@ -559,8 +603,11 @@ export default function App() {
         progress,
       );
       patch({
-        analysis: result,
-        velocity: result.rows,
+        analysis: {
+          ...result,
+          rows: applySkuAttributes(result.rows, w.attributes),
+        },
+        velocity: applySkuAttributes(result.rows, w.attributes),
         stock: [],
         stockResult: null,
         result: null,
@@ -626,7 +673,7 @@ export default function App() {
   const inspection =
     w.result?.assignments?.filter((r: Row) => r.rack_id === selected) ?? [];
   const classes =
-    w.analysis?.summary.classes ??
+    w.analysis?.summary?.classes ??
     w.velocity.reduce(
       (acc: Row, r: Row) => ({
         ...acc,
@@ -689,34 +736,83 @@ export default function App() {
           </span>
           <ChevronDown size={14} />
         </button>
-        <div className="sidebar-label workflow-label">GENERATION WORKFLOW</div>
-        <nav aria-label="Layout generation steps">
-          {steps.map((s, i) => (
+        <div className="sidebar-label workflow-label">
+          HISTORICAL DATA & ANALYSIS
+        </div>
+        <nav
+          aria-label="Historical data and analysis"
+          className="operations-nav"
+        >
+          {Object.entries(historyNames).map(([key, label]) => (
             <button
-              key={s.name}
-              aria-current={
-                area === "planning" && step === i ? "step" : undefined
-              }
-              className={`step-link ${area === "planning" && step === i ? "current" : ""}`}
-              aria-label={`Step ${i + 1}: ${s.name}`}
-              onClick={() => go(i)}
+              key={key}
+              type="button"
+              className={`step-link ${area === "history" && historyView === key ? "current" : ""}`}
+              aria-pressed={area === "history" && historyView === key}
+              onClick={() => {
+                setArea("history");
+                setHistoryView(key);
+                setError("");
+                setTimeout(() => titleRef.current?.focus(), 0);
+              }}
             >
-              <span className={`step-number ${prerequisites[i] ? "done" : ""}`}>
-                {prerequisites[i] ? (
-                  <Check size={14} />
-                ) : (
-                  String(i + 1).padStart(2, "0")
-                )}
+              <span className="step-number">
+                <span aria-hidden="true">
+                  {key === "affinity" ? (
+                    <Network size={17} />
+                  ) : key === "prepare" ? (
+                    <Database size={17} />
+                  ) : (
+                    <ChartNoAxesCombined size={17} />
+                  )}
+                </span>
               </span>
               <span>
-                <strong>{s.name}</strong>
-                <small>{s.detail}</small>
+                <strong>{label}</strong>
+                <small>
+                  {key === "prepare"
+                    ? "Import, review & complete"
+                    : key === "velocity"
+                      ? "Demand & ABC classification"
+                      : "Explore co-order groups"}
+                </small>
               </span>
-              {area === "planning" && step === i && (
-                <span className="active-dot" />
-              )}
             </button>
           ))}
+        </nav>
+        <div className="sidebar-label workflow-label">GENERATION WORKFLOW</div>
+        <nav aria-label="Layout generation steps">
+          {generationSteps.map((i, position) => {
+            const s = steps[i];
+            return (
+              <button
+                key={s.name}
+                aria-current={
+                  area === "planning" && step === i ? "step" : undefined
+                }
+                className={`step-link ${area === "planning" && step === i ? "current" : ""}`}
+                aria-label={`Step ${position + 1}: ${s.name}`}
+                onClick={() => go(i)}
+              >
+                <span
+                  className={`step-number ${prerequisites[i] ? "done" : ""}`}
+                >
+                  {prerequisites[i] ? (
+                    <Check size={14} />
+                  ) : (
+                    String(position + 1).padStart(2, "0")
+                  )}
+                </span>
+                <span>
+                  <strong>{s.name}</strong>
+                  <small>{s.detail}</small>
+                </span>
+                {area === "planning" && step === i && (
+                  <span className="active-dot" />
+                )}
+              </button>
+            );
+          })}
         </nav>
         <div className="sidebar-label operations-label">
           WAREHOUSE MANAGEMENT
@@ -821,7 +917,9 @@ export default function App() {
                   ? "Data & inventory"
                   : area === "operations"
                     ? "Layout scenarios"
-                    : steps[step].name}
+                    : area === "history"
+                      ? historyNames[historyView]
+                      : steps[step].name}
             </strong>
           </div>
           <div className="top-actions">
@@ -837,7 +935,8 @@ export default function App() {
                 ) {
                   patch(blank());
                   setOperationsOpened(false);
-                  setArea("planning");
+                  setArea("history");
+                  setHistoryView("prepare");
                   setGeometry(null);
                   setSelected("");
                 }
@@ -875,7 +974,9 @@ export default function App() {
           <div className="page-intro">
             <div>
               <div className="eyebrow">
-                {area === "simulation" ? (
+                {area === "history" ? (
+                  "HISTORICAL DATA & ANALYSIS"
+                ) : area === "simulation" ? (
                   "ASRS SIMULATION"
                 ) : area === "management" ? (
                   "WAREHOUSE MANAGEMENT"
@@ -883,30 +984,35 @@ export default function App() {
                   "LAYOUT SCENARIOS"
                 ) : (
                   <>
-                    STEP {String(step + 1).padStart(2, "0")} <span>/ 05</span>
+                    STEP {String(generationIndex + 1).padStart(2, "0")}{" "}
+                    <span>/ 04</span>
                   </>
                 )}
               </div>
               <h1 ref={titleRef} tabIndex={-1}>
-                {area === "simulation"
-                  ? "Run the warehouse. Trace every item."
-                  : area === "management"
-                    ? "Prepare data. Publish with confidence."
-                    : area === "operations"
-                      ? "Inspect inventory. Test position changes."
-                      : headings[step][0]}
+                {area === "history"
+                  ? historyNames[historyView]
+                  : area === "simulation"
+                    ? "Run the warehouse. Trace every item."
+                    : area === "management"
+                      ? "Prepare data. Publish with confidence."
+                      : area === "operations"
+                        ? "Inspect inventory. Test position changes."
+                        : headings[step][0]}
               </h1>
               <p>
-                {area === "simulation"
-                  ? "Replay demand against a deployed ASRS layout, replenish to assigned stock targets and inspect the complete stock-flow ledger."
-                  : area === "management"
-                    ? "Manage warehouse records and operational stock, then provide versioned data to external systems."
-                    : area === "operations"
-                      ? "Locate stock, estimate handling-unit movements and try validated swaps in a separate scenario."
-                      : headings[step][1]}
+                {area === "history"
+                  ? "Prepare historical demand, explore SKU relationships and resolve missing data before warehouse generation."
+                  : area === "simulation"
+                    ? "Replay demand against a deployed ASRS layout, replenish to assigned stock targets and inspect the complete stock-flow ledger."
+                    : area === "management"
+                      ? "Manage warehouse records and operational stock, then provide versioned data to external systems."
+                      : area === "operations"
+                        ? "Locate stock, estimate handling-unit movements and try validated swaps in a separate scenario."
+                        : headings[step][1]}
               </p>
             </div>
-            {area !== "simulation" && (
+            {area !== "simulation" && area !== "history" && (
               <div className="intro-right">
                 <Badge tone={w.result ? "green" : ""}>
                   {w.result ? (
@@ -994,6 +1100,75 @@ export default function App() {
             </div>
           )}
           <fieldset className="workspace-fieldset" disabled={!!busy}>
+            {area === "history" && (
+              <HistoricalData
+                key={workspaceId}
+                view={historyView}
+                workspace={w}
+                busy={!!busy}
+                onImport={importFile}
+                onSettings={changeSettings}
+                onAnalyze={analyze}
+                onContinue={(acknowledged) => {
+                  patch({ preparationAcknowledged: acknowledged, step: 0 });
+                  setArea("planning");
+                  setError("");
+                  setTimeout(() => titleRef.current?.focus(), 0);
+                }}
+                onGraph={async (settings) => {
+                  const value = await run("Load SKU affinity", (progress) =>
+                    engine(
+                      {
+                        command: "analyze",
+                        orders_id: w.orders!.id,
+                        settings: { ...w.settings, ...settings },
+                      },
+                      progress,
+                    ),
+                  );
+                  if (value)
+                    patch({
+                      analysis: {
+                        ...w.analysis,
+                        affinity_graph: value.affinity_graph,
+                      },
+                    });
+                  return value?.affinity_graph;
+                }}
+                onSaveSku={async (sku, values, masterRevision) => {
+                  let failure: unknown;
+                  const value = await run("Save SKU details", async () => {
+                    try {
+                      const revision = await saveNow();
+                      return await api(
+                        `/api/manage/workspaces/${workspaceId}/sku-details`,
+                        {
+                          method: "POST",
+                          body: JSON.stringify({
+                            sku,
+                            values,
+                            master_revision: masterRevision,
+                            workspace_revision: revision,
+                          }),
+                        },
+                      );
+                    } catch (e) {
+                      failure = e;
+                      throw e;
+                    }
+                  });
+                  if (!value)
+                    throw (
+                      failure || new Error("SKU details could not be saved")
+                    );
+                  setSaveStatus("Saved locally");
+                  saveVersion.current = value._save_revision;
+                  skipInitialSave.current = true;
+                  setWorkspace(value as Workspace);
+                  return true;
+                }}
+              />
+            )}
             {area === "planning" && (
               <>
                 {step === 0 && (
@@ -1009,322 +1184,6 @@ export default function App() {
                     disabled={!!busy}
                     onError={setError}
                   />
-                )}
-                {step === 1 && (
-                  <div className="step-columns">
-                    <div className="primary-column">
-                      <Panel
-                        title="Order history"
-                        subtitle="One order line counts as one pick. Affinity groups distinct SKUs by store and day."
-                        action={
-                          <UploadButton
-                            label={
-                              w.orders ? "Replace orders" : "Import orders"
-                            }
-                            accept=".xlsx,.csv"
-                            onFile={(f) => importFile(f, "orders")}
-                          />
-                        }
-                      >
-                        {w.orders ? (
-                          <>
-                            <div className="source-file">
-                              <div className="source-icon">
-                                <FileJson size={22} />
-                              </div>
-                              <div>
-                                <strong>{w.orders.name}</strong>
-                                <p>
-                                  {count(w.orders.line_count)} valid order lines
-                                  · {w.orders.date_start} → {w.orders.date_end}
-                                </p>
-                              </div>
-                              <Badge tone="green">Ready</Badge>
-                            </div>
-                            <div className="metrics-grid three">
-                              <Metric
-                                label="Unique SKUs"
-                                value={count(w.orders.sku_count)}
-                              />
-                              <Metric
-                                label="Store / day groups"
-                                value={count(w.orders.store_day_count)}
-                              />
-                              <Metric
-                                label="Stores"
-                                value={count(w.orders.store_count)}
-                              />
-                            </div>
-                            <div className="form-grid">
-                              <Field
-                                label="From date"
-                                hint={`Earliest available: ${w.orders.date_start}. Inclusive.`}
-                              >
-                                <input
-                                  type="date"
-                                  aria-label="From date"
-                                  min={w.orders.date_start}
-                                  max={w.orders.date_end}
-                                  aria-invalid={!!demandDateError}
-                                  aria-describedby={
-                                    demandDateError
-                                      ? "demand-date-error"
-                                      : undefined
-                                  }
-                                  value={
-                                    w.settings.start_date || w.orders.date_start
-                                  }
-                                  onChange={(e) =>
-                                    changeSettings({
-                                      start_date: e.target.value,
-                                    })
-                                  }
-                                />
-                              </Field>
-                              <Field
-                                label="Through date"
-                                hint={`Latest available: ${w.orders.date_end}. Inclusive.`}
-                              >
-                                <input
-                                  type="date"
-                                  aria-label="Through date"
-                                  min={w.orders.date_start}
-                                  max={w.orders.date_end}
-                                  aria-invalid={!!demandDateError}
-                                  aria-describedby={
-                                    demandDateError
-                                      ? "demand-date-error"
-                                      : undefined
-                                  }
-                                  value={
-                                    w.settings.end_date || w.orders.date_end
-                                  }
-                                  onChange={(e) =>
-                                    changeSettings({ end_date: e.target.value })
-                                  }
-                                />
-                              </Field>
-                            </div>
-                            {demandDateError && (
-                              <p
-                                id="demand-date-error"
-                                className="inline-warning"
-                                role="alert"
-                              >
-                                {demandDateError}
-                              </p>
-                            )}
-                          </>
-                        ) : (
-                          <Empty
-                            title="Add your order history"
-                            detail="Import an XLSX workbook or CSV with Date, Item or SKU, Quantity (in EA), and Store ID for affinity."
-                          />
-                        )}
-                        <div className="config-divider" />
-                        <div className="section-row">
-                          <div>
-                            <h3>ABC classification</h3>
-                            <p className="muted">
-                              Cumulative share of pick frequency, sorted by SKU
-                              demand.
-                            </p>
-                          </div>
-                          <UploadButton
-                            label="Import velocity CSV"
-                            accept=".csv"
-                            onFile={(f) => importFile(f, "velocity")}
-                            small
-                          />
-                        </div>
-                        <div className="form-grid columns-3">
-                          <Field label="Class A ends at (%)">
-                            <input
-                              type="number"
-                              min="1"
-                              max="99"
-                              value={Number(
-                                (w.settings.a_limit * 100).toFixed(2),
-                              )}
-                              onChange={(e) =>
-                                changeSettings({
-                                  a_limit: Number(e.target.value) / 100,
-                                })
-                              }
-                            />
-                          </Field>
-                          <Field label="Class B ends at (%)">
-                            <input
-                              type="number"
-                              min="2"
-                              max="100"
-                              value={Number(
-                                (w.settings.b_limit * 100).toFixed(2),
-                              )}
-                              onChange={(e) =>
-                                changeSettings({
-                                  b_limit: Number(e.target.value) / 100,
-                                })
-                              }
-                            />
-                          </Field>
-                          <button
-                            className="button primary align-end"
-                            disabled={!w.orders || !!demandDateError}
-                            onClick={analyze}
-                          >
-                            <ChartNoAxesCombined size={16} />
-                            Analyze demand
-                          </button>
-                        </div>
-                        {w.demandStale && (
-                          <div className="inline-warning">
-                            <RefreshCw size={15} />
-                            Demand parameters changed. Analyze again before
-                            generation.
-                          </div>
-                        )}
-                        {w.velocity.length > 0 && (
-                          <>
-                            <div className="class-summary">
-                              {["A", "B", "C"].map((cl) => (
-                                <div key={cl}>
-                                  <Badge tone={`class-${cl}`}>{cl}</Badge>
-                                  <strong>{count(classes[cl])}</strong>
-                                  <span>SKUs</span>
-                                </div>
-                              ))}
-                            </div>
-                            <Table
-                              rows={w.velocity}
-                              searchable
-                              label="SKU demand"
-                              filters={demandFilters}
-                              sortable
-                              empty="No demand records match your search and filters."
-                              columns={[
-                                { key: "sku", label: "SKU" },
-                                {
-                                  key: "velocity_class",
-                                  label: "Class",
-                                  render: (v) => (
-                                    <Badge tone={`class-${v}`}>{v}</Badge>
-                                  ),
-                                },
-                                { key: "pick_frequency", label: "Pick lines" },
-                                {
-                                  key: "total_quantity_ea",
-                                  label: "Quantity (EA)",
-                                },
-                                { key: "active_days", label: "Active days" },
-                              ]}
-                            />
-                            <button
-                              className="text-button"
-                              onClick={() =>
-                                download(
-                                  "sku_velocity_summary.csv",
-                                  csvString(
-                                    w.velocity.map(
-                                      ({ sku_requirements, ...row }) => row,
-                                    ),
-                                  ),
-                                  "text/csv",
-                                )
-                              }
-                            >
-                              <Download size={13} />
-                              Export velocity CSV
-                            </button>
-                          </>
-                        )}
-                      </Panel>
-                      {w.analysis && (
-                        <Panel
-                          title="Strong co-order relationships"
-                          subtitle="Cosine similarity of binary SKU presence within each store/day group."
-                        >
-                          <Table
-                            rows={w.analysis.relationships}
-                            label="Affinity relationships"
-                            searchable
-                            sortable
-                            columns={[
-                              { key: "sku_a", label: "SKU" },
-                              { key: "sku_b", label: "Co-ordered SKU" },
-                              {
-                                key: "shared_store_days",
-                                label: "Shared store/days",
-                              },
-                              {
-                                key: "cosine",
-                                label: "Similarity",
-                                render: (v) => (
-                                  <div className="similarity">
-                                    <span
-                                      style={{ width: `${Number(v) * 100}%` }}
-                                    />
-                                    <strong>{Number(v).toFixed(3)}</strong>
-                                  </div>
-                                ),
-                              },
-                            ]}
-                          />
-                        </Panel>
-                      )}
-                    </div>
-                    <aside className="secondary-column">
-                      <Panel title="The demand model">
-                        <div className="numbered-note">
-                          <span>01</span>
-                          <div>
-                            <strong>Frequency sets priority</strong>
-                            <p>
-                              ABC uses order-line frequency, rather than
-                              multiplying picks by quantity.
-                            </p>
-                          </div>
-                        </div>
-                        <div className="numbered-note">
-                          <span>02</span>
-                          <div>
-                            <strong>Quantities set capacity</strong>
-                            <p>
-                              Stock coverage uses quantity demand over the
-                              inclusive calendar observation span.
-                            </p>
-                          </div>
-                        </div>
-                        <div className="numbered-note">
-                          <span>03</span>
-                          <div>
-                            <strong>Co-orders inform affinity</strong>
-                            <p>
-                              Repeated lines for one SKU count once in each
-                              store/day relationship.
-                            </p>
-                          </div>
-                        </div>
-                      </Panel>
-                      <div className="subtle-card">
-                        <ShieldCheck size={20} />
-                        <h3>Your files stay local.</h3>
-                        <p>
-                          The app reads data on this computer and stores
-                          workspace files inside this project.
-                        </p>
-                      </div>
-                      {w.orders?.ignored_rows > 0 && (
-                        <div className="notice warning">
-                          <TriangleAlert size={18} />
-                          <p>
-                            {count(w.orders!.ignored_rows)} rows with missing
-                            SKU or invalid dates were excluded.
-                          </p>
-                        </div>
-                      )}
-                    </aside>
-                  </div>
                 )}
                 {step === 2 && (
                   <div className="step-columns">
@@ -1843,7 +1702,7 @@ export default function App() {
                           ) : (
                             <Empty
                               title="Order history is required"
-                              detail="Add orders in the Demand step to build affinity relationships."
+                              detail="Add orders in Historical data → Data preparation to build affinity relationships."
                             />
                           )}
                           <p className="muted small-print">
@@ -2412,8 +2271,13 @@ export default function App() {
                   go(1);
                 }}
                 useAttributes={(attributes) => {
-                  patch({ attributes, result: null, stockStale: true });
-                  go(2);
+                  patch({
+                    attributes,
+                    velocity: applySkuAttributes(w.velocity, attributes),
+                    result: null,
+                    stockStale: true,
+                  });
+                  go(1);
                 }}
               />
             )}
@@ -2437,10 +2301,10 @@ export default function App() {
           {area === "planning" && (
             <footer className="workflow-footer">
               <div>
-                <span className="footer-step">{step + 1} / 5</span>
+                <span className="footer-step">{generationIndex + 1} / 4</span>
                 <span>
                   {step === 0
-                    ? "Define the warehouse before analyzing inventory."
+                    ? "Use prepared demand to size stock for this warehouse."
                     : step === 1
                       ? "Demand comes before stock sizing."
                       : step === 2
@@ -2455,7 +2319,7 @@ export default function App() {
                   <button
                     className="button"
                     disabled={!!busy}
-                    onClick={() => go(step - 1)}
+                    onClick={() => go(generationSteps[generationIndex - 1])}
                   >
                     <ArrowLeft size={15} />
                     Back
@@ -2465,9 +2329,12 @@ export default function App() {
                   <button
                     className="button primary"
                     disabled={!!busy || !prerequisites[step]}
-                    onClick={() => go(step + 1)}
+                    onClick={() => go(generationSteps[generationIndex + 1])}
                   >
-                    Continue to {steps[step + 1].name.toLowerCase()}{" "}
+                    Continue to{" "}
+                    {steps[
+                      generationSteps[generationIndex + 1]
+                    ].name.toLowerCase()}{" "}
                     <ArrowRight size={15} />
                   </button>
                 )}
@@ -2517,7 +2384,14 @@ export default function App() {
             dependent results, so a stale layout is never presented as current.
           </p>
           <ol>
-            {steps.map((s) => (
+            {[
+              {
+                name: "Historical data & analysis",
+                detail:
+                  "Prepare history, inspect velocity and affinity, then review missing SKU data.",
+              },
+              ...generationSteps.map((i) => steps[i]),
+            ].map((s) => (
               <li key={s.name}>
                 <strong>{s.name}</strong>
                 <span>{s.detail}</span>

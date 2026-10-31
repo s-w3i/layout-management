@@ -3289,3 +3289,17 @@ th[aria-sort="descending"] {
 .data-management .management-actions {
   min-width: 0;
 }
+
+.historical-data { display: grid; gap: 24px; }
+.preparation-sequence { padding-left: 22px; line-height: 1.7; }
+.preparation-sequence li { margin-bottom: 12px; }
+.affinity-controls { display: grid; grid-template-columns: minmax(180px, 2fr) 1fr 1fr auto; gap: 14px; align-items: end; margin-bottom: 18px; }
+.affinity-graph { width: 100%; height: auto; display: block; margin: 16px 0; border: 1px solid #e2e8f0; border-radius: 12px; }
+.affinity-graph g[role=button] { cursor: pointer; outline: none; }
+.affinity-graph g[role=button]:focus circle { stroke: #0f172a; stroke-width: 6; }
+.affinity-legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; color: #475569; }
+@media (max-width: 1024px) { .affinity-controls { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 600px) { .affinity-controls { grid-template-columns: 1fr; } }
+.affinity-canvas { max-width: 100%; overflow: auto; }
+.affinity-canvas:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
+.affinity-graph { min-width: 880px; }
