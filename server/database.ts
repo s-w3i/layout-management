@@ -10,6 +10,7 @@ import {
 } from "../shared/inventory.js";
 import type { Row } from "../shared/model.js";
 import { orderDateBounds, validDate } from "../shared/dates.js";
+import { createTaskId, taskTypeForId } from "../shared/tasks.js";
 
 export class DataError extends Error {
   constructor(
@@ -1678,7 +1679,10 @@ export class WarehouseDatabase {
         }
         this.change(p, 0, quantity);
         const reservation = randomUUID(),
-          id = randomUUID();
+          id =
+            value.task_type == null
+              ? randomUUID()
+              : createTaskId(value.task_type, randomUUID());
         this.run(
           "INSERT INTO reservations VALUES(?,?,?,?,'active',?)",
           reservation,
@@ -1727,6 +1731,7 @@ export class WarehouseDatabase {
         }
         result = {
           task_id: id,
+          task_type: taskTypeForId(id),
           status: "reserved",
           container: p.container || null,
           item_count: items.length,
@@ -1880,6 +1885,7 @@ export class WarehouseDatabase {
           );
         result = {
           task_id: task.id,
+          task_type: taskTypeForId(task.id),
           status: this.required(
             "SELECT status FROM movement_tasks WHERE id=?",
             task.id,
@@ -1957,6 +1963,7 @@ export class WarehouseDatabase {
       id,
     ).map((t) => ({
       ...t,
+      task_type: taskTypeForId(t.id),
       items: this.all(
         "SELECT i.*,p.sku,i.quantity_micro/1000000.0 AS quantity FROM task_items i JOIN positions p ON p.id=i.position_id WHERE i.task_id=?",
         t.id,
@@ -1969,15 +1976,20 @@ export class WarehouseDatabase {
       id,
       before || Number(after) || 0,
       Math.min(1000, Math.max(1, Number(limit) || 200)),
-    ).map((r) => ({
-      ...r,
-      result: decode(r.result_json),
-      result_json: undefined,
-      lines: this.all(
-        "SELECT e.position_id,p.warehouse_id,p.sku,p.location_id,p.lot,p.expiry,p.status,p.container,s.base_uom,e.quantity_delta_micro,e.reserved_delta_micro,e.quantity_delta_micro/1000000.0 AS quantity_delta,e.reserved_delta_micro/1000000.0 AS reserved_delta FROM stock_event_lines e JOIN positions p ON p.id=e.position_id JOIN skus s ON s.sku=p.sku WHERE e.event_id=?",
-        r.id,
-      ),
-    }));
+    ).map((r) => {
+      const result = decode(r.result_json);
+      return {
+        ...r,
+        result,
+        task_id: result.task_id ?? "",
+        task_type: result.task_id ? taskTypeForId(result.task_id) : "",
+        result_json: undefined,
+        lines: this.all(
+          "SELECT e.position_id,p.warehouse_id,p.sku,p.location_id,p.lot,p.expiry,p.status,p.container,s.base_uom,e.quantity_delta_micro,e.reserved_delta_micro,e.quantity_delta_micro/1000000.0 AS quantity_delta,e.reserved_delta_micro/1000000.0 AS reserved_delta FROM stock_event_lines e JOIN positions p ON p.id=e.position_id JOIN skus s ON s.sku=p.sku WHERE e.event_id=?",
+          r.id,
+        ),
+      };
+    });
   }
   inventorySnapshot(id: string) {
     return this.transaction(() => {

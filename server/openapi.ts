@@ -96,6 +96,11 @@ export const openapi: Record<string, any> = {
           position_id: { type: "string" },
           reservation_id: { type: "string" },
           task_id: { type: "string" },
+          task_type: {
+            enum: ["delivery", "replenishment", "relocation"],
+            description:
+              "Explicit task_create purpose generates DEL-, RPL- or MOV- IDs. Omit to retain legacy relocation UUIDs.",
+          },
           lot: { type: "string" },
           expiry: { type: "string", format: "date" },
           container: { type: "string" },

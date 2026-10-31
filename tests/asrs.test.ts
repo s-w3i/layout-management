@@ -393,6 +393,19 @@ test("SKU movement ledger separates consumption, refills and returns with event-
     );
     const balances: Record<string, number> = { A: 16.5 * U, B: 0 };
     for (const row of rows) {
+      if (row.movement_type !== "return") {
+        const type =
+          row.movement_type === "consume" ? "delivery" : "replenishment";
+        assert.equal(row.task_type, type);
+        assert.equal(
+          row.task_id,
+          `${type === "delivery" ? "DEL" : "RPL"}-${id}-${row.cycle_id}`,
+        );
+        assert.equal(
+          events.find((e: Row) => e.sequence === row.sequence).task_id,
+          row.task_id,
+        );
+      } else assert.equal(row.task_id, "");
       assert.equal(row.initial_sku_micro, row.sku === "A" ? 16.5 * U : 0);
       assert.equal(row.sku_before_micro, balances[row.sku]);
       assert.equal(row.sku_before_micro + row.delta_micro, row.sku_after_micro);
@@ -482,6 +495,56 @@ test("SKU movement ledger separates consumption, refills and returns with event-
       db.page(id, "events", { limit: 5000 }).rows.length,
       events.length,
     );
+  } finally {
+    db.db.close();
+  }
+});
+test("simulation task IDs stay stable from active pickup checkpoints to completed cycles", () => {
+  const db = new AsrsDatabase(":memory:");
+  try {
+    const id = db.create({ name: "Task identity" }).id,
+      m = model();
+    db.appendOrders(id, [line(2, 8)]);
+    db.init(id, {}, m);
+    const sink = db.sink(id),
+      pickups: Row[] = [];
+    const e = new AsrsEngine(
+      m,
+      ["2023-01-03"],
+      asrsSettings({ speed: "max", replenishment_lead_seconds: 1 }),
+      (d) => db.orders(id, d),
+      {
+        ...sink,
+        event: (r) => {
+          sink.event(r);
+          if (r.kind === "TOTE_PICKUP") pickups.push(r);
+        },
+      },
+    );
+    const seen = new Map<string, string>();
+    for (let i = 0; i < 1000 && !e.finished; i++) {
+      e.step();
+      if (pickups.length) {
+        const pickup = pickups.shift()!;
+        db.save(id, e.checkpoint(), e.snapshot());
+        const row = db.page(id, "events", {
+          kind: "TOTE_PICKUP",
+          latest: "1",
+          limit: 1,
+        }).rows[0];
+        const type =
+          e.cranes[0].cycle!.kind === "pick" ? "delivery" : "replenishment";
+        assert.equal(row.task_type, type);
+        assert.match(row.task_id, type === "delivery" ? /^DEL-/ : /^RPL-/);
+        seen.set(pickup.cycle_id, row.task_id);
+      }
+    }
+    assert.equal(e.finished, true);
+    assert.equal(seen.size, 2);
+    for (const row of db
+      .page(id, "events", { limit: 5000 })
+      .rows.filter((r: Row) => r.cycle_id))
+      assert.equal(row.task_id, seen.get(row.cycle_id));
   } finally {
     db.db.close();
   }

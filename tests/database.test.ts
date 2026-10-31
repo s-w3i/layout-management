@@ -333,6 +333,7 @@ test("relocation confirms source, transit, interruption recovery and destination
     quantity: "5",
     destination: "DISPATCH",
   });
+  assert.equal(task.task_type, "relocation");
   assert.equal(db.listInventory(id)[0].available, 3);
   assert.throws(
     () => post({ kind: "task_complete", task_id: task.task_id }),
@@ -374,6 +375,90 @@ test("relocation confirms source, transit, interruption recovery and destination
   assert.equal(
     db.listInventory(id).find((r) => r.location_id === "RECEIVING")?.reserved,
     0,
+  );
+});
+test("delivery and replenishment task IDs retain their purpose through retries and lifecycle actions", (t) => {
+  const { db, post, id } = fixture(t);
+  const stock = post({
+    kind: "receipt",
+    sku: "001",
+    location_id: "RECEIVING",
+    quantity: "20",
+  });
+  for (const [type, prefix] of [
+    ["delivery", "DEL"],
+    ["replenishment", "RPL"],
+  ]) {
+    const value = {
+      kind: "task_create",
+      task_type: type,
+      position_id: stock.position_id,
+      quantity: "2",
+      destination: "DISPATCH",
+      request_id: `typed-${type}`,
+    };
+    const created = post(value);
+    assert.match(created.task_id, new RegExp(`^${prefix}-[0-9a-f-]{36}$`));
+    assert.equal(created.task_type, type);
+    assert.deepEqual(post(value), created);
+    assert.throws(
+      () =>
+        post({
+          ...value,
+          task_type: type === "delivery" ? "replenishment" : "delivery",
+        }),
+      /different operation/,
+    );
+    assert.equal(
+      db.listTasks(id).find((t) => t.id === created.task_id)?.task_type,
+      type,
+    );
+    for (const kind of [
+      "task_pickup",
+      "task_fail",
+      "task_redirect",
+      "task_complete",
+    ]) {
+      const action = post({
+        kind,
+        task_id: created.task_id,
+        task_type: "relocation",
+        ...(kind === "task_redirect" ? { destination: "DISPATCH" } : {}),
+      });
+      assert.equal(action.task_id, created.task_id);
+      assert.equal(action.task_type, type);
+    }
+    const history = db
+      .listEvents(id)
+      .filter((e) => e.task_id === created.task_id);
+    assert.equal(history.length, 5);
+    assert.ok(history.every((e) => e.task_type === type));
+  }
+  const before = db.listInventory(id),
+    eventCount = db.listEvents(id).length;
+  assert.throws(
+    () =>
+      post({
+        kind: "task_create",
+        task_type: "__proto__",
+        position_id: stock.position_id,
+        quantity: "1",
+        destination: "DISPATCH",
+      }),
+    /Choose delivery/,
+  );
+  assert.deepEqual(db.listInventory(id), before);
+  assert.equal(db.listEvents(id).length, eventCount);
+  const cancelled = post({
+    kind: "task_create",
+    task_type: "replenishment",
+    position_id: stock.position_id,
+    quantity: "1",
+    destination: "DISPATCH",
+  });
+  assert.equal(
+    post({ kind: "task_cancel", task_id: cancelled.task_id }).task_type,
+    "replenishment",
   );
 });
 test("expired, quarantined and damaged stock cannot be reserved; returns default to quarantine", (t) => {

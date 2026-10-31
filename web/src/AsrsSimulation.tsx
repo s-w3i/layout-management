@@ -1297,6 +1297,12 @@ export default function AsrsSimulation({
                           ),
                         },
                         { key: "order_reference", label: "Order ref." },
+                        {
+                          key: "task_id",
+                          label: "Task ID",
+                          render: (v) =>
+                            v ? <code className="task-id">{v}</code> : "—",
+                        },
                         { key: "source_row", label: "Order line · source row" },
                         {
                           key: "sku_before_micro",
@@ -1382,6 +1388,12 @@ export default function AsrsSimulation({
                       { key: "to_location", label: "To" },
                       { key: "crane", label: "Crane" },
                       { key: "cycle_id", label: "Cycle" },
+                      {
+                        key: "task_id",
+                        label: "Task ID",
+                        render: (v) =>
+                          v ? <code className="task-id">{v}</code> : "—",
+                      },
                     ]}
                   />
                 ) : (

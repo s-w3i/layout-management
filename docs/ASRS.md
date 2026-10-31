@@ -48,6 +48,8 @@ Filter by exact SKU, source row and movement kind. Follow the latest movements, 
 
 ### SKU in / out
 
+Simulation crane work has stable task IDs: `DEL-{run_id}-{cycle_id}` for delivery/picking and `RPL-{run_id}-{cycle_id}` for replenishment. A cycle’s transport and stock movements share its task ID, including receiving and external portions of one refill. Task IDs and purposes appear in stock flow, SKU in/out and their CSV exports. IDs include the run ID to distinguish simulations. Existing saved runs receive the same deterministic IDs when read; stored events and original cycle references are preserved.
+
 Use **Stock-flow audit → SKU in / out** for the quantity ledger. It includes actual consumption (`ORDER_OUT`), completed replenishment (`REPLENISH_IN`, `RETURN_PUTAWAY`) and returns (`RETURN_IN`). Opening stock is shown as the **Initial assigned EA** column. Consumption, replenishment and returned quantities have separate columns and named movement badges.
 
 Each row shows the SKU balance before and after that event, order reference, original source row, and the affected tote’s before/after quantities. A split order line has several consumption rows; their consumed quantities sum to its fulfilled quantity. On replenishment rows, the linked order line caused the refill and does not represent additional consumption.

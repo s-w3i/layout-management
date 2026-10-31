@@ -399,6 +399,9 @@ test("ASRS connects through the deployed API, pins versions, replays every date 
         exactQuantity(movements[i].sku_after_micro),
       );
       assert.equal(exported[i].source_row, String(movements[i].source_row));
+      assert.equal(exported[i].task_id, movements[i].task_id);
+      assert.equal(exported[i].task_type, "delivery");
+      assert.match(movements[i].task_id, new RegExp(`^DEL-${run.id}-C`));
     }
     assert.equal(
       (
@@ -483,4 +486,63 @@ test("ASRS connects through the deployed API, pins versions, replays every date 
       .filter((k) => k.name === "Temporary ASRS simulation reader")
       .every((k) => k.revoked_at),
   );
+  const operate = await request("/api/manage/keys", {
+    name: "Task integration",
+    scope: "operate",
+  });
+  let operationId = 0;
+  const operateStock = async (value: Row) => {
+    const response = await fetch(
+      base + `/api/v1/warehouses/${warehouse}/inventory`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${operate.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          request_id: `task-http-${++operationId}`,
+          reason: "Task ID integration check",
+          ...value,
+        }),
+      },
+    );
+    const result = (await response.json()) as Row;
+    assert.equal(response.status, 201, JSON.stringify(result));
+    return result;
+  };
+  const supply = await operateStock({
+    kind: "receipt",
+    sku: "A",
+    quantity: "10",
+    location_id: "RECEIVING",
+  });
+  for (const [purpose, prefix] of [
+    ["delivery", "DEL"],
+    ["replenishment", "RPL"],
+  ]) {
+    const task = await operateStock({
+      kind: "task_create",
+      task_type: purpose,
+      position_id: supply.position_id,
+      quantity: "2",
+      destination: "DISPATCH",
+    });
+    assert.match(task.task_id, new RegExp(`^${prefix}-`));
+    assert.equal(task.task_type, purpose);
+    const response = await fetch(
+      base + `/api/v1/warehouses/${warehouse}/tasks`,
+      { headers: { Authorization: `Bearer ${operate.token}` } },
+    );
+    const tasks = (await response.json()) as Row[];
+    assert.equal(
+      tasks.find((r: Row) => r.id === task.task_id)?.task_type,
+      purpose,
+    );
+    const cancelled = await operateStock({
+      kind: "task_cancel",
+      task_id: task.task_id,
+    });
+    assert.equal(cancelled.task_type, purpose);
+  }
 });

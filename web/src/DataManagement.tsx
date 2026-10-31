@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import type { Row } from "../../shared/model";
 import { stockStatuses, exactQuantity } from "../../shared/inventory";
+import { taskTypes, taskTypeForId } from "../../shared/tasks";
 import { api, download, upload } from "./api";
 import {
   Badge,
@@ -219,17 +220,27 @@ export default function DataManagement({
   const wholeContainer = operation.kind === "container_transfer",
     redirect = operation.kind === "task_redirect";
   async function postOperation() {
+    const value = {
+      ...operation,
+      ...(operation.kind === "task_create"
+        ? { task_type: operation.task_type ?? "delivery" }
+        : {}),
+    };
     const fingerprint = JSON.stringify({
       warehouse_id: workspaceId,
-      ...operation,
+      ...value,
     });
     if (pendingOperation.current?.fingerprint !== fingerprint)
       pendingOperation.current = { fingerprint, id: crypto.randomUUID() };
-    await post(`${warehousePath}/inventory`, {
-      ...operation,
+    const result = await post(`${warehousePath}/inventory`, {
+      ...value,
       request_id: pendingOperation.current!.id,
       expected_revision: operation.expected_revision || undefined,
     });
+    if (result.task_id)
+      setNotice(
+        `${taskTypes[taskTypeForId(result.task_id)].label} task assigned: ${result.task_id}`,
+      );
     pendingOperation.current = null;
     setOperation({
       ...operation,
@@ -1088,7 +1099,7 @@ export default function DataManagement({
               </Panel>
               <Panel
                 title="Record an inventory operation"
-                subtitle="Every confirmed operation creates an immutable transaction. Use a relocation task when pickup and delivery need separate confirmations."
+                subtitle="Every confirmed operation creates an immutable transaction. Create a movement task to track pickup and completion separately."
               >
                 <form
                   onSubmit={(e) => {
@@ -1122,8 +1133,11 @@ export default function DataManagement({
                           ],
                           ["transfer", "Confirm completed transfer"],
                           ["container_transfer", "Move whole container"],
-                          ["task_redirect", "Redirect relocation task"],
-                          ["task_create", "Create relocation task"],
+                          ["task_redirect", "Redirect movement task"],
+                          [
+                            "task_create",
+                            "Create delivery / replenishment task",
+                          ],
                           ["status", "Change stock status"],
                           ["reserve", "Reserve a selected stock position"],
                           ["reserve_sku", "Reserve SKU by earliest expiry"],
@@ -1136,6 +1150,27 @@ export default function DataManagement({
                         ))}
                       </select>
                     </Field>
+                    {operation.kind === "task_create" && (
+                      <Field label="Task purpose">
+                        <select
+                          value={operation.task_type ?? "delivery"}
+                          onChange={(e) =>
+                            change(
+                              setOperation,
+                              operation,
+                              "task_type",
+                              e.target.value,
+                            )
+                          }
+                        >
+                          {Object.entries(taskTypes).map(([type, t]) => (
+                            <option key={type} value={type}>
+                              {t.label} · {t.prefix}-…
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
+                    )}
                     {field("Operator", operation, setOperation, "actor", {
                       required: true,
                     })}
@@ -1155,7 +1190,7 @@ export default function DataManagement({
                         { required: true },
                       )
                     ) : redirect ? (
-                      <Field label="Active relocation task">
+                      <Field label="Active movement task">
                         <select
                           required
                           value={operation.task_id || ""}
@@ -1177,7 +1212,7 @@ export default function DataManagement({
                             )
                             .map((t) => (
                               <option key={t.id} value={t.id}>
-                                {t.reference} · {t.status}
+                                {t.id} · {t.reference} · {t.status}
                               </option>
                             ))}
                         </select>
@@ -1401,19 +1436,39 @@ export default function DataManagement({
           {tab === "Tasks & activity" && (
             <>
               <Panel
-                title="Relocation tasks"
+                title="Delivery, replenishment & relocation tasks"
                 subtitle="Stock remains at its source while reserved. Pickup moves it into transit; delivery moves it into the destination. Failed tasks retain stock in transit until recovered."
               >
                 <Table
-                  label="Relocation tasks"
+                  label="Movement tasks"
                   rows={tasks}
                   searchable
                   sortable
                   columns={[
                     {
                       key: "id",
-                      label: "Task",
-                      render: (v: string) => v.slice(0, 8),
+                      label: "Task ID",
+                      render: (v: string) => (
+                        <code className="task-id">{v}</code>
+                      ),
+                    },
+                    {
+                      key: "task_type",
+                      label: "Purpose",
+                      render: (v) => (
+                        <Badge
+                          tone={
+                            v === "replenishment"
+                              ? "green"
+                              : v === "delivery"
+                                ? "blue"
+                                : ""
+                          }
+                        >
+                          {taskTypes[v as keyof typeof taskTypes]?.label ??
+                            "Relocation"}
+                        </Badge>
+                      ),
                     },
                     { key: "sku", label: "SKU" },
                     { key: "source", label: "From" },
@@ -1439,14 +1494,21 @@ export default function DataManagement({
                               ]
                             : r.status === "in_transit"
                               ? [
-                                  ["task_complete", "Confirm delivery"],
+                                  [
+                                    "task_complete",
+                                    r.task_type === "replenishment"
+                                      ? "Confirm replenishment"
+                                      : "Confirm delivery",
+                                  ],
                                   ["task_fail", "Report interruption"],
                                 ]
                               : r.status === "failed"
                                 ? [
                                     [
                                       "task_complete",
-                                      "Confirm recovered delivery",
+                                      r.task_type === "replenishment"
+                                        ? "Confirm recovered replenishment"
+                                        : "Confirm recovered delivery",
                                     ],
                                   ]
                                 : []
@@ -1508,6 +1570,12 @@ export default function DataManagement({
                     { key: "sequence", label: "Sequence" },
                     { key: "created_at", label: "Time (UTC)" },
                     { key: "kind", label: "Operation" },
+                    {
+                      key: "task_id",
+                      label: "Task ID",
+                      render: (v) =>
+                        v ? <code className="task-id">{v}</code> : "—",
+                    },
                     { key: "actor", label: "Operator" },
                     { key: "reason", label: "Reason" },
                     {

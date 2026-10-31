@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import type { Row } from "../shared/model.js";
 import type { AsrsModel, SimulationOrder } from "../shared/asrs.js";
 import type { SimulationSink } from "./asrs-engine.js";
+import { createTaskId } from "../shared/tasks.js";
 
 const eventFields = [
   "sequence",
@@ -357,10 +358,48 @@ export class AsrsDatabase {
       const latest = query.latest === "1";
       let rows = this.db
         .prepare(
-          `SELECT ${eventFields.join(",")}${skuMovements ? ",(SELECT COALESCE(SUM(initial_micro),0) FROM loads WHERE loads.run_id=events.run_id AND loads.sku=events.sku) AS initial_sku_micro" : ""} FROM events WHERE ${where} ORDER BY sequence ${latest ? "DESC" : "ASC"} LIMIT ?`,
+          `SELECT ${eventFields.join(",")},(SELECT json_extract(payload_json,'$.kind') FROM cycles WHERE cycles.run_id=events.run_id AND cycles.id=events.cycle_id) AS _cycle_kind${skuMovements ? ",(SELECT COALESCE(SUM(initial_micro),0) FROM loads WHERE loads.run_id=events.run_id AND loads.sku=events.sku) AS initial_sku_micro" : ""} FROM events WHERE ${where} ORDER BY sequence ${latest ? "DESC" : "ASC"} LIMIT ?`,
         )
         .all(...args, limit) as Row[];
       if (latest) rows.reverse();
+      let activeKinds: Map<string, string> | undefined;
+      rows = rows.map((row) => {
+        const { _cycle_kind, ...event } = row;
+        let cycleKind =
+          _cycle_kind ||
+          (row.kind === "ORDER_OUT"
+            ? "pick"
+            : ["REPLENISH_IN", "RETURN_PUTAWAY"].includes(row.kind)
+              ? "refill"
+              : "");
+        if (!cycleKind && row.cycle_id) {
+          if (!activeKinds) {
+            const saved = this.db
+              .prepare("SELECT checkpoint_json FROM runs WHERE pk=?")
+              .get(key) as Row;
+            const checkpoint = saved.checkpoint_json
+              ? JSON.parse(saved.checkpoint_json)
+              : {};
+            activeKinds = new Map(
+              (checkpoint.cranes ?? [])
+                .filter((c: Row) => c.cycle)
+                .map((c: Row) => [c.cycle.id, c.cycle.kind]),
+            );
+          }
+          cycleKind = activeKinds.get(row.cycle_id);
+        }
+        const type =
+          cycleKind === "pick"
+            ? "delivery"
+            : cycleKind === "refill"
+              ? "replenishment"
+              : "";
+        return {
+          ...event,
+          task_type: type,
+          task_id: type ? createTaskId(type, `${id}-${row.cycle_id}`) : "",
+        };
+      });
       if (skuMovements)
         rows = rows.map((row) => ({
           ...row,

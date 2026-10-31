@@ -169,6 +169,8 @@ export class AsrsApi {
                 ...(kind === "sku-movements"
                   ? {
                       sequence: r.sequence,
+                      task_id: r.task_id,
+                      task_type: r.task_type,
                       simulation_time_local: r.simulation_time_local,
                       movement_type: r.movement_type,
                       kind: r.kind,

@@ -30,7 +30,7 @@ The machine-readable contract is served at **`GET /api/openapi.json`**.
 | `GET /api/v1/warehouses/{id}/locations`                  | Registered storage, receiving, dispatch and workstation locations               |
 | `GET /api/v1/warehouses/{id}/containers`                 | Container locations and contents, each in its SKU's base UOM                    |
 | `GET /api/v1/warehouses/{id}/equipment`                  | Equipment IDs and declared capabilities                                         |
-| `GET /api/v1/warehouses/{id}/tasks`                      | Relocation tasks with all reserved/moving stock lines                           |
+| `GET /api/v1/warehouses/{id}/tasks`                      | Delivery, replenishment and relocation tasks with purpose and stock lines      |
 | `GET /api/v1/warehouses/{id}/reservations`               | Outbound and task reservations                                                  |
 | `GET /api/v1/warehouses/{id}/events?after=0&limit=200`   | Immutable events in ascending sequence order                                    |
 | `GET /api/v1/warehouses/{id}/releases`                   | Published version history                                                       |
@@ -89,14 +89,16 @@ Use a new `request_id` for each operation. Retry an uncertain request with the *
 | `reserve_sku`                  | `sku,quantity`; allocates eligible stock by earliest expiry, with undated stock last                |
 | `dispatch`                     | `reservation_id`; confirms shipment and removes its reserved stock                                  |
 | `cancel_reservation`           | `reservation_id`                                                                                    |
-| `task_create`                  | `position_id,quantity,destination`; reserves a relocation; a container task moves its full contents |
+| `task_create`                  | `position_id,quantity,destination`; optional `task_type` classifies the movement; a container task moves its full contents |
 | `task_pickup`                  | `task_id`; confirms collection and moves all task stock into transit                                |
 | `task_complete`                | `task_id`; confirms delivery, including recovery of an interrupted task                             |
 | `task_cancel`                  | `task_id`; releases a task that has not been picked up                                              |
 | `task_fail`                    | `task_id`; records an interruption while keeping stock in transit                                   |
 | `task_redirect`                | `task_id,destination`; validates a recovery destination before delivery                             |
 
-All operations require `request_id` and a nonempty `reason`. Position operations optionally accept `expected_revision` to reject a stale count or stock selection. Returns default to quarantine. Expired stock cannot be made available. Reservations belonging to relocation tasks must be managed through task actions.
+All operations require `request_id` and a nonempty `reason`. Position operations optionally accept `expected_revision` to reject a stale count or stock selection. Returns default to quarantine. Expired stock cannot be made available. Reservations belonging to movement tasks must be managed through task actions.
+
+For `task_create`, supply `task_type: "delivery"` for a `DEL-<uuid>` ID or `"replenishment"` for an `RPL-<uuid>` ID. Explicit `"relocation"` generates `MOV-<uuid>`; omitting the field retains legacy relocation UUIDs. The response includes `task_id` and `task_type`. Use the full returned ID for pickup, completion, cancellation, failure and redirection. Purpose and ID remain stable throughout the task and on identical retries. Task lists and transaction history expose the same identity; existing task IDs remain valid. Task completion confirms movement into the chosen location; outbound dispatch remains a separate inventory operation.
 
 Transfers update source and destination atomically. Whole-container operations preserve all SKU/lot contents. While a container belongs to an active task, ordinary receipts/transfers cannot alter its contents or bypass its location. A failed task retains its stock until an explicit recovery delivery. Equipment routing and execution remain the consuming system's responsibility.
 

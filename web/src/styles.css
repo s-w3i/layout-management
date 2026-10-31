@@ -2940,6 +2940,13 @@ th[aria-sort="descending"] {
   font-size: 12px;
   min-height: 18px;
 }
+.task-id {
+  display: inline-block;
+  width: 24ch;
+  max-width: 24ch;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .configuration-panel input[aria-invalid="true"],
 .point-panel input[aria-invalid="true"] {
   border-color: #b84c45;
