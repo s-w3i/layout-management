@@ -59,6 +59,7 @@ def main():
         reports.append(report)
         print(json.dumps(report), flush=True)
     result = dict(order_groups=analysis.store_day_count, orders_sha256=hashlib.sha256(order_path.read_bytes()).hexdigest(), cases=reports, all_passed=all(r['exact_movement_parity'] for r in reports), model='Historical handling-unit visit estimates; no traffic simulation or inventory depletion')
+    (ROOT/'reports').mkdir(parents=True, exist_ok=True)
     (ROOT/'reports/movement-validation.json').write_text(json.dumps(result, indent=2)+'\n')
     if not result['all_passed']: sys.exit(1)
 
