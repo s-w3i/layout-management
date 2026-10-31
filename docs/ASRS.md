@@ -46,6 +46,14 @@ An order line can appear in several outbound movements when split; summing its o
 
 Filter by exact SKU, source row and movement kind. Follow the latest movements, or browse the complete ledger from the beginning. CSV exports include **all matching records**, beyond the current page, plus run/release/dataset IDs and time zone. The order-line view separately records fulfilled/returned quantities, status and unmet quantities. Tote balances include SKU buffer/initial-target summaries.
 
+### SKU in / out
+
+Use **Stock-flow audit → SKU in / out** for the quantity ledger. It includes actual consumption (`ORDER_OUT`), completed replenishment (`REPLENISH_IN`, `RETURN_PUTAWAY`) and returns (`RETURN_IN`). Opening stock is shown as the **Initial assigned EA** column. Consumption, replenishment and returned quantities have separate columns and named movement badges.
+
+Each row shows the SKU balance before and after that event, order reference, original source row, and the affected tote’s before/after quantities. A split order line has several consumption rows; their consumed quantities sum to its fulfilled quantity. On replenishment rows, the linked order line caused the refill and does not represent additional consumption.
+
+SKU balances include receiving plus all assigned totes, including totes in transit. A receiving-to-tote refill increases tote stock while leaving total SKU stock unchanged. External replenishment increases total SKU stock. Filters and pagination preserve the original event-time balances. This view also works for existing saved runs without rewriting their events. Its CSV uses exact EA quantities and exports all matching rows.
+
 ## Persistence and local endpoints
 
 Runtime simulation data lives in **`.data/asrs.sqlite`** (or `DATA_DIR/asrs.sqlite`) alongside the warehouse’s `app.sqlite`. Inputs, pinned release, stock, events, completed cycles and checkpoints persist. A checkpoint and its stock-flow writes commit in one SQLite transaction. After a crash, an interrupted running simulation becomes paused and resumes from its last committed event without posting twice. Interrupted preparations become failed and must be prepared again. One simulation runs/prepares at a time; previously prepared or paused runs remain available.
@@ -67,9 +75,11 @@ These endpoints belong to the trusted local management application and use the s
 | `POST /api/asrs/runs/{id}/control`   | `{action:resume\|pause\|stop\|speed}`; speed accepts numeric ≥1 or `"max"`; optional `skip_idle`      |
 | `GET /api/asrs/runs/{id}/events`     | Stock-flow cursor feed: `after,limit,sku,source_row,kind`; `latest=1` samples latest matching records |
 | `GET /api/asrs/runs/{id}/orders`     | Source-line cursor feed: `after,limit,sku,status,date`                                                |
+| `GET /api/asrs/runs/{id}/sku-movements` | SKU quantity ledger: `after,limit,sku,source_row,movement`; movement is `consume`, `replenish` or `return`; `latest=1` samples the latest matches |
 | `GET /api/asrs/runs/{id}/stock`      | Current tote balances; optional exact `sku`                                                           |
 | `GET /api/asrs/runs/{id}/events.csv` | Stream every matching stock-flow record                                                               |
 | `GET /api/asrs/runs/{id}/orders.csv` | Stream every matching source order line and fulfillment status                                        |
+| `GET /api/asrs/runs/{id}/sku-movements.csv` | Export all matching SKU quantity movements in EA, with the same SKU/source-row/movement filters |
 
 Selections use `{mode:"one_date",dates:["2023-01-03"]}`, `multiple_dates`, `{mode:"one_month",months:["2023-01"]}`, `multiple_months`, or `{mode:"full"}`. The settings contract and defaults are in `shared/asrs.ts`. The deployed warehouse’s authenticated calendar and cursor APIs are documented in [API.md](API.md).
 

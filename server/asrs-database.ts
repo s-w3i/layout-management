@@ -32,6 +32,11 @@ const eventFields = [
   "cycle_id",
   "reason",
 ];
+const skuMovementKinds: Record<string, string[]> = {
+  consume: ["ORDER_OUT"],
+  replenish: ["REPLENISH_IN", "RETURN_PUTAWAY"],
+  return: ["RETURN_IN"],
+};
 
 export class AsrsDatabase {
   readonly db: DatabaseSync;
@@ -327,20 +332,58 @@ export class AsrsDatabase {
       after = Math.max(0, Math.trunc(Number(query.after) || 0));
     if (!Number.isSafeInteger(after)) throw new Error("Invalid cursor");
     const args: (string | number)[] = [key, after];
-    if (kind === "events") {
+    if (kind === "events" || kind === "sku-movements") {
+      const skuMovements = kind === "sku-movements";
       let where = "run_id=? AND sequence>?";
+      if (skuMovements) {
+        if (
+          query.movement &&
+          !Object.hasOwn(skuMovementKinds, String(query.movement))
+        )
+          throw new Error(
+            "Choose consume, replenish or return for the SKU movement filter",
+          );
+        const kinds = query.movement
+          ? skuMovementKinds[String(query.movement)]
+          : Object.values(skuMovementKinds).flat();
+        where += ` AND kind IN (${kinds.map(() => "?").join(",")})`;
+        args.push(...kinds);
+      }
       for (const key of ["sku", "source_row", "kind"])
         if (query[key]) {
           where += ` AND ${key}=?`;
           args.push(String(query[key]));
         }
       const latest = query.latest === "1";
-      const rows = this.db
+      let rows = this.db
         .prepare(
-          `SELECT ${eventFields.join(",")} FROM events WHERE ${where} ORDER BY sequence ${latest ? "DESC" : "ASC"} LIMIT ?`,
+          `SELECT ${eventFields.join(",")}${skuMovements ? ",(SELECT COALESCE(SUM(initial_micro),0) FROM loads WHERE loads.run_id=events.run_id AND loads.sku=events.sku) AS initial_sku_micro" : ""} FROM events WHERE ${where} ORDER BY sequence ${latest ? "DESC" : "ASC"} LIMIT ?`,
         )
         .all(...args, limit) as Row[];
       if (latest) rows.reverse();
+      if (skuMovements)
+        rows = rows.map((row) => ({
+          ...row,
+          movement_type:
+            row.kind === "ORDER_OUT"
+              ? "consume"
+              : row.kind === "RETURN_IN"
+                ? "return"
+                : "replenish",
+          sku_before_micro: row.sku_balance_micro - row.delta_micro,
+          sku_after_micro: row.sku_balance_micro,
+          consumed_micro: row.kind === "ORDER_OUT" ? row.quantity_micro : 0,
+          replenished_micro: ["REPLENISH_IN", "RETURN_PUTAWAY"].includes(
+            row.kind,
+          )
+            ? row.quantity_micro
+            : 0,
+          returned_micro: row.kind === "RETURN_IN" ? row.quantity_micro : 0,
+          tote_before_micro: row.load_id
+            ? row.load_balance_micro - row.load_delta_micro
+            : null,
+          tote_after_micro: row.load_id ? row.load_balance_micro : null,
+        }));
       return {
         rows,
         next_after: rows.at(-1)?.sequence ?? after,

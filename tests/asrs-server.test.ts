@@ -11,6 +11,8 @@ import { WarehouseDatabase } from "../server/database.js";
 import { native, physical, sku } from "./fixtures.js";
 import { defaultAsrsSettings } from "../shared/asrs.js";
 import type { Row } from "../shared/model.js";
+import { parse as parseCsv } from "csv-parse/sync";
+import { exactQuantity } from "../shared/inventory.js";
 
 test("ASRS connects through the deployed API, pins versions, replays every date mode and recovers a crashed run", async (t) => {
   const folder = await mkdtemp(join(tmpdir(), "layout-asrs-http-"));
@@ -359,6 +361,61 @@ test("ASRS connects through the deployed API, pins versions, replays every date 
         csv.includes("ORDER-2"),
     );
     assert.ok(!csv.includes("REPLENISH_REQUEST"));
+    const movements = (
+      await request(
+        `/api/asrs/runs/${run.id}/sku-movements?movement=consume&limit=5000`,
+      )
+    ).rows;
+    assert.equal(
+      movements.length,
+      events.filter((e: Row) => e.kind === "ORDER_OUT").length,
+    );
+    assert.ok(
+      movements.every(
+        (r: Row) =>
+          r.movement_type === "consume" &&
+          r.sku_before_micro - r.sku_after_micro === r.consumed_micro,
+      ),
+    );
+    const skuCsv = await (
+      await fetch(
+        base +
+          `/api/asrs/runs/${run.id}/sku-movements.csv?movement=consume&latest=1`,
+      )
+    ).text();
+    const exported = parseCsv(skuCsv, { columns: true, bom: true }) as Row[];
+    assert.equal(exported.length, movements.length);
+    for (let i = 0; i < exported.length; i++) {
+      assert.equal(
+        exported[i].sku_before_ea,
+        exactQuantity(movements[i].sku_before_micro),
+      );
+      assert.equal(
+        exported[i].consumed_ea,
+        exactQuantity(movements[i].consumed_micro),
+      );
+      assert.equal(
+        exported[i].sku_after_ea,
+        exactQuantity(movements[i].sku_after_micro),
+      );
+      assert.equal(exported[i].source_row, String(movements[i].source_row));
+    }
+    assert.equal(
+      (
+        await fetch(
+          base + `/api/asrs/runs/${run.id}/sku-movements?movement=invalid`,
+        )
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await fetch(
+          base + `/api/asrs/runs/${run.id}/sku-movements.csv?movement=invalid`,
+        )
+      ).status,
+      400,
+    );
     if (index === 4) {
       assert.equal(run.state.totals.outbound, 19_000_000);
       assert.equal(run.state.onhand_micro, 13_000_000);

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { Storage } from "./storage.js";
 import { warehouseRead } from "./asrs-worker.js";
 import { csvString, type Row } from "../shared/model.js";
+import { exactQuantity } from "../shared/inventory.js";
 
 export class AsrsApi {
   private worker: Storage;
@@ -130,11 +131,17 @@ export class AsrsApi {
         if (view === "model") return reply(await this.worker.call("model", id));
         if (view === "stock")
           return reply(await this.worker.call("stock", id, query));
-        if (["events", "orders"].includes(view))
+        if (["events", "orders", "sku-movements"].includes(view))
           return reply(await this.worker.call("page", id, view, query));
-        if (["events.csv", "orders.csv"].includes(view)) {
+        if (["events.csv", "orders.csv", "sku-movements.csv"].includes(view)) {
           const run = await this.worker.call("run", id),
-            kind = view.split(".")[0];
+            kind = view.split(".")[0],
+            firstPage = await this.worker.call("page", id, kind, {
+              ...query,
+              after: 0,
+              limit: 5000,
+              latest: "0",
+            });
           res.writeHead(200, {
             "Content-Type": "text/csv; charset=utf-8",
             "Content-Disposition": `attachment; filename="asrs-${id}-${view}"`,
@@ -145,18 +152,52 @@ export class AsrsApi {
             let after = 0,
               first = true;
             while (!res.destroyed) {
-              const page = await this.worker.call("page", id, kind, {
-                ...query,
-                after,
-                limit: 5000,
-              });
+              const page = first
+                ? firstPage
+                : await this.worker.call("page", id, kind, {
+                    ...query,
+                    after,
+                    limit: 5000,
+                    latest: "0",
+                  });
               if (!page.rows.length) break;
               const rows = page.rows.map((r: Row) => ({
                 run_id: id,
                 release_id: run.config.release_id,
                 dataset_id: run.config.dataset_id,
                 time_zone: run.config.time_zone,
-                ...r,
+                ...(kind === "sku-movements"
+                  ? {
+                      sequence: r.sequence,
+                      simulation_time_local: r.simulation_time_local,
+                      movement_type: r.movement_type,
+                      kind: r.kind,
+                      sku: r.sku,
+                      initial_assigned_ea: exactQuantity(r.initial_sku_micro),
+                      sku_before_ea: exactQuantity(r.sku_before_micro),
+                      consumed_ea: exactQuantity(r.consumed_micro),
+                      replenished_ea: exactQuantity(r.replenished_micro),
+                      returned_ea: exactQuantity(r.returned_micro),
+                      sku_after_ea: exactQuantity(r.sku_after_micro),
+                      source_row: r.source_row,
+                      order_reference: r.order_reference,
+                      order_date: r.order_date,
+                      source_time: r.source_time,
+                      store: r.store,
+                      load_id: r.load_id,
+                      tote_before_ea:
+                        r.tote_before_micro == null
+                          ? ""
+                          : exactQuantity(r.tote_before_micro),
+                      tote_after_ea:
+                        r.tote_after_micro == null
+                          ? ""
+                          : exactQuantity(r.tote_after_micro),
+                      from_location: r.from_location,
+                      to_location: r.to_location,
+                      cycle_id: r.cycle_id,
+                    }
+                  : r),
               }));
               const csv = csvString(rows),
                 lines = first

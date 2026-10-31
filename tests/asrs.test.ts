@@ -350,6 +350,142 @@ test("simulation database commits checkpoints with immutable events and separate
     db.db.close();
   }
 });
+test("SKU movement ledger separates consumption, refills and returns with event-time balances", () => {
+  const db = new AsrsDatabase(":memory:"),
+    m = model();
+  m.loads.push({
+    ...m.loads[0],
+    id: "A#2",
+    address: "A/L01/S02",
+    position: [1, 0, 0.5],
+    initial: 6.5 * U,
+  });
+  const orders = [
+    line(2, 8),
+    line(3, -3.25),
+    line(4, 20),
+    line(5, -1.125, "2023-01-03", "B"),
+  ];
+  try {
+    const id = db.create({ name: "SKU ledger" }).id;
+    db.appendOrders(id, orders);
+    db.init(id, {}, m);
+    const engine = finish(
+      new AsrsEngine(
+        m,
+        ["2023-01-03"],
+        asrsSettings({ speed: "max", replenishment_lead_seconds: 1 }),
+        (date) => db.orders(id, date),
+        db.sink(id),
+      ),
+    );
+    const events = db.page(id, "events", { limit: 5000 }).rows,
+      rows = db.page(id, "sku-movements", { limit: 5000 }).rows;
+    assert.deepEqual(
+      rows.map((r: Row) => r.sequence),
+      events
+        .filter((e: Row) =>
+          ["ORDER_OUT", "REPLENISH_IN", "RETURN_PUTAWAY", "RETURN_IN"].includes(
+            e.kind,
+          ),
+        )
+        .map((e: Row) => e.sequence),
+    );
+    const balances: Record<string, number> = { A: 16.5 * U, B: 0 };
+    for (const row of rows) {
+      assert.equal(row.initial_sku_micro, row.sku === "A" ? 16.5 * U : 0);
+      assert.equal(row.sku_before_micro, balances[row.sku]);
+      assert.equal(row.sku_before_micro + row.delta_micro, row.sku_after_micro);
+      balances[row.sku] = row.sku_after_micro;
+      if (row.load_id)
+        assert.equal(
+          row.tote_before_micro + row.load_delta_micro,
+          row.tote_after_micro,
+        );
+      else assert.equal(row.tote_before_micro, null);
+    }
+    assert.equal(
+      Object.values(balances).reduce((a, b) => a + b, 0),
+      engine.snapshot().onhand_micro,
+    );
+    const consume = db.page(id, "sku-movements", {
+      movement: "consume",
+      sku: "A",
+      limit: 5000,
+    }).rows;
+    assert.equal(
+      consume.reduce((q: number, r: Row) => q + r.consumed_micro, 0),
+      28 * U,
+    );
+    assert.ok(
+      consume.every(
+        (r: Row) =>
+          r.movement_type === "consume" &&
+          r.order_reference === `ORD-${r.source_row}` &&
+          r.replenished_micro === 0,
+      ),
+    );
+    const refills = db.page(id, "sku-movements", {
+      movement: "replenish",
+      limit: 5000,
+    }).rows;
+    assert.ok(
+      refills.some(
+        (r: Row) =>
+          r.kind === "REPLENISH_IN" &&
+          r.sku_after_micro - r.sku_before_micro === r.replenished_micro,
+      ),
+    );
+    const putaway = refills.find((r: Row) => r.kind === "RETURN_PUTAWAY");
+    assert.ok(putaway);
+    assert.equal(putaway.sku_before_micro, putaway.sku_after_micro);
+    assert.equal(
+      putaway.tote_after_micro - putaway.tote_before_micro,
+      putaway.replenished_micro,
+    );
+    const returns = db.page(id, "sku-movements", {
+      movement: "return",
+      limit: 5000,
+    }).rows;
+    assert.equal(
+      returns.reduce((q: number, r: Row) => q + r.returned_micro, 0),
+      4.375 * U,
+    );
+    const first = db.page(id, "sku-movements", { limit: 1 });
+    assert.deepEqual(
+      db.page(id, "sku-movements", { after: first.next_after, limit: 5000 })
+        .rows,
+      rows.slice(1),
+    );
+    assert.deepEqual(
+      db.page(id, "sku-movements", { latest: "1", limit: 2 }).rows,
+      rows.slice(-2),
+    );
+    const lineRows = db.page(id, "sku-movements", {
+      movement: "consume",
+      source_row: 2,
+      limit: 5000,
+    }).rows;
+    assert.equal(
+      lineRows.reduce((q: number, r: Row) => q + r.consumed_micro, 0),
+      8 * U,
+    );
+    assert.equal(
+      db.page(id, "sku-movements", { sku: "missing" }).rows.length,
+      0,
+    );
+    assert.throws(
+      () => db.page(id, "sku-movements", { movement: "__proto__" }),
+      /Choose/,
+    );
+    assert.equal(
+      db.page(id, "events", { limit: 5000 }).rows.length,
+      events.length,
+    );
+  } finally {
+    db.db.close();
+  }
+});
 test("invalid engineering settings and unsupported physical layouts are rejected", () => {
   assert.throws(() => asrsSettings({ speed: 0 }), /at least/);
   assert.throws(

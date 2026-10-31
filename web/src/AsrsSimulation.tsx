@@ -91,6 +91,7 @@ export default function AsrsSimulation({
   const [sku, setSku] = useState(""),
     [sourceRow, setSourceRow] = useState(""),
     [kind, setKind] = useState("");
+  const [movement, setMovement] = useState("");
   const [cursor, setCursor] = useState(0),
     [cursors, setCursors] = useState<number[]>([]),
     [page, setPage] = useState<Row | null>(null),
@@ -211,13 +212,20 @@ export default function AsrsSimulation({
     setCursor(0);
     setCursors([]);
     setRows([]);
-  }, [id, sku, sourceRow, kind, tab, follow]);
+    setPage(null);
+  }, [id, sku, sourceRow, kind, movement, tab, follow]);
+  const ledger = tab === "events" || tab === "sku-movements";
   const query = new URLSearchParams({
     sku,
-    ...(tab === "events" ? { source_row: sourceRow, kind } : {}),
+    ...(ledger
+      ? {
+          source_row: sourceRow,
+          ...(tab === "events" ? { kind } : { movement }),
+        }
+      : {}),
     after: String(cursor),
     limit: "200",
-    ...(follow && tab === "events" ? { latest: "1" } : {}),
+    ...(follow && ledger ? { latest: "1" } : {}),
   }).toString();
   useEffect(() => {
     if (!visible || !id || !run?.state) return;
@@ -1070,6 +1078,7 @@ export default function AsrsSimulation({
             >
               {[
                 ["events", "Stock flow"],
+                ["sku-movements", "SKU in / out"],
                 ["orders", "Order lines"],
                 ["stock", "Tote balances"],
               ].map(([value, label]) => (
@@ -1083,7 +1092,11 @@ export default function AsrsSimulation({
                 </button>
               ))}
             </div>
-            <div className="form-grid">
+            <div
+              className={
+                tab === "sku-movements" ? "form-grid columns-3" : "form-grid"
+              }
+            >
               <Field label="Exact SKU filter">
                 <input
                   value={sku}
@@ -1091,7 +1104,7 @@ export default function AsrsSimulation({
                   placeholder="All SKUs"
                 />
               </Field>
-              {tab === "events" && (
+              {ledger && (
                 <>
                   <Field label="Original source row">
                     <input
@@ -1102,28 +1115,44 @@ export default function AsrsSimulation({
                       placeholder="All order lines"
                     />
                   </Field>
-                  <Field label="Movement kind">
-                    <select
-                      value={kind}
-                      onChange={(e) => setKind(e.target.value)}
-                    >
-                      <option value="">All movements</option>
-                      {eventKinds.map((k) => (
-                        <option key={k}>{k}</option>
-                      ))}
-                    </select>
-                  </Field>
+                  {tab === "events" ? (
+                    <Field label="Movement kind">
+                      <select
+                        value={kind}
+                        onChange={(e) => setKind(e.target.value)}
+                      >
+                        <option value="">All movements</option>
+                        {eventKinds.map((k) => (
+                          <option key={k}>{k}</option>
+                        ))}
+                      </select>
+                    </Field>
+                  ) : (
+                    <Field label="SKU movement type">
+                      <select
+                        value={movement}
+                        onChange={(e) => setMovement(e.target.value)}
+                      >
+                        <option value="">All SKU movements</option>
+                        <option value="consume">Consume</option>
+                        <option value="replenish">Replenish</option>
+                        <option value="return">Return</option>
+                      </select>
+                    </Field>
+                  )}
                 </>
               )}
             </div>
-            {tab === "events" && (
+            {ledger && (
               <label className="asrs-check">
                 <input
                   type="checkbox"
                   checked={follow}
                   onChange={(e) => setFollow(e.target.checked)}
                 />
-                Follow latest 200 movements. Clear to browse from the beginning.
+                Follow latest 200{" "}
+                {tab === "sku-movements" ? "SKU movements" : "movements"}. Clear
+                to browse from the beginning.
               </label>
             )}
             {tab === "stock" ? (
@@ -1197,17 +1226,128 @@ export default function AsrsSimulation({
                 <div className="asrs-export">
                   <a
                     className="button button-small"
-                    href={`/api/asrs/runs/${id}/${tab}.csv?${new URLSearchParams({ sku, ...(tab === "events" ? { source_row: sourceRow, kind } : {}) })}`}
+                    href={`/api/asrs/runs/${id}/${tab}.csv?${new URLSearchParams({ sku, ...(ledger ? { source_row: sourceRow, ...(tab === "events" ? { kind } : { movement }) } : {}) })}`}
                   >
                     <Download size={16} aria-hidden="true" />
-                    Export {tab === "events" ? "stock flow" : "order lines"} CSV
+                    Export{" "}
+                    {tab === "events"
+                      ? "stock flow"
+                      : tab === "sku-movements"
+                        ? "SKU in / out"
+                        : "order lines"}{" "}
+                    CSV
                   </a>
                   <span>
                     Exports every matching record, including pages outside this
                     view.
                   </span>
                 </div>
-                {tab === "events" ? (
+                {tab === "sku-movements" ? (
+                  <>
+                    <p className="asrs-help">
+                      Only completed stock movements are shown. Initial assigned
+                      EA is the SKU’s published opening target. SKU before/after
+                      includes all totes and receiving stock; moving returned
+                      stock from receiving into a tote replenishes that tote
+                      without increasing the SKU total. Replenishment order
+                      lines identify the refill trigger.
+                    </p>
+                    <Table
+                      label="SKU in and out records"
+                      empty="No SKU consumption, replenishment or return records match this view."
+                      rows={rows}
+                      columns={[
+                        {
+                          key: "simulation_time_local",
+                          label: "Warehouse local time",
+                          render: (v) => v.replace("T", " "),
+                        },
+                        { key: "sku", label: "SKU" },
+                        {
+                          key: "movement_type",
+                          label: "Movement",
+                          render: (v, r) => (
+                            <span>
+                              <Badge
+                                tone={
+                                  v === "consume"
+                                    ? "amber"
+                                    : v === "replenish"
+                                      ? "green"
+                                      : "blue"
+                                }
+                              >
+                                {v === "consume"
+                                  ? "Consume"
+                                  : v === "return"
+                                    ? "Return"
+                                    : "Replenish"}
+                              </Badge>
+                              {v === "replenish" && (
+                                <>
+                                  <br />
+                                  <small>
+                                    {r.kind === "RETURN_PUTAWAY"
+                                      ? "From receiving"
+                                      : "External supply"}
+                                  </small>
+                                </>
+                              )}
+                            </span>
+                          ),
+                        },
+                        { key: "order_reference", label: "Order ref." },
+                        { key: "source_row", label: "Order line · source row" },
+                        {
+                          key: "sku_before_micro",
+                          label: "SKU before EA",
+                          render: (v) => ea(v),
+                        },
+                        {
+                          key: "consumed_micro",
+                          label: "Consumed EA",
+                          render: (v) => (v ? ea(v) : "—"),
+                        },
+                        {
+                          key: "replenished_micro",
+                          label: "Replenished EA",
+                          render: (v) => (v ? ea(v) : "—"),
+                        },
+                        {
+                          key: "sku_after_micro",
+                          label: "SKU after EA",
+                          render: (v) => ea(v),
+                        },
+                        {
+                          key: "initial_sku_micro",
+                          label: "Initial assigned EA",
+                          render: (v) => ea(v),
+                        },
+                        {
+                          key: "returned_micro",
+                          label: "Returned EA",
+                          render: (v) => (v ? ea(v) : "—"),
+                        },
+                        {
+                          key: "load_id",
+                          label: "Tote · before → after EA",
+                          render: (v, r) => (
+                            <span>
+                              {v || "Receiving"}
+                              {r.tote_before_micro != null && (
+                                <>
+                                  <br />
+                                  {ea(r.tote_before_micro)} →{" "}
+                                  {ea(r.tote_after_micro)}
+                                </>
+                              )}
+                            </span>
+                          ),
+                        },
+                      ]}
+                    />
+                  </>
+                ) : tab === "events" ? (
                   <Table
                     label="Simulation stock flow"
                     rows={rows}
@@ -1274,7 +1414,7 @@ export default function AsrsSimulation({
                     ]}
                   />
                 )}
-                {!(tab === "events" && follow) && (
+                {!(ledger && follow) && (
                   <div className="asrs-pagination">
                     <button
                       className="button button-small"
