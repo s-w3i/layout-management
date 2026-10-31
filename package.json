@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.23.4"
   },
   "scripts": {
     "build:native": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j2",

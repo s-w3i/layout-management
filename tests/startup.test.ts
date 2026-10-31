@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:net";
 import { once } from "node:events";
 import { spawnSync } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 test("occupied ports stop the launcher before building and report a clear server error", async (t) => {
   const server = createServer();
@@ -11,7 +14,13 @@ test("occupied ports stop the launcher before building and report a clear server
   t.after(() => server.close());
   const address = server.address();
   assert.ok(address && typeof address !== "string");
-  const env = { ...process.env, PORT: String(address.port) };
+  const isolated = await mkdtemp(join(tmpdir(), "layout-startup-"));
+  t.after(() => rm(isolated, { recursive: true, force: true }));
+  const env = {
+    ...process.env,
+    PORT: String(address.port),
+    DATA_DIR: isolated,
+  };
   for (const [command, args] of [
     [process.execPath, ["scripts/check-port.mjs"]],
     ["bash", ["scripts/run.sh"]],

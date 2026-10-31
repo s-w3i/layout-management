@@ -2918,3 +2918,150 @@ th[aria-sort="descending"] {
     display: none;
   }
 }
+
+.data-management {
+  display: grid;
+  gap: 18px;
+}
+.management-heading,
+.management-heading > div,
+.management-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.management-heading {
+  justify-content: space-between;
+}
+.management-heading small {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+.management-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.management-tabs button {
+  border: 0;
+  background: transparent;
+  border-radius: 6px;
+  min-height: 44px;
+  padding: 9px 14px;
+  font-weight: 600;
+  color: var(--muted);
+  transition:
+    background 150ms,
+    color 150ms;
+}
+.management-tabs button.active {
+  color: var(--primary-dark);
+  background: #eaf0ff;
+}
+.management-tabs button:hover {
+  background: #f0f3f9;
+}
+.management-tabs button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+#management-panel {
+  display: grid;
+  gap: 20px;
+}
+.management-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.management-fields input,
+.management-fields select,
+.management-fields textarea {
+  width: 100%;
+  min-height: 44px;
+}
+.management-form {
+  padding: 22px 0 0;
+  margin-top: 22px;
+  border-top: 1px solid var(--line);
+}
+.management-form h3 {
+  font-size: 16px;
+  margin: 0 0 16px;
+}
+.management-hint {
+  color: var(--muted);
+  margin: 14px 0 0;
+  font-size: 13px;
+}
+.management-sequence {
+  padding-left: 22px;
+  line-height: 2;
+  margin: 0 0 24px;
+}
+.integration-example {
+  padding: 18px;
+  background: #f5f7fb;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: auto;
+  max-width: 100%;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.9;
+}
+.token-reveal {
+  display: grid;
+  gap: 14px;
+  margin-top: 20px;
+  padding: 18px;
+  background: #f0f8f4;
+  border: 1px solid #bed9c9;
+  border-radius: var(--radius);
+}
+.token-reveal code {
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.data-management .notice.success {
+  background: #eef8f2;
+  color: #216447;
+  border: 1px solid #c2dece;
+}
+.data-management .table-block {
+  max-width: 100%;
+}
+@media (max-width: 600px) {
+  .management-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .management-tabs button {
+    flex: 1 1 120px;
+  }
+  .management-heading {
+    align-items: flex-start;
+  }
+  .management-actions {
+    gap: 8px;
+  }
+}
+
+.data-management .panel-title {
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: flex-start;
+}
+.data-management .button,
+.data-management .table-sort {
+  min-height: 44px;
+}
+.data-management .management-actions {
+  min-width: 0;
+}

@@ -25,6 +25,7 @@ import {
   RefreshCw,
   MapPinned,
   PackageCheck,
+  Database,
 } from "lucide-react";
 import {
   defaultSettings,
@@ -38,6 +39,7 @@ import { augmentCatalog, newProject, syncBuffers } from "./warehouse";
 import { WarehouseStep } from "./WarehouseStep";
 import LayoutViewer from "./LayoutViewer";
 import InventoryOperations from "./InventoryOperations";
+import DataManagement from "./DataManagement";
 import { dateRangeError } from "../../shared/dates";
 import {
   demandFilters,
@@ -183,6 +185,30 @@ export default function App() {
     helpRef = useRef<HTMLDialogElement>(null);
   const saveVersion = useRef(0);
   const skipInitialSave = useRef(false);
+  const saveNow = async () => {
+    const revision = ++saveVersion.current;
+    await api(`/api/workspaces/${workspaceId}`, {
+      method: "PUT",
+      body: JSON.stringify({ ...workspace, _save_revision: revision }),
+    });
+    return revision;
+  };
+  const openSavedWorkspace = async (id: string) => {
+    await saveNow();
+    const saved = await api(`/api/workspaces/${id}`);
+    if (!saved.project)
+      throw new Error("This workspace has no warehouse configuration yet");
+    saveVersion.current = Number(saved._save_revision || 0);
+    skipInitialSave.current = true;
+    localStorage.setItem("layout-generator-workspace", id);
+    setWorkspaceId(id);
+    setWorkspace({
+      ...blank(),
+      ...saved,
+      settings: { ...defaultSettings, ...saved.settings },
+    });
+    setArea("planning");
+  };
   const w = workspace,
     step = w.step;
   useEffect(() => {
@@ -640,6 +666,7 @@ export default function App() {
       <aside className="sidebar">
         <a
           className="brand"
+          aria-label="Layout Generator"
           href="#"
           onClick={(e) => {
             e.preventDefault();
@@ -695,12 +722,39 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <div className="sidebar-label operations-label">AFTER GENERATION</div>
+        <div className="sidebar-label operations-label">
+          WAREHOUSE MANAGEMENT
+        </div>
+        <nav
+          className="operations-nav"
+          aria-label="Data and inventory management"
+        >
+          <button
+            type="button"
+            aria-label="Data & inventory"
+            title="Data & inventory"
+            className={`step-link ${area === "management" ? "current" : ""}`}
+            aria-pressed={area === "management"}
+            onClick={() => {
+              setArea("management");
+              setError("");
+              setTimeout(() => titleRef.current?.focus(), 0);
+            }}
+          >
+            <span className="step-number">
+              <Database size={17} aria-hidden="true" />
+            </span>
+            <span>
+              <strong>Data & inventory</strong>
+              <small>Records, releases & API</small>
+            </span>
+          </button>
+        </nav>
         <nav className="operations-nav" aria-label="Inventory tools">
           <button
             type="button"
-            aria-label="Inventory operations"
-            title="Inventory operations"
+            aria-label="Layout scenarios"
+            title="Layout scenarios"
             className={`step-link ${area === "operations" ? "current" : ""}`}
             aria-pressed={area === "operations"}
             onClick={() => {
@@ -714,7 +768,7 @@ export default function App() {
               <PackageCheck size={17} aria-hidden="true" />
             </span>
             <span>
-              <strong>Inventory operations</strong>
+              <strong>Layout scenarios</strong>
               <small>Locate, rank & trial swaps</small>
             </span>
           </button>
@@ -744,9 +798,11 @@ export default function App() {
             <span>Workspace</span>
             <span>/</span>
             <strong>
-              {area === "operations"
-                ? "Inventory operations"
-                : steps[step].name}
+              {area === "management"
+                ? "Data & inventory"
+                : area === "operations"
+                  ? "Layout scenarios"
+                  : steps[step].name}
             </strong>
           </div>
           <div className="top-actions">
@@ -800,8 +856,10 @@ export default function App() {
           <div className="page-intro">
             <div>
               <div className="eyebrow">
-                {area === "operations" ? (
-                  "INVENTORY OPERATIONS"
+                {area === "management" ? (
+                  "WAREHOUSE MANAGEMENT"
+                ) : area === "operations" ? (
+                  "LAYOUT SCENARIOS"
                 ) : (
                   <>
                     STEP {String(step + 1).padStart(2, "0")} <span>/ 05</span>
@@ -809,14 +867,18 @@ export default function App() {
                 )}
               </div>
               <h1 ref={titleRef} tabIndex={-1}>
-                {area === "operations"
-                  ? "Inspect inventory. Test position changes."
-                  : headings[step][0]}
+                {area === "management"
+                  ? "Prepare data. Publish with confidence."
+                  : area === "operations"
+                    ? "Inspect inventory. Test position changes."
+                    : headings[step][0]}
               </h1>
               <p>
-                {area === "operations"
-                  ? "Locate stock, estimate handling-unit movements and try validated swaps in a separate scenario."
-                  : headings[step][1]}
+                {area === "management"
+                  ? "Manage warehouse records and operational stock, then provide versioned data to external systems."
+                  : area === "operations"
+                    ? "Locate stock, estimate handling-unit movements and try validated swaps in a separate scenario."
+                    : headings[step][1]}
               </p>
             </div>
             <div className="intro-right">
@@ -2286,6 +2348,37 @@ export default function App() {
                   </>
                 )}
               </>
+            )}
+            {area === "management" && (
+              <DataManagement
+                workspaceId={workspaceId}
+                workspaceName={w.name}
+                save={saveNow}
+                openWorkspace={openSavedWorkspace}
+                useOrders={(orders) => {
+                  patch({
+                    orders,
+                    velocity: [],
+                    stock: [],
+                    analysis: null,
+                    stockResult: null,
+                    result: null,
+                    demandStale: false,
+                    stockStale: false,
+                    settings: {
+                      ...w.settings,
+                      start_date: "",
+                      end_date: "",
+                      store_workstation_mapping: {},
+                    },
+                  });
+                  go(1);
+                }}
+                useAttributes={(attributes) => {
+                  patch({ attributes, result: null, stockStale: true });
+                  go(2);
+                }}
+              />
             )}
             <div hidden={area !== "operations"}>
               {operationsOpened && (

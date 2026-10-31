@@ -1,3 +1,4 @@
+import { WarehouseDatabase } from "./database.js";
 import { parentPort, workerData } from "node:worker_threads";
 import { createReadStream } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -8,7 +9,10 @@ import { parse as parseSync } from "csv-parse/sync";
 import ExcelJS from "exceljs";
 import { attributeRows, type Row } from "../shared/model.js";
 
-const { path, name, kind, id, output } = workerData as Record<string, string>;
+const { path, name, kind, id, output, databasePath } = workerData as Record<
+  string,
+  string
+>;
 const scalar = (value: any): any =>
   value && typeof value === "object" && !(value instanceof Date)
     ? "result" in value
@@ -61,7 +65,14 @@ async function* tableRows(): AsyncGenerator<any[]> {
     for await (const row of parser) yield row;
   }
 }
+const database =
+  databasePath && kind === "orders"
+    ? new WarehouseDatabase(databasePath)
+    : null;
 async function importOrders() {
+  database?.beginRawImport(id, name);
+  let sourceRow = 0;
+  let rawRows: Row[] = [];
   let header: Map<string, number> | null = null,
     lines = 0,
     ignored = 0,
@@ -86,6 +97,7 @@ async function importOrders() {
     weight: "weight (kg)",
   };
   for await (const values of tableRows()) {
+    sourceRow++;
     if (!header) {
       const names = values
         .map((v) =>
@@ -119,6 +131,32 @@ async function importOrders() {
     if (!Number.isFinite(qty)) qty = 0;
     let conversion = Number(value("uom conversionqty") ?? 1);
     if (!Number.isFinite(conversion) || conversion <= 0) conversion = 1;
+    if (database) {
+      rawRows.push({
+        source_row: sourceRow,
+        date,
+        sku,
+        store,
+        quantity_ea: qty,
+        conversion,
+        source_time:
+          value("time") instanceof Date
+            ? value("time").toISOString().slice(11, 23)
+            : typeof value("time") === "number"
+              ? new Date(Math.round((value("time") % 1) * 86400000))
+                  .toISOString()
+                  .slice(11, 23)
+              : String(value("time") ?? ""),
+        uom: String(value("uom") ?? ""),
+        order_reference: String(
+          value("order id") ?? value("order no") ?? value("order number") ?? "",
+        ),
+      });
+      if (rawRows.length >= 1000) {
+        database.appendOrderLines(id, rawRows);
+        rawRows = [];
+      }
+    }
     skuSet.add(sku);
     if (skuSet.size > 10000)
       throw new Error("At most 10,000 distinct SKUs are supported");
@@ -176,6 +214,7 @@ async function importOrders() {
         "Order file exceeds 2 million lines or 100,000 store/day groups",
       );
   }
+  if (database && rawRows.length) database.appendOrderLines(id, rawRows);
   if (!header || !lines) throw new Error("No valid order rows found");
   const data = {
     daily: [...daily.values()].sort(
@@ -260,8 +299,11 @@ try {
   }
   parentPort!.postMessage({ result });
 } catch (error) {
+  database?.failDataset(id);
   parentPort!.postMessage({
     error: error instanceof Error ? error.message : String(error),
   });
   process.exitCode = 1;
+} finally {
+  database?.close();
 }

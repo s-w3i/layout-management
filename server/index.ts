@@ -3,16 +3,11 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { Storage } from "./storage.js";
+import { management } from "./management.js";
 import { createReadStream, createWriteStream } from "node:fs";
-import {
-  readFile,
-  writeFile,
-  mkdir,
-  rename,
-  stat,
-  unlink,
-} from "node:fs/promises";
+import { readFile, mkdir, stat, unlink } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -29,10 +24,12 @@ import {
 } from "../shared/model.js";
 
 const root = resolve(fileURLToPath(new URL("../../", import.meta.url)));
-const data = resolve(root, ".data"),
+const data = resolve(process.env.DATA_DIR || resolve(root, ".data")),
   publicRoot = resolve(root, "dist");
 for (const directory of ["uploads", "assets", "jobs", "workspaces"])
   await mkdir(resolve(data, directory), { recursive: true });
+const storage = new Storage(resolve(data, "app.sqlite"), data);
+await storage.ready;
 const port = Number(process.env.PORT ?? 4317);
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Invalid PORT");
@@ -46,19 +43,15 @@ type Job = {
   created_at: string;
 };
 const jobs = new Map<string, Job>();
-const saves = new Map<string, Promise<void>>();
+
 let tail = Promise.resolve();
+let stopping = false;
 const safeId = (id: string) => {
   if (!/^[a-f0-9-]{36}$/.test(id) && id !== "example-orders")
     throw new Error("Invalid resource ID");
   return id;
 };
 const json = async (path: string) => JSON.parse(await readFile(path, "utf8"));
-const atomic = async (path: string, value: unknown) => {
-  const tmp = path + "." + randomUUID() + ".tmp";
-  await writeFile(tmp, JSON.stringify(value));
-  await rename(tmp, path);
-};
 function send(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -83,7 +76,12 @@ async function body(
     throw new Error("Request body must be an object");
   return result;
 }
-function enqueue(progress: string, run: (job: Job) => Promise<Row>): Job {
+async function enqueue(
+  progress: string,
+  run: (job: Job) => Promise<Row>,
+): Promise<Job> {
+  if (stopping)
+    throw Object.assign(new Error("Server is shutting down"), { status: 503 });
   if (
     [...jobs.values()].filter(
       (j) => j.status === "queued" || j.status === "running",
@@ -97,13 +95,25 @@ function enqueue(progress: string, run: (job: Job) => Promise<Row>): Job {
     created_at: new Date().toISOString(),
   };
   jobs.set(job.id, job);
+  try {
+    await storage.call("saveJob", job);
+  } catch (error) {
+    jobs.delete(job.id);
+    throw error;
+  }
   tail = tail.then(async () => {
     if (job.status === "cancelled") return;
     job.status = "running";
     try {
+      await storage.call("saveJob", job);
       const result = await run(job);
       if ((job.status as string) === "cancelled") return;
-      await atomic(resolve(data, "jobs", job.id + ".json"), result);
+      await storage.call(
+        "saveJob",
+        { ...job, status: "complete", progress: "Complete" },
+        result,
+      );
+      job.result = result;
       job.status = "complete";
       job.progress = "Complete";
     } catch (error) {
@@ -112,6 +122,14 @@ function enqueue(progress: string, run: (job: Job) => Promise<Row>): Job {
         job.error = error instanceof Error ? error.message : String(error);
       }
     } finally {
+      if (job.status !== "complete")
+        try {
+          await storage.call("saveJob", job);
+        } catch {
+          job.error =
+            (job.error || "Job stopped") +
+            "; its status could not be persisted";
+        }
       delete job.cancel;
     }
   });
@@ -124,11 +142,20 @@ function enqueue(progress: string, run: (job: Job) => Promise<Row>): Job {
   return job;
 }
 async function ordersAsset(id: string): Promise<Row> {
-  return json(
-    id === "example-orders"
-      ? resolve(root, "examples/orders.json")
-      : resolve(data, "assets", safeId(id) + ".json"),
-  );
+  safeId(id);
+  try {
+    return await storage.call("getAsset", id);
+  } catch (error: any) {
+    if (id !== "example-orders" || error.status !== 404) throw error;
+    const value = await json(resolve(root, "examples/orders.json"));
+    const metadata = await json(resolve(root, "examples/orders.meta.json"));
+    await storage.call("putAsset", id, value, {
+      ...metadata,
+      kind: "orders",
+      source_level: "aggregated",
+    });
+    return value;
+  }
 }
 async function native(request: Row, job: Job): Promise<Row> {
   return new Promise((accept, reject) => {
@@ -200,6 +227,8 @@ async function example(kind: string): Promise<Row> {
     orders = await json(resolve(root, "examples/orders.meta.json"));
     orders!.id = "example-orders";
   } catch {}
+  if (orders && !(await storage.call("hasAsset", "example-orders")))
+    await ordersAsset("example-orders");
   return {
     project,
     velocity,
@@ -219,6 +248,10 @@ async function example(kind: string): Promise<Row> {
 }
 const server = createServer(async (req, res) => {
   try {
+    if (stopping) {
+      send(res, 503, { error: "Server is shutting down" });
+      return;
+    }
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
     const host = req.headers.host ?? "";
     if (![`127.0.0.1:${port}`, `localhost:${port}`].includes(host)) {
@@ -234,8 +267,29 @@ const server = createServer(async (req, res) => {
       send(res, 403, { error: "Cross-origin requests are not allowed" });
       return;
     }
+    if (
+      await management(req, res, url, {
+        storage,
+        data,
+        body,
+        send,
+        compute: (request) =>
+          native(request, {
+            id: randomUUID(),
+            status: "running",
+            progress: "",
+            created_at: new Date().toISOString(),
+          }),
+      })
+    )
+      return;
     if (req.method === "GET" && url.pathname === "/api/health") {
-      send(res, 200, { status: "ok", engine: "C++20", version: "0.1.0" });
+      send(res, 200, {
+        status: "ok",
+        engine: "C++20",
+        version: "0.1.0",
+        database: await storage.call("health"),
+      });
       return;
     }
     if (req.method === "GET" && url.pathname.startsWith("/api/examples/")) {
@@ -244,8 +298,9 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/api/compare") {
       const request = await body(req);
-      const reference = await json(
-        resolve(data, "assets", safeId(String(request.reference_id)) + ".json"),
+      const reference = await storage.call(
+        "getAsset",
+        safeId(String(request.reference_id)),
       );
       send(res, 200, compareLayouts(request.layout, reference.data));
       return;
@@ -256,13 +311,7 @@ const server = createServer(async (req, res) => {
         state.orders_data = await ordersAsset(String(state.orders.id));
       if (state.reference?.id)
         state.reference_data = (
-          await json(
-            resolve(
-              data,
-              "assets",
-              safeId(String(state.reference.id)) + ".json",
-            ),
-          )
+          await storage.call("getAsset", safeId(String(state.reference.id)))
         ).data;
       send(res, 200, { schema: "layout_generator_workspace/v1", ...state });
       return;
@@ -282,7 +331,7 @@ const server = createServer(async (req, res) => {
         ].includes(command)
       )
         throw new Error("Unsupported engine command");
-      const job = enqueue(
+      const job = await enqueue(
         command === "geometry"
           ? "Checking warehouse geometry"
           : command === "analyze"
@@ -315,12 +364,9 @@ const server = createServer(async (req, res) => {
           if (command === "generate") {
             result.generated_at = new Date().toISOString();
             if (request.reference_id) {
-              const reference = await json(
-                resolve(
-                  data,
-                  "assets",
-                  safeId(String(request.reference_id)) + ".json",
-                ),
+              const reference = await storage.call(
+                "getAsset",
+                safeId(String(request.reference_id)),
               );
               result.comparison = compareLayouts(result, reference.data);
             }
@@ -368,12 +414,14 @@ const server = createServer(async (req, res) => {
         path = resolve(data, "uploads", id + ext),
         output = resolve(data, "assets", id + ".json");
       let size = 0;
+      const sourceHash = createHash("sha256");
       try {
         await pipeline(
           req,
           new Transform({
             transform(chunk, _, done) {
               size += chunk.length;
+              sourceHash.update(chunk);
               if (size > 256 * 1024 * 1024)
                 done(new Error("Uploads may not exceed 256 MB"));
               else done(null, chunk);
@@ -385,67 +433,107 @@ const server = createServer(async (req, res) => {
         await unlink(path).catch(() => {});
         throw error;
       }
-      const job = enqueue(
-        "Reading " + name,
-        async (job) =>
-          new Promise((accept, reject) => {
-            const worker = new Worker(
-              new URL("./import-worker.js", import.meta.url),
+      const job = await enqueue("Reading " + name, async (job) => {
+        const imported: Row = await new Promise((accept, reject) => {
+          const worker = new Worker(
+            new URL("./import-worker.js", import.meta.url),
+            {
+              workerData: {
+                path,
+                name,
+                kind,
+                id,
+                output,
+                databasePath: resolve(data, "app.sqlite"),
+              },
+              resourceLimits: { maxOldGenerationSizeMb: 1536 },
+            },
+          );
+          job.cancel = () => {
+            void worker.terminate();
+          };
+          const timeout = setTimeout(() => {
+            void worker.terminate();
+            reject(new Error("Import exceeded the ten-minute time limit"));
+          }, 600000);
+          worker.on("message", (message: Row) => {
+            if (message.progress) job.progress = message.progress;
+            if (message.error) {
+              clearTimeout(timeout);
+              reject(new Error(message.error));
+            }
+            if (message.result) {
+              clearTimeout(timeout);
+              const result = message.result;
+              if (kind === "reference")
+                accept({
+                  id,
+                  name,
+                  kind,
+                  summary: result.data.summary,
+                  assignment_count: result.data.assignments.length,
+                });
+              else accept(result);
+            }
+          });
+          worker.on("error", (error) => {
+            clearTimeout(timeout);
+            reject(error);
+          });
+          worker.on("exit", (code) => {
+            clearTimeout(timeout);
+            if (code) void storage.call("failDataset", id).catch(() => {});
+            if (code)
+              reject(
+                new Error(
+                  job.status === "cancelled"
+                    ? "Cancelled"
+                    : "Import worker stopped before completing",
+                ),
+              );
+          });
+        });
+        try {
+          if (job.status === "cancelled") throw new Error("Cancelled");
+          if (kind === "session" && imported.data.reference?.id) {
+            const rid = imported.data.reference.id;
+            await storage.call(
+              "putAsset",
+              rid,
+              await json(resolve(data, "assets", rid + ".json")),
               {
-                workerData: { path, name, kind, id, output },
-                resourceLimits: { maxOldGenerationSizeMb: 1536 },
+                name: imported.data.reference.name || "Workspace reference",
+                kind: "reference",
               },
             );
-            job.cancel = () => {
-              void worker.terminate();
-            };
-            const timeout = setTimeout(() => {
-              void worker.terminate();
-              reject(new Error("Import exceeded the ten-minute time limit"));
-            }, 600000);
-            worker.on("message", (message: Row) => {
-              if (message.progress) job.progress = message.progress;
-              if (message.error) {
-                clearTimeout(timeout);
-                reject(new Error(message.error));
-              }
-              if (message.result) {
-                clearTimeout(timeout);
-                const result = message.result;
-                if (kind === "reference")
-                  accept({
-                    id,
-                    name,
-                    kind,
-                    summary: result.data.summary,
-                    assignment_count: result.data.assignments.length,
-                  });
-                else accept(result);
-              }
-            });
-            worker.on("error", (error) => {
-              clearTimeout(timeout);
-              reject(error);
-            });
-            worker.on("exit", (code) => {
-              clearTimeout(timeout);
-              if (code)
-                reject(
-                  new Error(
-                    job.status === "cancelled"
-                      ? "Cancelled"
-                      : "Import worker stopped before completing",
-                  ),
-                );
-            });
-          }),
-      );
+            await unlink(resolve(data, "assets", rid + ".json"));
+          }
+          const content = await json(output);
+          await storage.call("putAsset", id, content, {
+            ...imported,
+            data: undefined,
+            rows: undefined,
+            attributes: undefined,
+            source_path: path,
+            sha256: sourceHash.digest("hex"),
+            kind:
+              kind === "session" && imported.data.orders?.id === id
+                ? "orders"
+                : kind,
+          });
+          await unlink(output);
+          return imported;
+        } catch (error) {
+          await storage.call("failDataset", id);
+          throw error;
+        }
+      });
       send(res, 202, { id: job.id });
       return;
     }
     if (url.pathname.startsWith("/api/jobs/")) {
       const id = safeId(url.pathname.split("/").at(-1)!);
-      const job = jobs.get(id);
+      const job = jobs.get(id) || (await storage.call("getJob", id));
       if (!job) {
         send(res, 404, { error: "Job not found" });
         return;
@@ -455,6 +543,7 @@ const server = createServer(async (req, res) => {
           job.status = "cancelled";
           job.progress = "Cancelled";
           job.cancel?.();
+          await storage.call("saveJob", job);
         }
         send(res, 200, { status: job.status });
         return;
@@ -465,60 +554,37 @@ const server = createServer(async (req, res) => {
           status: job.status,
           progress: job.progress,
           error: job.error,
-          ...(job.status === "complete"
-            ? { result: await json(resolve(data, "jobs", id + ".json")) }
-            : {}),
+          ...(job.status === "complete" ? { result: job.result } : {}),
         });
         return;
       }
     }
     if (url.pathname === "/api/workspaces" && req.method === "POST") {
-      const id = randomUUID();
-      await atomic(resolve(data, "workspaces", id + ".json"), {});
-      send(res, 201, { id });
+      send(res, 201, await storage.call("createWorkspace"));
+      return;
+    }
+    if (url.pathname === "/api/workspaces" && req.method === "GET") {
+      send(res, 200, await storage.call("listWorkspaces"));
       return;
     }
     if (url.pathname.startsWith("/api/workspaces/")) {
       const id = safeId(url.pathname.split("/").at(-1)!);
-      const path = resolve(data, "workspaces", id + ".json");
-      await stat(path);
       if (req.method === "GET") {
-        send(res, 200, await json(path));
+        const state = await storage.call("getWorkspace", id);
+        if (
+          state.orders?.id === "example-orders" &&
+          !(await storage.call("hasAsset", "example-orders"))
+        )
+          await ordersAsset("example-orders");
+        send(res, 200, state);
         return;
       }
       if (req.method === "PUT") {
-        const state = await body(req);
-        if (
-          !Number.isSafeInteger(state._save_revision) ||
-          state._save_revision < 1
-        )
-          throw new Error("A positive workspace revision is required");
-        let stale = false;
-        const save = (saves.get(id) ?? Promise.resolve())
-          .catch(() => {})
-          .then(async () => {
-            const previous = await json(path);
-            if (
-              Number(state._save_revision ?? 0) <=
-              Number(previous._save_revision ?? 0)
-            ) {
-              stale = true;
-              return;
-            }
-            await atomic(path, state);
-          });
-        saves.set(id, save);
-        try {
-          await save;
-        } finally {
-          if (saves.get(id) === save) saves.delete(id);
-        }
-        if (stale)
-          send(res, 409, {
-            error:
-              "This workspace has a newer saved version. Reload it or export a copy of your changes.",
-          });
-        else send(res, 200, { saved_at: new Date().toISOString() });
+        send(
+          res,
+          200,
+          await storage.call("saveWorkspace", id, await body(req)),
+        );
         return;
       }
     }
@@ -561,7 +627,7 @@ const server = createServer(async (req, res) => {
     else await pipeline(createReadStream(path), res);
   } catch (error) {
     if (!res.headersSent)
-      send(res, 400, {
+      send(res, Number((error as any)?.status) || 400, {
         error: error instanceof Error ? error.message : String(error),
       });
     else res.end();
@@ -574,7 +640,33 @@ server.once("error", (error: NodeJS.ErrnoException) => {
       : `Cannot start Layout Generator: ${error.message}`,
   );
   process.exitCode = 1;
+  void storage.close();
 });
+server.on("close", () => {
+  void storage.close();
+});
+const shutdown = async () => {
+  if (stopping) return;
+  stopping = true;
+  const saves: Promise<unknown>[] = [];
+  for (const job of jobs.values())
+    if (["running", "queued"].includes(job.status)) {
+      job.status = "cancelled";
+      job.progress = "Server stopped";
+      job.cancel?.();
+      saves.push(storage.call("saveJob", job));
+    }
+  await Promise.all(saves);
+  await tail;
+  server.close();
+};
+for (const signal of ["SIGINT", "SIGTERM"] as const)
+  process.once(signal, () => {
+    void shutdown().catch((error) => {
+      console.error(error.message);
+      process.exit(1);
+    });
+  });
 server.listen(port, "127.0.0.1", () =>
   console.log(`Layout Generator: http://127.0.0.1:${port}`),
 );

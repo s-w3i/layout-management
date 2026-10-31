@@ -4,7 +4,7 @@
 
 Install these on the machine that will run the application:
 
-- Node.js 22 or later, with npm.
+- Node.js 22.23.4 or later, with npm and its built-in SQLite module. The bundled SQLite library must be 3.51.3 or later.
 - CMake 3.16 or later.
 - A C++20 compiler, such as GCC 11 or later.
 - Git, Git LFS and internet access for dependency and dataset downloads.
@@ -22,6 +22,7 @@ Install Node.js separately if necessary, then check its version:
 ```bash
 node --version
 npm --version
+node --input-type=module -e 'import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(":memory:"); console.log(db.prepare("SELECT sqlite_version() AS version").get()); db.close();'
 ```
 
 ## Checkout and build
@@ -64,6 +65,24 @@ Use a browser with WebGL 2 support for the 3D view.
 ## Load the supplied data
 
 During warehouse setup, import a `.grid.json` file from `resources/map/amr/` or `resources/map/asrs/`. Load the original input files from `resources/data/` and `resources/others/` for demand and stock setup.
+
+## Initialize the database and integration access
+
+The first start creates `.data/app.sqlite` and migrates existing workspace and asset JSON files. Keep the original `.data/` directory in place during this first start. Migration preserves the original files.
+
+1. Open **Data & inventory → Overview**, set the warehouse time zone and register the warehouse.
+2. On **Master data**, check SKU attributes and UOM conversions.
+3. On **Inventory**, enter verified opening counts or import an opening-stock CSV. Calculated stock requirements are planning targets.
+4. Finish layout generation, synchronize the warehouse, then open **Publish** to validate and publish a release.
+5. On **Integration**, create a read or operate API key and copy it once. Use the [integration setup and API reference](docs/API.md) to connect the consuming system.
+
+Use **Overview → Create backup** to create a consistent SQLite snapshot. Original upload files should also be included in deployment backups.
+
+To keep runtime data in another directory, set its absolute path when starting:
+
+```bash
+DATA_DIR=/absolute/path/to/warehouse-data npm start
+```
 
 ## Deploy on a remote Linux machine
 

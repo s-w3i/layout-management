@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
-import { unlink } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import ExcelJS from "exceljs";
 import type { Row } from "../shared/model.js";
@@ -18,15 +20,15 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
   assert.ok(address && typeof address !== "string");
   const port = address.port;
   await new Promise<void>((resolve) => listener.close(() => resolve()));
-  const child = spawn(process.execPath, ["dist-server/server/index.js"], {
-    env: { ...process.env, PORT: String(port) },
+  const isolated = await mkdtemp(join(tmpdir(), "layout-http-"));
+  let child = spawn(process.execPath, ["dist-server/server/index.js"], {
+    env: { ...process.env, PORT: String(port), DATA_DIR: isolated },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const owned = new Set<string>();
   t.after(async () => {
     child.kill("SIGTERM");
     await once(child, "exit");
-    await Promise.all([...owned].map((path) => unlink(path).catch(() => {})));
+    await rm(isolated, { recursive: true, force: true });
   });
   await new Promise<void>((resolve, reject) => {
     child.once("error", reject);
@@ -50,7 +52,6 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
     return data;
   };
   const poll = async (id: string) => {
-    owned.add(`.data/jobs/${id}.json`);
     for (let i = 0; i < 600; ++i) {
       const job = await request(`/api/jobs/${id}`);
       if (job.status === "complete") return job.result as Row;
@@ -67,8 +68,6 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
     assert.equal(response.status, 202);
     const job = (await response.json()) as Row;
     const result = await poll(job.id);
-    owned.add(`.data/assets/${result.id}.json`);
-    owned.add(`.data/uploads/${result.id}.${name.split(".").at(-1)}`);
     return result;
   };
   const engine = async (value: Row) =>
@@ -101,10 +100,19 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
     "CSV and XLSX use the same order and signed-quantity semantics",
     async () => {
       const rows = [
-        ["date", "sku", "quantity_ea", "store", "UOM ConversionQty"],
-        ["2026-01-01", "A", 4, "S", 0.5],
-        ["2026-01-03", "A", -1, "S", 0.5],
-        ["2026-01-03", "B", 2, "S", 1],
+        [
+          "date",
+          "sku",
+          "quantity_ea",
+          "store",
+          "UOM ConversionQty",
+          "Time",
+          "UOM",
+          "Order ID",
+        ],
+        ["2026-01-01", "A", 4, "S", 0.5, "08:00:00", "EA", "ORDER1"],
+        ["2026-01-03", "A", -1, "S", 0.5, "09:00:00", "EA", "ORDER2"],
+        ["2026-01-03", "B", 2, "S", 1, "10:15:30", "EA", "ORDER3"],
       ];
       orders = await upload(
         "orders",
@@ -190,7 +198,6 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
       );
       assert.notEqual(restored.data.orders.id, orders.id);
       assert.notEqual(restored.data.reference.id, reference.id);
-      owned.add(`.data/assets/${restored.data.reference.id}.json`);
       assert.deepEqual(
         await engine({
           command: "analyze",
@@ -302,7 +309,6 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
     "older autosaves cannot overwrite newer state; running generation can be cancelled",
     async () => {
       const workspace = await request("/api/workspaces", {});
-      owned.add(`.data/workspaces/${workspace.id}.json`);
       for (const [revision, expectedStatus] of [
         [2, 200],
         [1, 409],
@@ -328,12 +334,232 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
           sku(String(i), 1, 2, 2),
         ),
       });
-      owned.add(`.data/jobs/${job.id}.json`);
       const cancelled = await fetch(`${base}/api/jobs/${job.id}`, {
         method: "DELETE",
       });
       assert.equal(((await cancelled.json()) as Row).status, "cancelled");
       assert.equal((await request(`/api/jobs/${job.id}`)).status, "cancelled");
+    },
+  );
+  await t.test(
+    "cancelling an order import releases its SQLite writer and hides partial history",
+    async () => {
+      const response = await fetch(
+        `${base}/api/uploads?kind=orders&name=cancelled-orders.csv`,
+        {
+          method: "POST",
+          body:
+            "date,sku,quantity_ea,store\n" +
+            "2026-01-01,A,1,S\n".repeat(500000),
+        },
+      );
+      assert.equal(response.status, 202);
+      const pending = (await response.json()) as Row;
+      let started = false;
+      for (let i = 0; i < 400; i++) {
+        const job = await request(`/api/jobs/${pending.id}`);
+        if (/Read /.test(job.progress)) {
+          started = true;
+          break;
+        }
+        if (job.status === "failed") throw new Error(job.error);
+        await delay(10);
+      }
+      assert.equal(started, true);
+      const cancelled = await fetch(`${base}/api/jobs/${pending.id}`, {
+        method: "DELETE",
+      });
+      assert.equal(((await cancelled.json()) as Row).status, "cancelled");
+      let dataset: Row | undefined;
+      for (let i = 0; i < 200; i++) {
+        dataset = (await request("/api/manage/datasets")).find(
+          (d: Row) => d.name === "cancelled-orders.csv",
+        );
+        if (dataset?.status === "failed") break;
+        await delay(10);
+      }
+      assert.equal(dataset?.status, "failed");
+      assert.equal(
+        (await fetch(`${base}/api/manage/datasets/${dataset!.id}/lines`))
+          .status,
+        404,
+      );
+      assert.ok((await request("/api/workspaces", {})).id);
+    },
+  );
+  await t.test(
+    "SQLite inventory, publishing, scoped integration APIs and restart recovery",
+    async () => {
+      const ws = await request("/api/workspaces", {}),
+        rows = [sku("API", 10, 4, 2)];
+      const generated = await engine({
+        command: "generate",
+        project: p,
+        sku_rows: rows,
+      });
+      const state = {
+        name: "API warehouse",
+        project: p,
+        velocity: rows,
+        stock: rows,
+        attributes: { API: physical },
+        settings: {},
+        result: generated,
+        _save_revision: 1,
+      };
+      const saved = await fetch(`${base}/api/workspaces/${ws.id}`, {
+        method: "PUT",
+        body: JSON.stringify(state),
+      });
+      assert.equal(saved.status, 200);
+      await request(`/api/manage/warehouses/${ws.id}/sync`, {});
+      await request("/api/manage/skus/import", { workspace_id: ws.id });
+      const opening = {
+        csv: "sku,quantity,location_id,lot\nAPI,5,RECEIVING,LOT1\n",
+        actor: "Counter",
+        reason: "Verified opening stock",
+      };
+      await request(
+        `/api/manage/warehouses/${ws.id}/opening-stock-csv`,
+        opening,
+      );
+      assert.equal(
+        (
+          await request(
+            `/api/manage/warehouses/${ws.id}/opening-stock-csv`,
+            opening,
+          )
+        ).duplicate,
+        true,
+      );
+      const token = await request("/api/manage/keys", {
+        name: "Read consumer",
+        scope: "read",
+      });
+      const operate = await request("/api/manage/keys", {
+        name: "Actual system",
+        scope: "operate",
+      });
+      assert.equal((await fetch(base + "/api/v1/warehouses")).status, 401);
+      const headers = { Authorization: `Bearer ${token.token}` };
+      let r = await fetch(`${base}/api/v1/warehouses/${ws.id}/inventory`, {
+        headers,
+      });
+      assert.equal(r.status, 200);
+      assert.equal(((await r.json()) as Row[])[0].quantity, 5);
+      r = await fetch(`${base}/api/v1/warehouses/${ws.id}/inventory`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({}),
+      });
+      assert.equal(r.status, 403);
+      const payload = {
+        kind: "receipt",
+        request_id: "external-receipt",
+        reason: "External reference",
+        sku: "API",
+        quantity: "2",
+        location_id: "RECEIVING",
+      };
+      for (let i = 0; i < 2; i++) {
+        r = await fetch(`${base}/api/v1/warehouses/${ws.id}/inventory`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${operate.token}` },
+          body: JSON.stringify(payload),
+        });
+        assert.equal(r.status, 201);
+      }
+      assert.equal(
+        (await request(`/api/manage/warehouses/${ws.id}/inventory`)).reduce(
+          (n: number, r: Row) => n + r.quantity,
+          0,
+        ),
+        7,
+      );
+      const publication = await request(
+        `/api/manage/warehouses/${ws.id}/publish`,
+        { name: "API release", expected_revision: 1 },
+      );
+      const bundle = await request(`/api/manage/releases/${publication.id}`);
+      assert.deepEqual(bundle.slotting.assignments, generated.assignments);
+      assert.equal(
+        bundle.inventory.reduce((n: number, r: Row) => n + r.quantity, 0),
+        7,
+      );
+      const spec = await request("/api/openapi.json");
+      assert.ok(spec.paths["/api/v1/warehouses/{warehouseId}/inventory"].post);
+      const original = await request(`/api/manage/datasets/${orders.id}/lines`);
+      assert.equal(original.total, 3);
+      assert.equal(original.rows[0].source_time, "08:00:00");
+      assert.equal(original.rows[0].uom, "EA");
+      assert.equal(original.rows[0].order_reference, "ORDER1");
+      const publicLines = await fetch(
+        `${base}/api/v1/datasets/${orders.id}/lines?limit=2`,
+        { headers },
+      );
+      assert.equal(publicLines.status, 200);
+      assert.equal(((await publicLines.json()) as Row).rows.length, 2);
+      const daily = await fetch(
+        `${base}/api/v1/datasets/${orders.id}/daily?sku=A`,
+        { headers },
+      );
+      assert.equal(daily.status, 200);
+      assert.equal(((await daily.json()) as Row).total, 2);
+      const snapshot = await fetch(
+        `${base}/api/v1/warehouses/${ws.id}/inventory-snapshot`,
+        { headers },
+      );
+      assert.equal(snapshot.status, 200);
+      assert.ok(((await snapshot.json()) as Row).inventory_event_sequence > 0);
+      assert.equal(
+        (
+          await fetch(`${base}/api/v1/warehouses/unknown/inventory`, {
+            headers,
+          })
+        ).status,
+        404,
+      );
+      assert.equal(original.rows[1].quantity_ea, -1);
+      assert.equal(
+        (await request(`/api/manage/datasets`)).find(
+          (d: Row) => d.id === orders.id,
+        ).raw_count,
+        3,
+      );
+      child.kill("SIGTERM");
+      await once(child, "exit");
+      child = spawn(process.execPath, ["dist-server/server/index.js"], {
+        env: { ...process.env, PORT: String(port), DATA_DIR: isolated },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.stdout.once("data", () => resolve());
+        child.once("exit", (code) =>
+          reject(new Error(`Restart failed: ${code}`)),
+        );
+      });
+      r = await fetch(`${base}/api/v1/warehouses/${ws.id}/published`, {
+        headers,
+      });
+      assert.equal(r.status, 200);
+      assert.deepEqual(await r.json(), bundle);
+      assert.equal(
+        (await request(`/api/manage/warehouses/${ws.id}/inventory`)).reduce(
+          (n: number, r: Row) => n + r.quantity,
+          0,
+        ),
+        7,
+      );
+      assert.equal(
+        (await request(`/api/manage/warehouses/${ws.id}/events`)).at(0).actor,
+        "integration:Actual system",
+      );
+      await fetch(`${base}/api/manage/keys/${token.id}`, { method: "DELETE" });
+      assert.equal(
+        (await fetch(base + "/api/v1/warehouses", { headers })).status,
+        401,
+      );
     },
   );
 });

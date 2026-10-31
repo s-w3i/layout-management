@@ -157,6 +157,7 @@ export function Table({
   columns: {
     key: string;
     label: string;
+    sortable?: boolean;
     render?: (value: any, row: Row) => ReactNode;
   }[];
   searchable?: boolean;
@@ -262,14 +263,14 @@ export function Table({
                   key={c.key}
                   scope="col"
                   aria-sort={
-                    sortable
+                    sortable && c.sortable !== false
                       ? sort?.key === c.key
                         ? sort.direction
                         : "none"
                       : undefined
                   }
                 >
-                  {sortable ? (
+                  {sortable && c.sortable !== false ? (
                     <button
                       type="button"
                       className="table-sort"
@@ -308,7 +309,14 @@ export function Table({
             {visible.map((row, index) => (
               <tr
                 key={String(
-                  row.inventory_load_id ?? row.sku ?? row.rack_id ?? index,
+                  row.id ??
+                    row.inventory_load_id ??
+                    (row.source_row != null
+                      ? `${row.dataset_id}:${row.source_row}`
+                      : undefined) ??
+                    row.sku ??
+                    row.rack_id ??
+                    index,
                 )}
               >
                 {columns.map((c) => (
