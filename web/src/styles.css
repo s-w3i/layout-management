@@ -3294,12 +3294,44 @@ th[aria-sort="descending"] {
 .preparation-sequence { padding-left: 22px; line-height: 1.7; }
 .preparation-sequence li { margin-bottom: 12px; }
 .affinity-controls { display: grid; grid-template-columns: minmax(180px, 2fr) 1fr 1fr auto; gap: 14px; align-items: end; margin-bottom: 18px; }
-.affinity-graph { width: 100%; height: auto; display: block; margin: 16px 0; border: 1px solid #e2e8f0; border-radius: 12px; }
-.affinity-graph g[role=button] { cursor: pointer; outline: none; }
-.affinity-graph g[role=button]:focus circle { stroke: #0f172a; stroke-width: 6; }
-.affinity-legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; color: #475569; }
 @media (max-width: 1024px) { .affinity-controls { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 600px) { .affinity-controls { grid-template-columns: 1fr; } }
-.affinity-canvas { max-width: 100%; overflow: auto; }
-.affinity-canvas:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
-.affinity-graph { min-width: 880px; }
+
+.affinity-network { margin: 20px 0; }
+.network-toolbar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.network-label-toggle { display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 13px; cursor: pointer; }
+.network-label-toggle input { width: 17px; height: 17px; }
+.network-layout { display: grid; grid-template-columns: minmax(0,1fr) 240px; border: 1px solid #24344d; border-radius: 14px; overflow: hidden; }
+.network-stage { position: relative; min-width: 0; height: 590px; background: #071126; }
+.network-webgl { position: absolute; inset: 0; }
+.network-webgl canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.network-webgl canvas:focus-visible { outline: 3px solid #60a5fa; outline-offset: -3px; }
+.network-camera { position: absolute; top: 14px; left: 14px; right: 14px; display: flex; flex-wrap: wrap; gap: 6px; pointer-events: none; }
+.network-camera-button { display: grid; place-items: center; width: 44px; height: 44px; border: 1px solid #39516e; border-radius: 8px; color: #dbeafe; background: #101f38e6; cursor: pointer; pointer-events: auto; }
+.network-camera-button:hover { background: #23416b; }
+.network-stage-caption { position: absolute; bottom: 16px; left: 18px; right: 18px; display: grid; gap: 5px; color: #e2e8f0; font-size: 12px; pointer-events: none; text-shadow: 0 1px 4px #071126; }
+.network-stage-caption span { color: #a6b7cf; }
+.network-inspector { padding: 20px 16px; background: #f8fafc; border-left: 1px solid #dbe4ef; min-width: 0; }
+.network-inspector .field { margin-bottom: 18px; }
+.network-selected-title { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; overflow-wrap: anywhere; }
+.network-selected-title > strong { font-size: 20px; }
+.network-degree { display: grid; gap: 4px; margin: 22px 0; }
+.network-degree strong { font-size: 30px; color: #1e40af; }
+.network-degree span { font-size: 12px; color: #64748b; }
+.network-inspector h3 { font-size: 12px; margin-top: 24px; }
+.network-connections { list-style: none; padding: 0; margin: 10px 0; }
+.network-connections li { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #e2e8f0; font-size: 12px; }
+.network-connections button { min-height: 44px; color: #1d4ed8; background: transparent; border: 0; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+.network-legend { display: grid; gap: 9px; font-size: 12px; color: #475569; margin-top: 24px; }
+.network-legend span { display: flex; gap: 8px; align-items: center; }
+.network-legend i { width: 9px; height: 9px; border-radius: 50%; border: 1px solid #64748b; }
+.network-instructions { font-size: 12px; color: #64748b; line-height: 1.7; margin: 12px 0; }
+.network-projection { height: 100%; }
+.network-projection svg { width: 100%; height: 100%; display: block; }
+.network-projection g[role=button] { cursor: pointer; }
+.network-projection g:focus circle { stroke: white; stroke-width: 1.5; }
+.network-loading { height: 590px; display: grid; place-items: center; background: #071126; color: #e2e8f0; border-radius: 14px; }
+@media (max-width: 1100px) { .network-layout { grid-template-columns: 1fr; } .network-inspector { border-left: 0; border-top: 1px solid #dbe4ef; } .network-stage { height: 520px; } }
+@media (max-width: 600px) { .network-stage { height: 440px; } .network-toolbar > .inline-actions { flex-wrap: wrap; } }
+
+@media (min-width: 1101px) { .network-inspector { max-height: 590px; overflow: auto; } }

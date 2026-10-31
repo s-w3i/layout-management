@@ -430,13 +430,13 @@ json analyze(const json &request) {
   const auto focus = text(settings, "affinity_focus_sku",
                           rows.empty() ? "" : text(rows[0], "sku"));
   const double shared_value = num(settings, "affinity_minimum_shared", 1),
-               limit_value = num(settings, "affinity_neighbor_limit", 12);
+               limit_value = num(settings, "affinity_neighbor_limit", 48);
   if (!std::isfinite(shared_value) || !std::isfinite(limit_value) ||
       shared_value < 1 || shared_value > 1000000000 || limit_value < 1 ||
-      limit_value > 24 || std::floor(shared_value) != shared_value ||
+      limit_value > 96 || std::floor(shared_value) != shared_value ||
       std::floor(limit_value) != limit_value)
     throw std::runtime_error(
-        "Affinity requires at least one shared store-day and 1–24 neighbors");
+        "Affinity requires at least one shared store-day and 1–96 neighbors");
   const int minimum_shared = int(shared_value),
             neighbor_limit = int(limit_value);
   if (!focus.empty() && !indices.count(focus))
@@ -459,6 +459,21 @@ json analyze(const json &request) {
     graph_skus.insert(text(edge, "sku_a"));
     graph_skus.insert(text(edge, "sku_b"));
   }
+  json network_edges = graph_edges;
+  size_t network_count = 0;
+  for (const auto &p : ranked) {
+    const auto &a = names[p.key >> 32], &b = names[p.key & 0xffffffff];
+    if (p.shared < minimum_shared || !graph_skus.count(a) ||
+        !graph_skus.count(b))
+      continue;
+    ++network_count;
+    if (a == focus || b == focus || network_edges.size() >= 600)
+      continue;
+    network_edges.push_back({{"sku_a", a},
+                             {"sku_b", b},
+                             {"shared_store_days", p.shared},
+                             {"cosine", p.cosine}});
+  }
   json graph_nodes = json::array();
   for (const auto &row : rows)
     if (graph_skus.count(text(row, "sku")))
@@ -479,6 +494,9 @@ json analyze(const json &request) {
            {{"date_start", first},
             {"date_end", last},
             {"nodes", graph_nodes},
+            {"network_version", 1},
+            {"network_relationships", network_edges},
+            {"network_relationship_count", network_count},
             {"focus_sku", focus},
             {"minimum_shared", minimum_shared},
             {"neighbor_limit", neighbor_limit},

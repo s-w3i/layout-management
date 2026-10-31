@@ -220,7 +220,7 @@ test("affinity focuses on pairs outside the global top 100, deduplicates baskets
   );
   assert.match(
     native(
-      { command: "analyze", orders, settings: { affinity_neighbor_limit: 25 } },
+      { command: "analyze", orders, settings: { affinity_neighbor_limit: 97 } },
       true,
     ).error,
     /neighbors/,

@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Download,
-  Network,
   Save,
   TriangleAlert,
 } from "lucide-react";
@@ -25,6 +24,8 @@ import {
   UploadButton,
   count,
 } from "./components";
+
+const AffinityNetwork = lazy(() => import("./AffinityNetwork"));
 
 type Props = {
   view: string;
@@ -569,15 +570,20 @@ function Affinity({
     initial?.focus_sku || w.velocity[0]?.sku || "",
   );
   const [minimum, setMinimum] = useState(initial?.minimum_shared || 1),
-    [limit, setLimit] = useState(initial?.neighbor_limit || 12);
-  const svg = useRef<SVGSVGElement>(null);
+    [limit, setLimit] = useState(
+      initial?.network_version &&
+        [12, 24, 48, 96].includes(initial.neighbor_limit)
+        ? initial.neighbor_limit
+        : 48,
+    );
+  const [inspectSku, setInspectSku] = useState(
+    initial?.focus_sku || w.velocity[0]?.sku || "",
+  );
   useEffect(() => {
     setGraph(initial || null);
+    setInspectSku(initial?.focus_sku || w.velocity[0]?.sku || "");
     setSku(initial?.focus_sku || w.velocity[0]?.sku || "");
   }, [w.analysis, w.velocity]);
-  const bySku = new Map<string, Row>(
-    [...(graph?.nodes || []), ...w.velocity].map((r: Row) => [r.sku, r]),
-  );
   async function show(focus = sku) {
     const result = await load({
       affinity_focus_sku: focus,
@@ -587,14 +593,11 @@ function Affinity({
     if (result) {
       setGraph(result);
       setSku(focus);
+      setInspectSku(focus);
     }
   }
   const focus = graph?.focus_sku,
-    edges: Row[] = graph?.relationships || [];
-  const neighbors: Row[] = edges.map((edge) => ({
-    ...edge,
-    sku: edge.sku_a === focus ? edge.sku_b : edge.sku_a,
-  }));
+    neighbors: Row[] = graph?.relationships || [];
   const dirty =
     graph &&
     (focus !== sku ||
@@ -602,24 +605,8 @@ function Affinity({
       graph.neighbor_limit !== limit);
   return (
     <Panel
-      title="SKU affinity graph"
-      subtitle="Explore one SKU group at a time. Select any SKU to see its strongest co-order neighbors across the selected dates."
-      action={
-        <button
-          className="button button-small"
-          disabled={!graph || w.demandStale}
-          onClick={() =>
-            svg.current &&
-            download(
-              `affinity-${focus}.svg`,
-              svg.current.outerHTML,
-              "image/svg+xml",
-            )
-          }
-        >
-          <Download size={14} /> Export SVG
-        </button>
-      }
+      title="3D SKU affinity network"
+      subtitle="Explore an interconnected SKU neighborhood in 3D. Select a node to inspect its demand and connections, or make it the new focus."
     >
       {!w.orders || !w.velocity.length ? (
         <Empty
@@ -655,7 +642,7 @@ function Affinity({
                 value={limit}
                 onChange={(e) => setLimit(Number(e.target.value))}
               >
-                {[6, 12, 18].map((n) => (
+                {[12, 24, 48, 96].map((n) => (
                   <option key={n}>{n}</option>
                 ))}
               </select>
@@ -680,10 +667,11 @@ function Affinity({
             </div>
           ) : (
             <>
-              {dirty && (
+              {(dirty || (graph && !graph.network_version)) && (
                 <div className="notice">
-                  Filters changed. Select Show relationships to update the
-                  graph.
+                  {graph && !graph.network_version
+                    ? "This saved view contains focus links only. Select Show relationships to load connections between neighboring SKUs."
+                    : "Filters changed. Select Show relationships to update the network."}
                 </div>
               )}
               {graph && (
@@ -693,130 +681,34 @@ function Affinity({
                     {graph.date_end || w.analysis?.summary?.date_end} · Showing{" "}
                     {neighbors.length} of{" "}
                     {count(graph.eligible_relationship_count)} matching
-                    neighbors for <strong>{focus}</strong>. Edge width indicates
-                    cosine similarity. Select a neighbor to inspect its group.
+                    neighbors for <strong>{focus}</strong>. The network includes
+                    connections between these neighbors.
                   </p>
-                  <div className="affinity-legend">
-                    <span>◎ Focus SKU</span>
-                    <span>A · High velocity</span>
-                    <span>B · Medium velocity</span>
-                    <span>C · Low velocity</span>
-                  </div>
-                  <div
-                    className="affinity-canvas"
-                    role="region"
-                    aria-label="Scrollable affinity graph"
-                    tabIndex={0}
+                  <Suspense
+                    fallback={
+                      <div className="network-loading" role="status">
+                        Loading 3D network…
+                      </div>
+                    }
                   >
-                    <svg
-                      ref={svg}
-                      width="920"
-                      height="580"
-                      className="affinity-graph"
-                      xmlns="http://www.w3.org/2000/svg"
-                      viewBox="0 0 920 580"
-                      role="group"
-                      aria-label={`Affinity group for SKU ${focus}`}
-                    >
-                      <title>
-                        SKU {focus} and its strongest co-order neighbors
-                      </title>
-                      <rect width="920" height="580" fill="#f8fafc" rx="12" />
-                      {neighbors.map((edge, i) => {
-                        const angle =
-                          (i / Math.max(1, neighbors.length)) * Math.PI * 2 -
-                          Math.PI / 2;
-                        return (
-                          <line
-                            key={edge.sku}
-                            x1="460"
-                            y1="280"
-                            x2={460 + 330 * Math.cos(angle)}
-                            y2={280 + 215 * Math.sin(angle)}
-                            stroke="#94a3b8"
-                            strokeWidth={1 + edge.cosine * 5}
-                          >
-                            <title>
-                              {edge.sku}: {edge.shared_store_days} shared
-                              store-days; cosine {edge.cosine.toFixed(4)}
-                            </title>
-                          </line>
-                        );
-                      })}
-                      {[{ sku: focus, center: true }, ...neighbors].map(
-                        (node, i) => {
-                          const angle =
-                              ((i - 1) / Math.max(1, neighbors.length)) *
-                                Math.PI *
-                                2 -
-                              Math.PI / 2,
-                            x = node.center ? 460 : 460 + 330 * Math.cos(angle),
-                            y = node.center ? 280 : 280 + 215 * Math.sin(angle),
-                            cl = bySku.get(node.sku)?.velocity_class || "?";
-                          return (
-                            <g
-                              key={node.sku}
-                              transform={`translate(${x},${y})`}
-                              role="button"
-                              tabIndex={busy ? -1 : 0}
-                              aria-disabled={busy}
-                              aria-label={`SKU ${node.sku}, class ${cl}. Show affinity group`}
-                              onClick={() => !busy && void show(node.sku)}
-                              onKeyDown={(e) => {
-                                if (
-                                  (e.key === "Enter" || e.key === " ") &&
-                                  !busy
-                                ) {
-                                  e.preventDefault();
-                                  void show(node.sku);
-                                }
-                              }}
-                            >
-                              <title>
-                                {node.sku} · Class {cl} ·{" "}
-                                {count(bySku.get(node.sku)?.pick_frequency)}{" "}
-                                picks
-                              </title>
-                              <circle
-                                r={node.center ? 34 : 23}
-                                fill={
-                                  cl === "A"
-                                    ? "#2563eb"
-                                    : cl === "B"
-                                      ? "#b45309"
-                                      : "#475569"
-                                }
-                                stroke={node.center ? "#0f172a" : "#ffffff"}
-                                strokeWidth={node.center ? 4 : 2}
-                              />
-                              <text
-                                textAnchor="middle"
-                                y="5"
-                                fill="white"
-                                fontFamily="sans-serif"
-                                fontSize="15"
-                                fontWeight="700"
-                              >
-                                {cl}
-                              </text>
-                              <text
-                                textAnchor="middle"
-                                y={node.center ? 57 : 43}
-                                fill="#0f172a"
-                                fontFamily="sans-serif"
-                                fontSize="13"
-                                fontWeight="600"
-                              >
-                                {String(node.sku).length > 14
-                                  ? `${String(node.sku).slice(0, 12)}…`
-                                  : node.sku}
-                              </text>
-                            </g>
-                          );
-                        },
-                      )}
-                    </svg>
-                  </div>
+                    <AffinityNetwork
+                      graph={graph}
+                      velocity={w.velocity}
+                      selected={inspectSku}
+                      onSelect={setInspectSku}
+                      onExplore={(sku) => void show(sku)}
+                      busy={busy}
+                    />
+                  </Suspense>
+                  {graph.network_relationship_count >
+                    (graph.network_relationships?.length || 0) && (
+                    <p className="muted">
+                      Showing {graph.network_relationships.length} of{" "}
+                      {count(graph.network_relationship_count)} connections in
+                      this neighborhood, keeping every focus link and the
+                      strongest remaining links.
+                    </p>
+                  )}
                   {!neighbors.length && (
                     <div className="notice">
                       No co-order neighbors meet this threshold. Reduce the
@@ -826,10 +718,13 @@ function Affinity({
                   <Table
                     searchable
                     sortable
-                    label="Affinity neighbors"
-                    rows={neighbors}
+                    label="Affinity connections"
+                    rows={
+                      graph.network_relationships || graph.relationships || []
+                    }
                     columns={[
-                      { key: "sku", label: "Related SKU" },
+                      { key: "sku_a", label: "SKU A" },
+                      { key: "sku_b", label: "SKU B" },
                       { key: "shared_store_days", label: "Shared store-days" },
                       {
                         key: "cosine",
@@ -838,15 +733,23 @@ function Affinity({
                       },
                       {
                         key: "group",
-                        label: "Explore",
+                        label: "Inspect",
                         sortable: false,
                         render: (_, r) => (
-                          <button
-                            className="button button-small"
-                            onClick={() => void show(r.sku)}
-                          >
-                            View {r.sku} group
-                          </button>
+                          <div className="inline-actions">
+                            <button
+                              className="button button-small"
+                              onClick={() => setInspectSku(r.sku_a)}
+                            >
+                              Inspect {r.sku_a}
+                            </button>
+                            <button
+                              className="button button-small"
+                              onClick={() => setInspectSku(r.sku_b)}
+                            >
+                              Inspect {r.sku_b}
+                            </button>
+                          </div>
                         ),
                       },
                     ]}
