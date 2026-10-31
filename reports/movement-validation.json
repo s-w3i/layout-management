@@ -1,0 +1,35 @@
+{
+  "order_groups": 12398,
+  "orders_sha256": "7f3b7d7324aa6eddf502f79c069836800c521b11fa8e7113bf527be16a0d4959",
+  "cases": [
+    {
+      "case": "saved-layout",
+      "source_sha256": "7dcba7379fee957618da502c4f13e3e600d9ea3e510342e4a8f7d259d4888927",
+      "assigned_loads": 3268,
+      "unit_count": 198,
+      "estimated_visits": 553917,
+      "exact_movement_parity": true,
+      "native_wall_seconds": 1.576216186003876
+    },
+    {
+      "case": "reference-amr-layout",
+      "source_sha256": "255c0481a7034abd4016e07c4a926d0632d49d4d297cb6fcb08309076b0038ea",
+      "assigned_loads": 3335,
+      "unit_count": 197,
+      "estimated_visits": 553086,
+      "exact_movement_parity": true,
+      "native_wall_seconds": 1.5920165509960498
+    },
+    {
+      "case": "reference-asrs-layout",
+      "source_sha256": "611fe78eddf40e89dc54e30c53dd15d6f8ac65eb0c0c5e46cafd7ce995f2c9f5",
+      "assigned_loads": 3335,
+      "unit_count": 3314,
+      "estimated_visits": 907648,
+      "exact_movement_parity": true,
+      "native_wall_seconds": 2.461013442996773
+    }
+  ],
+  "all_passed": true,
+  "model": "Historical handling-unit visit estimates; no traffic simulation or inventory depletion"
+}

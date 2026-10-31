@@ -1,0 +1,165 @@
+{
+  "generated_at": "2026-10-31T04:34:29Z",
+  "legacy_source": "/home/usern/layout_management_master",
+  "legacy_source_hashes": {
+    "warehouse_layout/slotting_rules.py": "ef70e2dadd8cbcad59b5268565903a1af85027e1ef051830439e79079146f74c",
+    "warehouse_layout/zone_settings_editor.py": "d4e3c38eebdbe2dd575c2f5de6a2d8749fe5a8aefa1b6d336882de14fd4004c6",
+    "warehouse_layout/domain.py": "546f27564ffdabe6b10a4a05b60c54d871de9d20539111f7b2adb22c13075048",
+    "warehouse_layout/attributes.py": "0f8a4aef854bf9cdc3e30fbba16d1f4464b6dbef3bd3801f5433e4b4ebfd070f",
+    "warehouse_layout/affinity.py": "e7e7d731ae0e56d97215da0552d159ef4419c8875a6a893412ba9f32a20c8663",
+    "warehouse_layout/rack_selection.py": "706f50c6ca930f4a1ee0d10d45f4a4efece611f4dfa080b61f53f82b8e9d153a",
+    "warehouse_layout/attribute_editor.py": "aa24538056af1f0be7319db51e50f0e75fb86c14b7cd3a9bd13ccf6ebf68482f",
+    "warehouse_layout/__init__.py": "81294c03b7c7f8dfed70369cf149d4c8a0c6b561e2db5307d447441440f8dffb",
+    "warehouse_layout/inventory.py": "30c71ffea5f350965b23b4359c592ea85c8931ec951f83126672a8a0de102e6e",
+    "warehouse_layout/gui.py": "8dbebd09108efcbb312341d21677e01aaa1036b9a7f9ea34c83ff4b88e122a8a",
+    "warehouse_layout/stock_determination.py": "1c47ea8f638074c7bf0aae0483a3b8a00fc04cfc14ba7129ea15332299f1bb41",
+    "warehouse_layout/slotting.py": "a42b48ba1ea2fbf37fd348cd4a07863cab4d1d18645ab901669b3644e78a217e",
+    "warehouse_layout/storage_planning.py": "09c0351568c8bae727519c79dd4ee4233adf963d94293eb2661b3564a508f2a6",
+    "warehouse_layout/rmf.py": "77385d568d495e715251886e029e68646eefb47fc3aef9b8f3c0a4be9642e943",
+    "warehouse_layout/sku_velocity_analysis.py": "6d98222bbd948f437e6e38066a87fd7e8e95019ab3276c6acb9e519fc7e9b1aa",
+    "warehouse_layout/cli.py": "5055c7b57401c4e4f795febb4088f6bf6a2a6c0894ccf52fbb705a1455f8a54f",
+    "warehouse_layout/config.py": "c32f52515bede0f2f839f0555532c2eda42121f8f50bc5e5778fe385c35e0a0a",
+    "warehouse_layout/traffic.py": "7b4123acd4c19a3e9686aad7d151887776e73431d5d698bd991312a833bcfb30",
+    "warehouse_layout/slotting_repository.py": "3c5b366ebf4505058ffb995e6a5222b0a3b7c86361bccc09a19aa33712039ebc",
+    "warehouse_layout/ctbsa.py": "1cd273ddbec58b21dd659f5883fbd0b7971c98da56dac2cb1a88b680ff720719",
+    "warehouse_layout/slotting_strategies/affinity_support.py": "7a4e6d7dae3267fd47774d181972a5ceb5a58b06af6b5ee043e33b02dd21809f",
+    "warehouse_layout/slotting_strategies/abc_affinity.py": "90bbdefb226d9b80a551dec0ccfba065074400b6009449ae554d4f45db14432c",
+    "warehouse_layout/slotting_strategies/base.py": "207112c86e12d1624c06bf98c87302af3a0c3c73e550a609cd4f36322a1f9805",
+    "warehouse_layout/slotting_strategies/__init__.py": "ec7108fa3c4e1cb62b28d8d0966575848a007c74556591f342f4aff9d94ea92b",
+    "warehouse_layout/slotting_strategies/zone_workload.py": "839e150d8499134b28cf277fd17deae75f3543d0b244a72e4722dbd6b531adea",
+    "warehouse_layout/slotting_strategies/quantity_feasibility.py": "5bede81761447c35fc7380f47ad51411f45c199a23be6f2c4a979c26350ff930",
+    "warehouse_layout/slotting_strategies/affinity_pipeline.py": "c540f85ac4502021a96225af29a75df0cf509655a34be68089137086b554c5db",
+    "warehouse_layout/slotting_strategies/rack_balance.py": "9d19ae2800a3553b42dbf704133a7f793a9bc48fa94ffffd1afa635c5d46c3bf",
+    "warehouse_layout/slotting_strategies/basic.py": "c20f649314fe47be74158f51e44b0faa00c86ec2a8d507ccda913651fbc4446b",
+    "warehouse_layout/slotting_strategies/allocation.py": "3565506670eeb2172d2a31fcc7f13c9d19adb7df6a632f2396426aec7497f526"
+  },
+  "basic_cases": [
+    {
+      "case": "amr-basic-off-cap12",
+      "input_sha256": "e67030d906739331831591d9f9e29d7810e0be0759c4fb32a7d16a31c0661f8d",
+      "native_loads": 3335,
+      "python_loads": 3335,
+      "identical_load_placements": 3335,
+      "exact_placement_parity": true,
+      "native_assigned": 3335,
+      "python_assigned": 3335,
+      "native_occupied_racks": 280,
+      "python_occupied_racks": 280,
+      "native_engine_s": 18.069793672,
+      "python_s": 156.4305224890004,
+      "validation": {
+        "passed": true,
+        "complete": true,
+        "physical_fit_verified": false,
+        "error_count": 0,
+        "errors": [],
+        "warnings": [
+          "27 assigned loads have incomplete physical data; their physical fit is unverified"
+        ],
+        "unassigned_loads": 0,
+        "unverified_loads": 27,
+        "unreachable_loads": 0,
+        "checked_loads": 3335,
+        "unique_occupied_cells": 3335,
+        "checks": [
+          "inventory_identity",
+          "quantity_conservation",
+          "unique_physical_cells",
+          "attribute_compatibility",
+          "contiguous_footprints",
+          "same_sku_physical_cell_limit",
+          "whole_rack_weight",
+          "routing_reachability"
+        ]
+      },
+      "differences": []
+    },
+    {
+      "case": "amr-basic-on-cap12",
+      "input_sha256": "d3b21538ba0e1e977150ccb99393474508b16622c505f1bba3b08c171da5686c",
+      "native_loads": 3335,
+      "python_loads": 3335,
+      "identical_load_placements": 3335,
+      "exact_placement_parity": true,
+      "native_assigned": 3335,
+      "python_assigned": 3335,
+      "native_occupied_racks": 285,
+      "python_occupied_racks": 285,
+      "native_engine_s": 17.391382324,
+      "python_s": 169.5265416809998,
+      "validation": {
+        "passed": true,
+        "complete": true,
+        "physical_fit_verified": false,
+        "error_count": 0,
+        "errors": [],
+        "warnings": [
+          "27 assigned loads have incomplete physical data; their physical fit is unverified"
+        ],
+        "unassigned_loads": 0,
+        "unverified_loads": 27,
+        "unreachable_loads": 0,
+        "checked_loads": 3335,
+        "unique_occupied_cells": 3335,
+        "checks": [
+          "inventory_identity",
+          "quantity_conservation",
+          "unique_physical_cells",
+          "attribute_compatibility",
+          "contiguous_footprints",
+          "same_sku_physical_cell_limit",
+          "whole_rack_weight",
+          "routing_reachability"
+        ]
+      },
+      "differences": []
+    },
+    {
+      "case": "asrs-basic-off-cap12",
+      "input_sha256": "a6689816085510d68b2ebc32c660bea349508aecd402291232f5a53fc69ff051",
+      "native_loads": 3335,
+      "python_loads": 3335,
+      "identical_load_placements": 3335,
+      "exact_placement_parity": true,
+      "native_assigned": 3335,
+      "python_assigned": 3335,
+      "native_occupied_racks": 280,
+      "python_occupied_racks": 280,
+      "native_engine_s": 19.275180607,
+      "python_s": 187.53905175100044,
+      "validation": {
+        "passed": true,
+        "complete": true,
+        "physical_fit_verified": false,
+        "error_count": 0,
+        "errors": [],
+        "warnings": [
+          "27 assigned loads have incomplete physical data; their physical fit is unverified"
+        ],
+        "unassigned_loads": 0,
+        "unverified_loads": 27,
+        "unreachable_loads": 0,
+        "checked_loads": 3335,
+        "unique_occupied_cells": 3335,
+        "checks": [
+          "inventory_identity",
+          "quantity_conservation",
+          "unique_physical_cells",
+          "attribute_compatibility",
+          "contiguous_footprints",
+          "same_sku_physical_cell_limit",
+          "whole_rack_weight",
+          "routing_reachability"
+        ]
+      },
+      "differences": []
+    }
+  ],
+  "stock": {
+    "sku_count": 1524,
+    "exact_numeric_stock_parity": true,
+    "mismatched_skus": 0,
+    "differences": []
+  },
+  "affinity_note": "See current-affinity-comparison.json and historical-affinity-comparison.json for complete-order affinity, physical validation, and measured objective differences. Exact affinity placement parity is not claimed."
+}

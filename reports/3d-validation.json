@@ -1,0 +1,54 @@
+{
+  "date": "2026-10-31",
+  "tests": {
+    "passed": 31,
+    "failed": 0,
+    "log": "3d-automated-tests.tap"
+  },
+  "native_generation_sources_unchanged": true,
+  "source_sha256": {
+    "shared/layout3d.ts": "1a955af8f160b7f7be08c7a3675f5fb55592e293845f4a19be548f7ce3030aa4",
+    "web/src/Layout3D.tsx": "735f77bb565ac73075a1bf20743a5333df47e1ecfdea61ff06f7f76a36524ecb",
+    "web/src/LayoutViewer.tsx": "ef58cc43f90c81b20bfd6f0c1a1b445194c4a941990ce98f4c26878ab8ec05cb",
+    "web/src/App.tsx": "f924c74f94abea8a2fcd87fec56a9a5d1829b731c3cfc8a149cfe3677583f405",
+    "web/src/styles.css": "0c4fd3bf5ef92feb1ef5239e31e3686d810cef3bf4367bec8a6e5cf0a310174b",
+    "tests/layout3d.test.ts": "ea4deeb47f04b4d5c9ed0822eb8750368b9ae57ea1b657065143d56101d650df",
+    "package.json": "86383e50f8b59b835bb9d06aa8b68cd10115475aee2555dc6fc109d1f11334b0",
+    "package-lock.json": "bc205e3eb8b88a421af2bf0ae1b55de80c9039ea07786e4f6497295198f6dc8b"
+  },
+  "browser": {
+    "full_scene_racks": 342,
+    "full_scene_cells": 4104,
+    "full_scene_allocations": 3268,
+    "pointer_picked_rack": "G15_14",
+    "isolated_cells": 12,
+    "isolated_allocations": 12,
+    "cutaway_level": 1,
+    "cutaway_visible_cells": 4,
+    "cutaway_visible_allocations": 4,
+    "inspector_total_loads_during_cutaway": 12,
+    "selection_shared_with_2d": true,
+    "keyboard_camera_checked": true,
+    "colour_modes_checked": [
+      "ABC",
+      "zone"
+    ],
+    "mobile": {
+      "viewport": 375,
+      "document_client_width": 360,
+      "document_scroll_width": 360,
+      "selector_widths": [
+        147,
+        147
+      ],
+      "webgl_canvas_rendered": true,
+      "alerts": []
+    },
+    "workspace_revision_before_and_after": 18
+  },
+  "limits": [
+    "Blocks represent allocated storage space, not individual product shapes.",
+    "Missing 3D geometry uses explicitly labelled schematic dimensions derived from grid/rack settings.",
+    "WebGL 2 is required; an unsupported-GPU failure was not forced in browser testing."
+  ]
+}
