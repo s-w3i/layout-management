@@ -78,11 +78,22 @@ The first start creates `.data/app.sqlite` and migrates existing workspace and a
 
 Use **Overview → Create backup** to create a consistent SQLite snapshot. Original upload files should also be included in deployment backups.
 
+## Set up ASRS simulation
+
+1. Import the ASRS grid, calculate stock requirements, generate the layout and publish the warehouse.
+2. Import the original order file if the selected history has no retained order lines.
+3. Open **ASRS simulation**, connect to the deployed warehouse API and select the published warehouse and order history.
+4. Choose dates/months, playback speed and replenishment lead time, then press **Prepare simulation → Start**.
+
+Follow the [ASRS setup and operation instructions](docs/ASRS.md) for source connections, playback controls and stock-flow exports. Stop the server and back up the complete `.data/` directory to preserve both warehouse and simulation databases.
+
 To keep runtime data in another directory, set its absolute path when starting:
 
 ```bash
 DATA_DIR=/absolute/path/to/warehouse-data npm start
 ```
+
+Use separate data directories for concurrently running application instances.
 
 ## Deploy on a remote Linux machine
 

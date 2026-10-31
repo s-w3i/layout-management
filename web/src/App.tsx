@@ -26,6 +26,7 @@ import {
   MapPinned,
   PackageCheck,
   Database,
+  Activity,
 } from "lucide-react";
 import {
   defaultSettings,
@@ -40,6 +41,7 @@ import { WarehouseStep } from "./WarehouseStep";
 import LayoutViewer from "./LayoutViewer";
 import InventoryOperations from "./InventoryOperations";
 import DataManagement from "./DataManagement";
+import AsrsSimulation from "./AsrsSimulation";
 import { dateRangeError } from "../../shared/dates";
 import {
   demandFilters,
@@ -167,6 +169,7 @@ export default function App() {
     [geometryError, setGeometryError] = useState("");
   const [area, setArea] = useState("planning");
   const [operationsOpened, setOperationsOpened] = useState(false);
+  const [simulationOpened, setSimulationOpened] = useState(false);
   const [selected, setSelected] = useState(""),
     [busy, setBusy] = useState<{
       label: string;
@@ -753,6 +756,27 @@ export default function App() {
         <nav className="operations-nav" aria-label="Inventory tools">
           <button
             type="button"
+            aria-label="ASRS simulation"
+            title="ASRS simulation"
+            className={`step-link ${area === "simulation" ? "current" : ""}`}
+            aria-pressed={area === "simulation"}
+            onClick={() => {
+              setArea("simulation");
+              setSimulationOpened(true);
+              setError("");
+              setTimeout(() => titleRef.current?.focus(), 0);
+            }}
+          >
+            <span className="step-number">
+              <Activity size={17} aria-hidden="true" />
+            </span>
+            <span>
+              <strong>ASRS simulation</strong>
+              <small>Crane cycles & stock flow</small>
+            </span>
+          </button>
+          <button
+            type="button"
             aria-label="Layout scenarios"
             title="Layout scenarios"
             className={`step-link ${area === "operations" ? "current" : ""}`}
@@ -798,11 +822,13 @@ export default function App() {
             <span>Workspace</span>
             <span>/</span>
             <strong>
-              {area === "management"
-                ? "Data & inventory"
-                : area === "operations"
-                  ? "Layout scenarios"
-                  : steps[step].name}
+              {area === "simulation"
+                ? "ASRS simulation"
+                : area === "management"
+                  ? "Data & inventory"
+                  : area === "operations"
+                    ? "Layout scenarios"
+                    : steps[step].name}
             </strong>
           </div>
           <div className="top-actions">
@@ -856,7 +882,9 @@ export default function App() {
           <div className="page-intro">
             <div>
               <div className="eyebrow">
-                {area === "management" ? (
+                {area === "simulation" ? (
+                  "ASRS SIMULATION"
+                ) : area === "management" ? (
                   "WAREHOUSE MANAGEMENT"
                 ) : area === "operations" ? (
                   "LAYOUT SCENARIOS"
@@ -867,36 +895,42 @@ export default function App() {
                 )}
               </div>
               <h1 ref={titleRef} tabIndex={-1}>
-                {area === "management"
-                  ? "Prepare data. Publish with confidence."
-                  : area === "operations"
-                    ? "Inspect inventory. Test position changes."
-                    : headings[step][0]}
+                {area === "simulation"
+                  ? "Run the warehouse. Trace every item."
+                  : area === "management"
+                    ? "Prepare data. Publish with confidence."
+                    : area === "operations"
+                      ? "Inspect inventory. Test position changes."
+                      : headings[step][0]}
               </h1>
               <p>
-                {area === "management"
-                  ? "Manage warehouse records and operational stock, then provide versioned data to external systems."
-                  : area === "operations"
-                    ? "Locate stock, estimate handling-unit movements and try validated swaps in a separate scenario."
-                    : headings[step][1]}
+                {area === "simulation"
+                  ? "Replay demand against a deployed ASRS layout, replenish to assigned stock targets and inspect the complete stock-flow ledger."
+                  : area === "management"
+                    ? "Manage warehouse records and operational stock, then provide versioned data to external systems."
+                    : area === "operations"
+                      ? "Locate stock, estimate handling-unit movements and try validated swaps in a separate scenario."
+                      : headings[step][1]}
               </p>
             </div>
-            <div className="intro-right">
-              <Badge tone={w.result ? "green" : ""}>
-                {w.result ? (
-                  <>
-                    <CircleCheck size={12} />
-                    Layout generated
-                  </>
-                ) : (
-                  <>
-                    <CircleDashed size={12} />
-                    Configuration
-                  </>
-                )}
-              </Badge>
-              <span>{w.name}</span>
-            </div>
+            {area !== "simulation" && (
+              <div className="intro-right">
+                <Badge tone={w.result ? "green" : ""}>
+                  {w.result ? (
+                    <>
+                      <CircleCheck size={12} />
+                      Layout generated
+                    </>
+                  ) : (
+                    <>
+                      <CircleDashed size={12} />
+                      Configuration
+                    </>
+                  )}
+                </Badge>
+                <span>{w.name}</span>
+              </div>
+            )}
           </div>
           {area === "planning" && w.example && step === 0 && (
             <div className="example-banner">
@@ -2349,6 +2383,14 @@ export default function App() {
                 )}
               </>
             )}
+            <div hidden={area !== "simulation"}>
+              {simulationOpened && (
+                <AsrsSimulation
+                  visible={area === "simulation"}
+                  workspaceId={workspaceId}
+                />
+              )}
+            </div>
             {area === "management" && (
               <DataManagement
                 workspaceId={workspaceId}

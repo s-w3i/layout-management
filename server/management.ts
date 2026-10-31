@@ -73,6 +73,18 @@ export async function management(
       ["lines", "daily", "baskets"].includes(route[2])
     )
       return send(await call("datasetRows", route[1], route[2], query));
+    if (
+      route[0] === "datasets" &&
+      route.length === 3 &&
+      route[2] === "calendar"
+    )
+      return send(await call("datasetCalendar", route[1]));
+    if (
+      route[0] === "datasets" &&
+      route.length === 3 &&
+      route[2] === "line-feed"
+    )
+      return send(await call("orderLineFeed", route[1], query));
     if (route[0] === "warehouses" && route.length === 1)
       return send(await call("listWarehouses"));
     if (route[0] === "skus" && route.length === 1)

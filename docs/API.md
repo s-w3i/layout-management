@@ -1,6 +1,6 @@
 # Warehouse integration API
 
-The web application prepares warehouse geometry, inventory data and slotting. External warehouse systems consume published releases and may post confirmed inventory operations. This application does not simulate or control equipment motion.
+The web application prepares warehouse geometry, inventory data and slotting. External warehouse systems consume published releases and may post confirmed inventory operations. The [ASRS simulation](ASRS.md) consumes this API and maintains separate simulated stock. Integration inventory operations represent confirmed real operations; they do not control equipment motion.
 
 ## Connect
 
@@ -16,32 +16,38 @@ The machine-readable contract is served at **`GET /api/openapi.json`**.
 
 ## Read configuration and inventory
 
-| Endpoint                                               | Result                                                                          |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------- |
-| `GET /api/v1/warehouses`                               | Registered warehouses and their draft configuration hashes                      |
-| `GET /api/v1/warehouses/{id}/published`                | Current published release; retain its release ID                                |
-| `GET /api/v1/releases/{releaseId}`                     | Complete immutable release                                                      |
-| `GET /api/v1/releases/{releaseId}/warehouse`           | Pinned geometry, locations, equipment and container snapshot                    |
-| `GET /api/v1/releases/{releaseId}/slotting`            | Pinned assignments, unassigned reasons and validation details                   |
-| `GET /api/v1/releases/{releaseId}/inventory`           | Operational inventory as it was at publication                                  |
-| `GET /api/v1/releases/{releaseId}/skus`                | Pinned SKU master and UOM conversions                                           |
-| `GET /api/v1/warehouses/{id}/inventory?q=SKU`          | Current operational inventory                                                   |
-| `GET /api/v1/warehouses/{id}/inventory-snapshot`       | Consistent inventory plus its event-feed cursor                                 |
-| `GET /api/v1/warehouses/{id}/locations`                | Registered storage, receiving, dispatch and workstation locations               |
-| `GET /api/v1/warehouses/{id}/containers`               | Container locations and contents, each in its SKU's base UOM                    |
-| `GET /api/v1/warehouses/{id}/equipment`                | Equipment IDs and declared capabilities                                         |
-| `GET /api/v1/warehouses/{id}/tasks`                    | Relocation tasks with all reserved/moving stock lines                           |
-| `GET /api/v1/warehouses/{id}/reservations`             | Outbound and task reservations                                                  |
-| `GET /api/v1/warehouses/{id}/events?after=0&limit=200` | Immutable events in ascending sequence order                                    |
-| `GET /api/v1/warehouses/{id}/releases`                 | Published version history                                                       |
-| `GET /api/v1/skus?q=SKU`                               | Current SKU master and SKU-specific UOM conversions                             |
-| `GET /api/v1/partners`                                 | Store and supplier master data                                                  |
-| `GET /api/v1/datasets`                                 | Historical demand datasets and retained-line availability                       |
-| `GET /api/v1/datasets/{id}/lines`                      | Parsed original order lines, including signed quantities and source row numbers |
-| `GET /api/v1/datasets/{id}/daily`                      | Daily SKU aggregates used by the layout engine                                  |
-| `GET /api/v1/datasets/{id}/baskets`                    | Store/day SKU groups used by movement estimates                                 |
+| Endpoint                                                 | Result                                                                          |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `GET /api/v1/warehouses`                                 | Registered warehouses and their draft configuration hashes                      |
+| `GET /api/v1/warehouses/{id}/published`                  | Current published release; retain its release ID                                |
+| `GET /api/v1/releases/{releaseId}`                       | Complete immutable release                                                      |
+| `GET /api/v1/releases/{releaseId}/warehouse`             | Pinned geometry, locations, equipment and container snapshot                    |
+| `GET /api/v1/releases/{releaseId}/slotting`              | Pinned assignments, unassigned reasons and validation details                   |
+| `GET /api/v1/releases/{releaseId}/inventory`             | Operational inventory as it was at publication                                  |
+| `GET /api/v1/releases/{releaseId}/skus`                  | Pinned SKU master and UOM conversions                                           |
+| `GET /api/v1/warehouses/{id}/inventory?q=SKU`            | Current operational inventory                                                   |
+| `GET /api/v1/warehouses/{id}/inventory-snapshot`         | Consistent inventory plus its event-feed cursor                                 |
+| `GET /api/v1/warehouses/{id}/locations`                  | Registered storage, receiving, dispatch and workstation locations               |
+| `GET /api/v1/warehouses/{id}/containers`                 | Container locations and contents, each in its SKU's base UOM                    |
+| `GET /api/v1/warehouses/{id}/equipment`                  | Equipment IDs and declared capabilities                                         |
+| `GET /api/v1/warehouses/{id}/tasks`                      | Relocation tasks with all reserved/moving stock lines                           |
+| `GET /api/v1/warehouses/{id}/reservations`               | Outbound and task reservations                                                  |
+| `GET /api/v1/warehouses/{id}/events?after=0&limit=200`   | Immutable events in ascending sequence order                                    |
+| `GET /api/v1/warehouses/{id}/releases`                   | Published version history                                                       |
+| `GET /api/v1/skus?q=SKU`                                 | Current SKU master and SKU-specific UOM conversions                             |
+| `GET /api/v1/partners`                                   | Store and supplier master data                                                  |
+| `GET /api/v1/datasets`                                   | Historical demand datasets and retained-line availability                       |
+| `GET /api/v1/datasets/{id}/lines`                        | Parsed original order lines, including signed quantities and source row numbers |
+| `GET /api/v1/datasets/{id}/daily`                        | Daily SKU aggregates used by the layout engine                                  |
+| `GET /api/v1/datasets/{id}/baskets`                      | Store/day SKU groups used by movement estimates                                 |
+| `GET /api/v1/datasets/{id}/calendar`                     | Observed dates/months and retained-line count                                   |
+| `GET /api/v1/datasets/{id}/line-feed?after=0&limit=5000` | Retained lines using a stable original-source-row cursor                        |
 
 Dataset views accept `limit` (1–500), `offset`, `sku`, `start` and `end` filters and return `{rows,total,limit,offset}`. Source clock times retain source-local clock values; no warehouse timezone is inferred. Original import files remain the source for unmodeled columns. Legacy datasets retain their aggregates; reimport the original workbook to retain line records.
+
+The separate `line-feed` accepts `after` (last processed `source_row`, initially 0), `limit` (1–5000), and optional `start`/`end` calendar filters. It returns `{rows,next_after,done}`. Continue with `next_after` until `done` is true. It reads immutable, ready datasets without repeated offset/count scans and requires retained original lines. The `calendar` response is `{dataset_id,raw_count,dates,months}`; dates/months contain only values observed in the source. Warehouse summaries also include system type and current published release ID/version.
+
+Authenticated server-to-server `/api/v1/` requests can arrive through a forwarded host/port (for example an SSH tunnel). Bearer authentication is still required; management endpoints retain strict local-host checks, and foreign browser origins remain rejected.
 
 Release sections return `{release_id,version,checksum,units,data}`. A release checksum is SHA-256 of the complete bundle **excluding `checksum`**, serialized as compact UTF-8 JSON with recursively alphabetically sorted object keys and unchanged array order. Numbers and strings use ECMAScript `JSON.stringify` serialization; for example, `1.0` is serialized as `1`. Later inventory transactions and draft edits do not change existing releases.
 

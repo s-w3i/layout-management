@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import type { Row } from "../../shared/model";
 import { layoutScene, visibleScene, type Box3D } from "../../shared/layout3d";
+import { phasePosition } from "../../shared/asrs";
 
 const zones = [
   "#799bd2",
@@ -49,20 +50,25 @@ export default function Layout3D({
   result,
   selected,
   onSelect,
+  simulation,
 }: {
   project: Row;
   geometry: Row | null;
   result: Row;
   selected: string;
   onSelect: (rack: string) => void;
+  simulation?: Row;
 }) {
   const host = useRef<HTMLDivElement>(null),
     actions = useRef<{
       command: (kind: Command) => void;
       select: (id: string) => void;
+      live?: () => void;
     } | null>(null),
     pose = useRef<Pose | null>(null);
   const selectedRef = useRef(selected);
+  const simulationRef = useRef(simulation);
+  simulationRef.current = simulation;
   selectedRef.current = selected;
   const [colour, setColour] = useState("abc"),
     [level, setLevel] = useState(0),
@@ -155,6 +161,7 @@ export default function Layout3D({
       scene.add(mesh);
       meshes.push(mesh);
       picks.push(mesh);
+      return mesh;
     };
     const frames: { box: Box3D; rack: string }[] = [];
     for (const rack of view.racks) {
@@ -207,7 +214,7 @@ export default function Layout3D({
       metalness: 0.02,
     });
     materials.push(loadMaterial);
-    boxes(
+    const loadMesh = boxes(
       view.loads.map((load) => ({
         rack: load.rack,
         box: {
@@ -283,11 +290,106 @@ export default function Layout3D({
     const highlight = new THREE.Box3Helper(new THREE.Box3(), 0xcb682c);
     highlight.visible = false;
     scene.add(highlight);
+    const craneMeshes = new Map<
+      string,
+      { mast: THREE.Mesh; carriage: THREE.Mesh; tote: THREE.Mesh }
+    >();
+    const mastMaterial = new THREE.MeshStandardMaterial({ color: 0x2873ba }),
+      carriageMaterial = new THREE.MeshStandardMaterial({ color: 0x277452 }),
+      carriedMaterial = new THREE.MeshStandardMaterial({ color: 0xd48b32 });
+    materials.push(mastMaterial, carriageMaterial, carriedMaterial);
+    const maxHeight = Math.max(
+        2,
+        ...model.racks.map((r: Row) => r.box.z + r.box.height / 2),
+      ),
+      reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+    let lastLive: Row | undefined;
+    const updateSimulation = () => {
+      const live = simulationRef.current;
+      if (!live) return;
+      const carried = new Set<string>();
+      for (const c of live.cranes) {
+        let meshes = craneMeshes.get(c.id);
+        if (!meshes) {
+          meshes = {
+            mast: new THREE.Mesh(cube, mastMaterial),
+            carriage: new THREE.Mesh(cube, carriageMaterial),
+            tote: new THREE.Mesh(cube, carriedMaterial),
+          };
+          for (const mesh of Object.values(meshes)) scene.add(mesh);
+          craneMeshes.set(c.id, meshes);
+        }
+        const interpolate =
+          live.running &&
+          live.speed !== "max" &&
+          live.speed <= 100 &&
+          !reduced.matches;
+        const at =
+          c.phase && interpolate
+            ? Math.min(
+                c.phase.end,
+                live.now +
+                  ((performance.now() - live.received_at) / 1000) * live.speed,
+              )
+            : live.now;
+        const pos = c.phase
+          ? phasePosition(c.phase, at, live.axes)
+          : c.position;
+        meshes.mast.position.set(pos[0], maxHeight / 2, -c.home[1]);
+        meshes.mast.scale.set(0.08, maxHeight, 0.08);
+        meshes.carriage.position.set(pos[0], pos[2], -pos[1]);
+        meshes.carriage.scale.set(0.85, 0.16, 0.55);
+        meshes.tote.position.set(pos[0], pos[2] + 0.25, -pos[1]);
+        meshes.tote.scale.set(0.5, 0.4, 0.65);
+        meshes.tote.visible = c.loaded;
+        if (c.loaded && c.load_id) carried.add(c.load_id);
+      }
+      if (loadMesh && live !== lastLive) {
+        view.loads.forEach((load, index) => {
+          matrix.position.set(load.x, load.z + 0.02, -load.y);
+          matrix.scale.set(
+            Math.max(0.01, load.width - 0.065),
+            Math.max(0.01, load.height - 0.11),
+            Math.max(0.01, load.depth - 0.08),
+          );
+          if (carried.has(load.id)) matrix.scale.set(0, 0, 0);
+          matrix.updateMatrix();
+          loadMesh.setMatrixAt(index, matrix.matrix);
+          loadMesh.setColorAt(
+            index,
+            new THREE.Color(
+              live.quantities[load.id] > 0
+                ? load.unverified
+                  ? "#c45f54"
+                  : colour === "zones"
+                    ? zones[zoneIds.indexOf(load.zone) % zones.length]
+                    : (classes[load.velocity] ?? classes.C)
+                : "#d8dee6",
+            ),
+          );
+        });
+        loadMesh.instanceMatrix.needsUpdate = true;
+        if (loadMesh.instanceColor) loadMesh.instanceColor.needsUpdate = true;
+      }
+      lastLive = live;
+    };
     let disposed = false,
       frame = 0;
     const render = () => {
       frame = 0;
-      if (!disposed) renderer.render(scene, camera);
+      if (!disposed) {
+        updateSimulation();
+        renderer.render(scene, camera);
+        const live = simulationRef.current;
+        if (
+          live?.running &&
+          live.speed !== "max" &&
+          live.speed <= 100 &&
+          !reduced.matches &&
+          !document.hidden
+        )
+          invalidate();
+      }
     };
     const invalidate = () => {
       if (!frame && !disposed) frame = requestAnimationFrame(render);
@@ -363,7 +465,7 @@ export default function Layout3D({
       controls.update();
     } else fit(allBounds);
     select(selectedRef.current);
-    actions.current = { command, select };
+    actions.current = { command, select, live: invalidate };
     controls.addEventListener("change", invalidate);
     const observer = new ResizeObserver(resize);
     observer.observe(mount);
@@ -464,6 +566,9 @@ export default function Layout3D({
   useEffect(() => {
     actions.current?.select(selected);
   }, [selected]);
+  useEffect(() => {
+    actions.current?.live?.();
+  }, [simulation]);
   if (!model || !view)
     return (
       <div className="three-loading" role="status">

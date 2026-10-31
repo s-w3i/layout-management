@@ -9,8 +9,12 @@ export class Storage {
   private next = 0;
   private stopped: Error | null = null;
   readonly ready: Promise<void>;
-  constructor(path: string, legacy?: string) {
-    this.worker = new Worker(new URL("./storage-worker.js", import.meta.url), {
+  constructor(
+    path: string,
+    legacy?: string,
+    workerUrl = new URL("./storage-worker.js", import.meta.url),
+  ) {
+    this.worker = new Worker(workerUrl, {
       workerData: { path, legacy },
     });
     this.ready = new Promise((resolve, reject) => {

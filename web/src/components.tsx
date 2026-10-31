@@ -310,6 +310,7 @@ export function Table({
               <tr
                 key={String(
                   row.id ??
+                    row.sequence ??
                     row.inventory_load_id ??
                     (row.source_row != null
                       ? `${row.dataset_id}:${row.source_row}`

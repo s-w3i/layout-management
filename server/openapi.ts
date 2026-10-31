@@ -45,7 +45,7 @@ export const openapi: Record<string, any> = {
     title: "Warehouse Configuration and Inventory API",
     version: "1.0.0",
     description:
-      "Published releases are immutable snapshots with metre, kilogram and SKU base-UOM units. Live inventory is separate. Integration keys are read or operate scoped. Administer keys through the local web UI. Use an SSH tunnel for remote access. No simulation or machine control is performed.",
+      "Published releases are immutable snapshots with metre, kilogram and SKU base-UOM units. Live inventory is separate. Integration keys are read or operate scoped. Administer keys through the local web UI. Use an SSH tunnel for remote access. ASRS replay uses a separate simulation ledger; this API does not execute machine control.",
   },
   servers: [{ url: "/" }],
   components: {
@@ -488,6 +488,61 @@ openapi.paths["/api/v1/datasets"] = {
   get: {
     ...read("List historical order datasets and retained-line availability"),
     responses: { "200": resultSchema(array(object)), ...errorResponses },
+  },
+};
+openapi.paths["/api/v1/datasets/{datasetId}/calendar"] = {
+  get: {
+    ...read("Read observed input dates and months only", [pathId("datasetId")]),
+    responses: {
+      "200": resultSchema(
+        record(
+          {
+            dataset_id: string,
+            raw_count: integer,
+            dates: array(string),
+            months: array(string),
+          },
+          ["dataset_id", "raw_count", "dates", "months"],
+        ),
+      ),
+      ...errorResponses,
+    },
+  },
+};
+openapi.paths["/api/v1/datasets/{datasetId}/line-feed"] = {
+  get: {
+    ...read(
+      "Read retained order lines using a stable source-row cursor; no offset scans",
+      [
+        pathId("datasetId"),
+        ...["after", "limit", "start", "end"].map((name) => ({
+          name,
+          in: "query",
+          schema: ["after", "limit"].includes(name)
+            ? {
+                type: "integer",
+                minimum: name === "after" ? 0 : 1,
+                ...(name === "limit"
+                  ? { maximum: 5000, default: 5000 }
+                  : { default: 0 }),
+              }
+            : { type: "string", format: "date" },
+        })),
+      ],
+    ),
+    responses: {
+      "200": resultSchema(
+        record(
+          {
+            rows: array(reference("OrderLine")),
+            next_after: integer,
+            done: { type: "boolean" },
+          },
+          ["rows", "next_after", "done"],
+        ),
+      ),
+      ...errorResponses,
+    },
   },
 };
 for (const kind of ["lines", "daily", "baskets"]) {

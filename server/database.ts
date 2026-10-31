@@ -531,6 +531,60 @@ export class WarehouseDatabase {
       metadata_json: undefined,
     }));
   }
+  datasetCalendar(id: string) {
+    const dataset = this.required(
+      "SELECT raw_count FROM datasets WHERE id=? AND kind='orders' AND status='ready'",
+      id,
+    );
+    const dates = this.all(
+      "SELECT DISTINCT date FROM demand_daily WHERE dataset_id=? ORDER BY date",
+      id,
+    ).map((r) => r.date);
+    return {
+      dataset_id: id,
+      raw_count: dataset.raw_count,
+      dates,
+      months: [...new Set(dates.map((d) => d.slice(0, 7)))],
+    };
+  }
+  orderLineFeed(id: string, query: Row = {}) {
+    this.required(
+      "SELECT 1 FROM datasets WHERE id=? AND kind='orders' AND status='ready' AND raw_count>0",
+      id,
+    );
+    const after = Number(query.after ?? 0),
+      limit = Number(query.limit ?? 5000);
+    if (
+      !Number.isSafeInteger(after) ||
+      after < 0 ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 5000
+    )
+      throw new DataError(
+        "Use a nonnegative source-row cursor and a limit between 1 and 5000",
+      );
+    for (const key of ["start", "end"])
+      if (query[key] && !validDate(query[key]))
+        throw new DataError("Invalid calendar date");
+    if (query.start && query.end && query.start > query.end)
+      throw new DataError("Start must be on or before end");
+    const rows = this.all(
+      "SELECT * FROM order_lines INDEXED BY sqlite_autoindex_order_lines_1 WHERE dataset_id=? AND source_row>? AND (?='' OR date>=?) AND (?='' OR date<=?) ORDER BY source_row LIMIT ?",
+      id,
+      after,
+      query.start || "",
+      query.start || "",
+      query.end || "",
+      query.end || "",
+      limit,
+    );
+    return {
+      rows,
+      next_after: rows.at(-1)?.source_row ?? after,
+      done: rows.length < limit,
+    };
+  }
   orderLines(id: string, query: Row = {}) {
     this.required("SELECT 1 FROM datasets WHERE id=? AND status='ready'", id);
     const limit = Math.min(500, Math.max(1, Number(query.limit) || 100)),
@@ -874,7 +928,7 @@ export class WarehouseDatabase {
   }
   listWarehouses() {
     return this.all(
-      "SELECT id,name,version_hash,updated_at,time_zone FROM warehouses ORDER BY name",
+      "SELECT w.id,w.name,w.version_hash,w.updated_at,w.time_zone,json_extract(w.project_json,'$.storage_layout.system_type') AS system_type,p.release_id AS published_release_id,r.version AS published_version FROM warehouses w LEFT JOIN publications p ON p.warehouse_id=w.id LEFT JOIN releases r ON r.id=p.release_id ORDER BY w.name",
     );
   }
   requireWarehouse(id: string) {

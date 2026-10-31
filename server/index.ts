@@ -6,6 +6,7 @@ import {
 import { randomUUID, createHash } from "node:crypto";
 import { Storage } from "./storage.js";
 import { management } from "./management.js";
+import { AsrsApi } from "./asrs.js";
 import { createReadStream, createWriteStream } from "node:fs";
 import { readFile, mkdir, stat, unlink } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
@@ -33,6 +34,8 @@ await storage.ready;
 const port = Number(process.env.PORT ?? 4317);
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Invalid PORT");
+const asrs = new AsrsApi(storage, data, `http://127.0.0.1:${port}`);
+await asrs.ready;
 type Job = {
   id: string;
   status: "queued" | "running" | "complete" | "failed" | "cancelled";
@@ -254,7 +257,14 @@ const server = createServer(async (req, res) => {
     }
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
     const host = req.headers.host ?? "";
-    if (![`127.0.0.1:${port}`, `localhost:${port}`].includes(host)) {
+    const authenticatedIntegration =
+      url.pathname.startsWith("/api/v1/") &&
+      !req.headers.origin &&
+      (req.headers.authorization || "").startsWith("Bearer ");
+    if (
+      ![`127.0.0.1:${port}`, `localhost:${port}`].includes(host) &&
+      !authenticatedIntegration
+    ) {
       send(res, 403, { error: "This server accepts local requests only" });
       return;
     }
@@ -267,6 +277,7 @@ const server = createServer(async (req, res) => {
       send(res, 403, { error: "Cross-origin requests are not allowed" });
       return;
     }
+    if (await asrs.handle(req, res, url, body, send)) return;
     if (
       await management(req, res, url, {
         storage,
@@ -640,10 +651,10 @@ server.once("error", (error: NodeJS.ErrnoException) => {
       : `Cannot start Layout Generator: ${error.message}`,
   );
   process.exitCode = 1;
-  void storage.close();
+  void asrs.close().finally(() => storage.close());
 });
 server.on("close", () => {
-  void storage.close();
+  void asrs.close().finally(() => storage.close());
 });
 const shutdown = async () => {
   if (stopping) return;
@@ -658,6 +669,7 @@ const shutdown = async () => {
     }
   await Promise.all(saves);
   await tail;
+  await asrs.close();
   server.close();
 };
 for (const signal of ["SIGINT", "SIGTERM"] as const)
