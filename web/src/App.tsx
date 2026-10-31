@@ -43,6 +43,7 @@ import InventoryOperations from "./InventoryOperations";
 import DataManagement from "./DataManagement";
 import AsrsSimulation from "./AsrsSimulation";
 import { dateRangeError } from "../../shared/dates";
+import { stockGeometryKey } from "../../shared/editor";
 import {
   demandFilters,
   inventoryFilters,
@@ -167,6 +168,7 @@ export default function App() {
     [ready, setReady] = useState(false),
     [geometry, setGeometry] = useState<Row | null>(null),
     [geometryError, setGeometryError] = useState("");
+  const [geometryUpdating, setGeometryUpdating] = useState(false);
   const [area, setArea] = useState("planning");
   const [operationsOpened, setOperationsOpened] = useState(false);
   const [simulationOpened, setSimulationOpened] = useState(false);
@@ -281,17 +283,15 @@ export default function App() {
   }, [w, workspaceId, ready]);
   useEffect(() => {
     if (!ready) return;
-    let jobId = "",
-      cancelled = false;
+    let cancelled = false;
+    setGeometryUpdating(true);
     const abort = new AbortController();
     const timer = setTimeout(() => {
-      engine(
-        { command: "geometry", project: w.project },
-        (_, id) => {
-          jobId = id;
-        },
-        abort.signal,
-      )
+      api("/api/geometry", {
+        method: "POST",
+        body: JSON.stringify({ project: w.project }),
+        signal: abort.signal,
+      })
         .then((result) => {
           if (!cancelled) {
             setGeometry(result);
@@ -301,14 +301,15 @@ export default function App() {
         .catch((e) => {
           if (!cancelled && e.name !== "AbortError")
             setGeometryError(e.message);
+        })
+        .finally(() => {
+          if (!cancelled) setGeometryUpdating(false);
         });
-    }, 180);
+    }, 60);
     return () => {
       cancelled = true;
       clearTimeout(timer);
       abort.abort();
-      if (jobId)
-        void api(`/api/jobs/${jobId}`, { method: "DELETE" }).catch(() => {});
     };
   }, [w.project, ready]);
   useEffect(() => {
@@ -354,6 +355,7 @@ export default function App() {
   const warehouseValid = Boolean(
     geometry?.summary.rack_count &&
       geometry?.summary.workstation_count &&
+      !geometryUpdating &&
       !geometryError,
   );
   const activeStores: string[] = w.analysis?.stores ?? w.orders?.stores ?? [];
@@ -427,18 +429,7 @@ export default function App() {
   const changeProject = (project: Row) =>
     setWorkspace((current) => {
       const physical =
-        JSON.stringify([
-          project.warehouse_storage_defaults,
-          project.machine_carrying_capacity,
-          project.storage_layout?.levels_per_rack,
-          project.storage_layout?.slots_per_level,
-        ]) !==
-        JSON.stringify([
-          current.project.warehouse_storage_defaults,
-          current.project.machine_carrying_capacity,
-          current.project.storage_layout?.levels_per_rack,
-          current.project.storage_layout?.slots_per_level,
-        ]);
+        stockGeometryKey(project) !== stockGeometryKey(current.project);
       return {
         ...current,
         project,
@@ -465,15 +456,17 @@ export default function App() {
     void run(`Import ${kind}`, async (progress) => {
       const result = await upload(file, kind, progress);
       if (kind === "grid") {
-        const project = result.data.storage_layout
-          ? result.data
-          : syncBuffers({
-              ...result.data,
-              storage_layout: newProject().storage_layout,
-              machine_carrying_capacity:
-                result.data.machine_carrying_capacity ??
-                newProject().machine_carrying_capacity,
-            });
+        const project =
+          result.data.storage_layout &&
+          Object.keys(result.data.storage_layout).length
+            ? result.data
+            : syncBuffers({
+                ...result.data,
+                storage_layout: newProject().storage_layout,
+                machine_carrying_capacity:
+                  result.data.machine_carrying_capacity ??
+                  newProject().machine_carrying_capacity,
+              });
         changeProject(project);
         setSelected("");
       }
@@ -938,7 +931,7 @@ export default function App() {
               <span>
                 <strong>Your existing warehouse, ready to explore.</strong>{" "}
                 Using the copied{" "}
-                {w.project.storage_layout.system_type === "AMR"
+                {(w.project.storage_layout.system_type ?? "AMR") === "AMR"
                   ? "AMR"
                   : "ASRS"}{" "}
                 grid, SKU attributes and saved stock inputs.
@@ -946,7 +939,7 @@ export default function App() {
               <select
                 aria-label="Choose existing example"
                 value={
-                  w.project.storage_layout.system_type === "AMR"
+                  (w.project.storage_layout.system_type ?? "AMR") === "AMR"
                     ? "amr"
                     : "asrs"
                 }
@@ -1005,6 +998,8 @@ export default function App() {
               <>
                 {step === 0 && (
                   <WarehouseStep
+                    updating={geometryUpdating}
+                    invalid={!!geometryError}
                     project={w.project}
                     geometry={geometry}
                     onChange={changeProject}

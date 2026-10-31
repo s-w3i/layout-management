@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type InputHTMLAttributes } from "react";
 import {
   MousePointer2,
   RectangleHorizontal,
@@ -15,8 +15,19 @@ import {
 import type { Row } from "../../shared/model";
 import { MapCanvas } from "./MapCanvas";
 import { Field, Panel, UploadButton, count } from "./components";
-import { syncBuffers } from "./warehouse";
+import { syncBuffers, standard } from "./warehouse";
 import { download } from "./api";
+import {
+  addLane,
+  deleteLane,
+  laneDirections,
+  lanePair,
+  setLaneDirection,
+  zoneId,
+  numericDraft,
+  validateGrid,
+  type LaneDirection,
+} from "../../shared/editor";
 
 type Props = {
   project: Row;
@@ -26,6 +37,8 @@ type Props = {
   selected: string;
   onSelect: (id: string) => void;
   disabled: boolean;
+  updating?: boolean;
+  invalid?: boolean;
   onError: (message: string) => void;
 };
 const isPoint = (value: Row, node: Row) =>
@@ -38,6 +51,8 @@ export function WarehouseStep({
   selected,
   onSelect,
   disabled,
+  updating = false,
+  invalid = false,
   onError,
 }: Props) {
   const [tool, setTool] = useState("select"),
@@ -53,31 +68,83 @@ export function WarehouseStep({
   const [pointX, setPointX] = useState(0),
     [pointY, setPointY] = useState(0);
   const [gridDraft, setGridDraft] = useState<Row>({ ...project.grid });
-  useEffect(() => setGridDraft({ ...project.grid }), [project.grid]);
+  const [pendingGrid, setPendingGrid] = useState<Row | null>(null);
+  const gridConfirmRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    if (pendingGrid) gridConfirmRef.current?.showModal();
+    else gridConfirmRef.current?.close();
+  }, [pendingGrid]);
+  const lastProject = useRef(project);
+  useEffect(() => {
+    if (project !== lastProject.current) {
+      setPast([]);
+      setFuture([]);
+      setLaneStart(null);
+      setGridDraft({ ...project.grid });
+      setPendingGrid(null);
+    }
+    lastProject.current = project;
+  }, [project]);
+  useEffect(
+    () => setGridDraft({ ...project.grid }),
+    [
+      project.grid.width_m,
+      project.grid.length_m,
+      project.grid.spacing_m,
+      project.grid.spacing_y_m,
+    ],
+  );
   const node = (geometry?.nodes ?? []).find((n: Row) => n.id === selected),
     rack = (geometry?.racks ?? []).find((r: Row) => r.id === selected);
   const zones = [
-    ...new Set<string>(Object.values(project.zone_assignments ?? {})),
+    ...new Set<string>([
+      ...(Object.values(project.zone_assignments ?? {}) as string[]),
+      ...Object.keys(project.location_attributes ?? {}).filter(
+        (id) => !id.includes("/"),
+      ),
+    ]),
   ].sort();
   useEffect(() => {
     if (node) {
       setColumn(node.column);
       setRow(node.row);
-      setRole(node.role || "rack");
+      setRole(node.role || "clear");
       setEndpoint(node.endpoint || "");
       setPointX(node.x);
       setPointY(node.y);
-      if (rack) setZone(rack.zone);
+      if (rack && tool !== "rack" && tool !== "zone") setZone(rack.zone);
     }
-  }, [selected, node?.x, node?.y]);
-  const commit = (p: Row, refresh = true) => {
+  }, [
+    selected,
+    node?.x,
+    node?.y,
+    node?.role,
+    node?.endpoint,
+    rack?.zone,
+    tool,
+  ]);
+  const commit = (p: Row, refresh = false): boolean => {
     try {
-      const next = refresh ? syncBuffers(p) : p;
+      const next = refresh
+        ? syncBuffers(p)
+        : {
+            ...p,
+            storage_layout: {
+              ...p.storage_layout,
+              machine_carrying_capacity:
+                p.machine_carrying_capacity ??
+                p.storage_layout.machine_carrying_capacity,
+            },
+          };
       setPast((previous) => [...previous.slice(-19), project]);
       setFuture([]);
+      lastProject.current = next;
+      onError("");
       onChange(next);
+      return true;
     } catch (error) {
       onError(String((error as Error).message));
+      return false;
     }
   };
   const paint = (nodes: Row[], action: string) => {
@@ -90,31 +157,24 @@ export function WarehouseStep({
         return;
       }
       if (laneStart.id === n.id) return;
-      const p = structuredClone(project),
-        start = { column: laneStart.column, row: laneStart.row },
-        end = { column: n.column, row: n.row };
-      p.added_lanes ??= [];
-      p.added_lanes.push({ start, end });
-      p.deleted_lanes = (p.deleted_lanes ?? []).filter(
-        (l: Row) =>
-          !(
-            (l.start.column === start.column &&
-              l.start.row === start.row &&
-              l.end.column === end.column &&
-              l.end.row === end.row) ||
-            (l.end.column === start.column &&
-              l.end.row === start.row &&
-              l.start.column === end.column &&
-              l.start.row === end.row)
-          ),
-      );
-      commit(p);
+      commit(addLane(project, laneStart, n));
       setLaneStart(null);
       return;
     }
     const p = structuredClone(project),
       chosen = new Set(nodes.map((n) => n.id));
+    let activeZone = zone;
+    if (action === "rack" || action === "zone") {
+      try {
+        activeZone = zoneId(zone);
+      } catch (error) {
+        onError((error as Error).message);
+        return;
+      }
+    }
     p.zone_assignments ??= {};
+    p.markers ??= [];
+    p.location_attributes ??= {};
     if (
       action === "rack" ||
       action === "workstation" ||
@@ -132,7 +192,7 @@ export function WarehouseStep({
           role: action,
           endpoint_id: `${action === "rack" ? "RACK" : "WS"}_${n.column}_${n.row}`,
         });
-        if (action === "rack") p.zone_assignments[n.id] = zone;
+        if (action === "rack") p.zone_assignments[n.id] = activeZone;
         else delete p.zone_assignments[n.id];
       }
       if (
@@ -142,27 +202,59 @@ export function WarehouseStep({
             m.role === "rack" && m.column === n.column && m.row === n.row,
         )
       )
-        p.zone_assignments[n.id] = zone;
+        p.zone_assignments[n.id] = activeZone;
       if (action === "erase" || action === "delete-point")
         delete p.zone_assignments[n.id];
       if (action === "delete-point") {
         p.deleted_positions ??= [];
-        p.deleted_positions.push({ column: n.column, row: n.row });
+        if (!p.deleted_positions.some((point: Row) => isPoint(point, n)))
+          p.deleted_positions.push({ column: n.column, row: n.row });
         p.coordinate_overrides = (p.coordinate_overrides ?? []).filter(
           (o: Row) => o.column !== n.column || o.row !== n.row,
         );
+        for (const key of ["added_lanes", "deleted_lanes", "one_way_lanes"])
+          p[key] = (p[key] ?? []).filter(
+            (lane: Row) => !isPoint(lane.start, n) && !isPoint(lane.end, n),
+          );
       }
     }
-    if (!p.location_attributes[zone])
-      p.location_attributes[zone] = { ...p.warehouse_storage_defaults };
-    commit(p);
+    if (
+      (action === "rack" || action === "zone") &&
+      !Object.hasOwn(p.location_attributes, activeZone)
+    )
+      p.location_attributes[activeZone] = { ...p.warehouse_storage_defaults };
+    commit(p, action !== "zone");
   };
   const changeStorage = (patch: Row) =>
-    commit({
-      ...project,
-      storage_layout: { ...project.storage_layout, ...patch },
-    });
+    commit(
+      {
+        ...project,
+        storage_layout: { ...project.storage_layout, ...patch },
+      },
+      true,
+    );
+  const editZone = (patch: Row): boolean => {
+    try {
+      const id = zoneId(zone);
+      return commit({
+        ...project,
+        location_attributes: {
+          ...project.location_attributes,
+          [id]: { ...project.location_attributes?.[id], ...patch },
+        },
+      });
+    } catch (error) {
+      onError((error as Error).message);
+      return false;
+    }
+  };
   const zoneAttrs = project.location_attributes?.[zone] ?? {};
+  const envelope = { ...standard, ...project.warehouse_storage_defaults },
+    systemType = project.storage_layout.system_type ?? "AMR";
+  const machine =
+    project.machine_carrying_capacity ??
+    project.storage_layout.machine_carrying_capacity ??
+    {};
   const tools = [
     { id: "select", name: "Inspect", icon: MousePointer2 },
     { id: "rack", name: "Racks", icon: RectangleHorizontal },
@@ -173,13 +265,24 @@ export function WarehouseStep({
     { id: "pan", name: "Pan", icon: Move },
   ];
   return (
-    <div className="warehouse-layout">
+    <fieldset
+      className="warehouse-layout"
+      disabled={disabled}
+      aria-label="Warehouse configuration"
+    >
       <div className="warehouse-main">
         <div
           className="editor-toolbar"
           role="toolbar"
           aria-label="Warehouse editing tools"
         >
+          <span className="geometry-status" role="status">
+            {updating
+              ? "Updating map…"
+              : invalid
+                ? "Map needs attention"
+                : "Map up to date"}
+          </span>
           <div className="tool-group">
             {tools.map((t) => (
               <button
@@ -205,6 +308,7 @@ export function WarehouseStep({
               disabled={!past.length || disabled}
               onClick={() => {
                 setFuture((f) => [project, ...f]);
+                lastProject.current = past.at(-1)!;
                 onChange(past.at(-1)!);
                 setPast((p) => p.slice(0, -1));
               }}
@@ -217,6 +321,7 @@ export function WarehouseStep({
               disabled={!future.length || disabled}
               onClick={() => {
                 setPast((p) => [...p, project]);
+                lastProject.current = future[0];
                 onChange(future[0]);
                 setFuture((f) => f.slice(1));
               }}
@@ -328,27 +433,65 @@ export function WarehouseStep({
                 const n = geometry?.nodes.find(
                   (n: Row) => n.column === column && n.row === row,
                 );
+                if (n) {
+                  onSelect(n.id);
+                  setRole(n.role || "clear");
+                  setEndpoint(n.endpoint || "");
+                } else onError("Choose an active grid point.");
+              }}
+            >
+              Select point
+            </button>
+            <button
+              className="button"
+              disabled={disabled}
+              onClick={() => {
+                const n = geometry?.nodes.find(
+                  (n: Row) => n.column === column && n.row === row,
+                );
                 if (!n) {
                   onError("Choose an active grid point.");
                   return;
                 }
                 const p = structuredClone(project);
+                p.markers ??= [];
+                p.location_attributes ??= {};
                 p.markers = p.markers.filter(
                   (m: Row) => m.column !== column || m.row !== row,
                 );
-                if (role !== "clear")
+                if (role !== "clear") {
+                  const id =
+                    endpoint.trim() ||
+                    `${role === "rack" ? "RACK" : "WS"}_${column}_${row}`;
+                  if (p.markers.some((m: Row) => m.endpoint_id === id)) {
+                    onError(
+                      "Endpoint IDs must be unique. Choose another endpoint ID.",
+                    );
+                    return;
+                  }
                   p.markers.push({
                     column,
                     row,
                     role,
-                    endpoint_id:
-                      endpoint ||
-                      `${role === "rack" ? "RACK" : "WS"}_${column}_${row}`,
+                    endpoint_id: id,
                   });
+                }
                 p.zone_assignments ??= {};
-                if (role === "rack") p.zone_assignments[n.id] = zone;
-                else delete p.zone_assignments[n.id];
-                commit(p);
+                if (role === "rack") {
+                  let id;
+                  try {
+                    id = zoneId(zone);
+                  } catch (error) {
+                    onError((error as Error).message);
+                    return;
+                  }
+                  p.zone_assignments[n.id] = id;
+                  if (!Object.hasOwn(p.location_attributes, id))
+                    p.location_attributes[id] = {
+                      ...p.warehouse_storage_defaults,
+                    };
+                } else delete p.zone_assignments[n.id];
+                commit(p, true);
                 onSelect(n.id);
               }}
             >
@@ -373,17 +516,23 @@ export function WarehouseStep({
               <summary>Edit physical coordinates and lane direction</summary>
               <div className="form-grid columns-3">
                 <Field label="X coordinate (m)">
-                  <input
+                  <NumberInput
                     type="number"
                     value={pointX}
-                    onChange={(e) => setPointX(Number(e.target.value))}
+                    onValue={(value) => {
+                      setPointX(Number(value));
+                      return true;
+                    }}
                   />
                 </Field>
                 <Field label="Y coordinate (m)">
-                  <input
+                  <NumberInput
                     type="number"
                     value={pointY}
-                    onChange={(e) => setPointY(Number(e.target.value))}
+                    onValue={(value) => {
+                      setPointY(Number(value));
+                      return true;
+                    }}
                   />
                 </Field>
                 <button
@@ -402,7 +551,7 @@ export function WarehouseStep({
                       x: pointX,
                       y: pointY,
                     });
-                    commit(p);
+                    commit(p, true);
                   }}
                 >
                   Move point
@@ -416,47 +565,28 @@ export function WarehouseStep({
                     geometry?.nodes[l[1]]?.id === node.id,
                 )
                 .map((l: Row) => {
-                  const a = geometry!.nodes[l[0]],
-                    b = geometry!.nodes[l[1]];
+                  const {
+                    start: a,
+                    end: b,
+                    key,
+                  } = lanePair(geometry!.nodes[l[0]], geometry!.nodes[l[1]]);
                   return (
-                    <div className="lane-row" key={`${a.id}-${b.id}`}>
+                    <div className="lane-row" key={key}>
                       <span>
                         {a.id} — {b.id}
                       </span>
                       <select
                         aria-label={`Direction from ${a.id} to ${b.id}`}
-                        value={l[2] ? "both" : "forward"}
+                        value={laneDirections(project).get(key) ?? "both"}
                         onChange={(e) => {
-                          const p = structuredClone(project);
-                          const isPoint = (v: Row, n: Row) =>
-                            v.column === n.column && v.row === n.row;
-                          p.one_way_lanes = (p.one_way_lanes ?? []).filter(
-                            (x: Row) =>
-                              !(
-                                (isPoint(x.start, a) && isPoint(x.end, b)) ||
-                                (isPoint(x.start, b) && isPoint(x.end, a))
-                              ),
+                          commit(
+                            setLaneDirection(
+                              project,
+                              a,
+                              b,
+                              e.target.value as LaneDirection,
+                            ),
                           );
-                          if (e.target.value !== "both")
-                            p.one_way_lanes.push({
-                              start: {
-                                column:
-                                  e.target.value === "forward"
-                                    ? a.column
-                                    : b.column,
-                                row:
-                                  e.target.value === "forward" ? a.row : b.row,
-                              },
-                              end: {
-                                column:
-                                  e.target.value === "forward"
-                                    ? b.column
-                                    : a.column,
-                                row:
-                                  e.target.value === "forward" ? b.row : a.row,
-                              },
-                            });
-                          commit(p);
                         }}
                       >
                         <option value="both">Both directions</option>
@@ -471,20 +601,7 @@ export function WarehouseStep({
                         className="icon-button"
                         aria-label={`Delete lane ${a.id} to ${b.id}`}
                         onClick={() => {
-                          const p = structuredClone(project);
-                          p.deleted_lanes ??= [];
-                          p.deleted_lanes.push({
-                            start: { column: a.column, row: a.row },
-                            end: { column: b.column, row: b.row },
-                          });
-                          p.added_lanes = (p.added_lanes ?? []).filter(
-                            (x: Row) =>
-                              !(
-                                (isPoint(x.start, a) && isPoint(x.end, b)) ||
-                                (isPoint(x.start, b) && isPoint(x.end, a))
-                              ),
-                          );
-                          commit(p);
+                          commit(deleteLane(project, a, b));
                         }}
                       >
                         <Trash2 size={14} />
@@ -523,29 +640,32 @@ export function WarehouseStep({
             <p className="muted">Define the capacity the allocator can use.</p>
             <Field label="Storage system">
               <select
-                value={project.storage_layout.system_type}
+                value={systemType}
                 onChange={(e) => {
                   const amr = e.target.value === "AMR";
-                  commit({
-                    ...project,
-                    machine_carrying_capacity: amr
-                      ? {
-                          max_item_length: null,
-                          max_item_width: null,
-                          max_item_height: null,
-                          max_item_weight: 150,
-                        }
-                      : {
-                          max_item_length: 1,
-                          max_item_width: 1,
-                          max_item_height: 1.5,
-                          max_item_weight: 25,
-                        },
-                    storage_layout: {
-                      ...project.storage_layout,
-                      system_type: e.target.value,
+                  commit(
+                    {
+                      ...project,
+                      machine_carrying_capacity: amr
+                        ? {
+                            max_item_length: null,
+                            max_item_width: null,
+                            max_item_height: null,
+                            max_item_weight: 150,
+                          }
+                        : {
+                            max_item_length: 1,
+                            max_item_width: 1,
+                            max_item_height: 1.5,
+                            max_item_weight: 25,
+                          },
+                      storage_layout: {
+                        ...project.storage_layout,
+                        system_type: e.target.value,
+                      },
                     },
-                  });
+                    true,
+                  );
                 }}
               >
                 <option>AMR</option>
@@ -555,36 +675,48 @@ export function WarehouseStep({
             </Field>
             <div className="form-grid">
               <Field label="Levels / rack">
-                <input
+                <NumberInput
                   type="number"
                   min="1"
-                  max="64"
-                  value={project.storage_layout.levels_per_rack}
-                  onChange={(e) =>
-                    changeStorage({ levels_per_rack: Number(e.target.value) })
+                  max={Math.min(
+                    64,
+                    Math.floor(
+                      256 / (project.storage_layout.slots_per_level ?? 4),
+                    ),
+                  )}
+                  integer
+                  value={project.storage_layout.levels_per_rack ?? 3}
+                  onValue={(value) =>
+                    changeStorage({ levels_per_rack: Number(value) })
                   }
                 />
               </Field>
               <Field label="Slots / level">
-                <input
+                <NumberInput
                   type="number"
                   min="1"
-                  max="64"
-                  value={project.storage_layout.slots_per_level}
-                  onChange={(e) =>
-                    changeStorage({ slots_per_level: Number(e.target.value) })
+                  max={Math.min(
+                    64,
+                    Math.floor(
+                      256 / (project.storage_layout.levels_per_rack ?? 3),
+                    ),
+                  )}
+                  integer
+                  value={project.storage_layout.slots_per_level ?? 4}
+                  onValue={(value) =>
+                    changeStorage({ slots_per_level: Number(value) })
                   }
                 />
               </Field>
             </div>
             <Field label="Rack height (m)">
-              <input
+              <NumberInput
                 type="number"
                 min=".1"
                 step=".1"
                 value={project.storage_layout.rack_height_m ?? 3.1}
-                onChange={(e) =>
-                  changeStorage({ rack_height_m: Number(e.target.value) })
+                onValue={(value) =>
+                  changeStorage({ rack_height_m: Number(value) })
                 }
               />
             </Field>
@@ -594,77 +726,74 @@ export function WarehouseStep({
               Used for stock sizing and physical classification.
             </p>
             <div className="form-grid">
-              {Object.entries(project.warehouse_storage_defaults).map(
-                ([key, value]) => (
-                  <Field
-                    key={key}
-                    label={`${key.replace("max_item_", "").replace(/^./, (x) => x.toUpperCase())} (${key.endsWith("weight") ? "kg" : "m"})`}
-                  >
-                    <input
-                      type="number"
-                      min=".001"
-                      step=".01"
-                      value={Number(value)}
-                      onChange={(e) =>
-                        commit(
-                          {
-                            ...project,
-                            warehouse_storage_defaults: {
-                              ...project.warehouse_storage_defaults,
-                              [key]: Number(e.target.value),
-                            },
+              {Object.entries(envelope).map(([key, value]) => (
+                <Field
+                  key={key}
+                  label={`${key.replace("max_item_", "").replace(/^./, (x) => x.toUpperCase())} (${key.endsWith("weight") ? "kg" : "m"})`}
+                >
+                  <NumberInput
+                    type="number"
+                    min=".001"
+                    step=".01"
+                    value={Number(value)}
+                    onValue={(value) =>
+                      commit(
+                        {
+                          ...project,
+                          warehouse_storage_defaults: {
+                            ...envelope,
+                            [key]: Number(value),
                           },
-                          false,
-                        )
-                      }
-                    />
-                  </Field>
-                ),
-              )}
+                        },
+                        false,
+                      )
+                    }
+                  />
+                </Field>
+              ))}
             </div>
             <Field
               label={
-                project.storage_layout.system_type === "AMR"
+                systemType === "AMR"
                   ? "Whole-rack capacity (kg)"
                   : "Machine carrying weight (kg)"
               }
             >
-              <input
+              <NumberInput
                 type="number"
                 min=".001"
-                value={
-                  project.machine_carrying_capacity?.max_item_weight ?? 150
-                }
-                onChange={(e) =>
+                nullable
+                placeholder="Unbounded"
+                value={machine.max_item_weight ?? ""}
+                onValue={(value) =>
                   commit({
                     ...project,
                     machine_carrying_capacity: {
-                      ...project.machine_carrying_capacity,
-                      max_item_weight: Number(e.target.value),
+                      ...machine,
+                      max_item_weight: value,
                     },
                   })
                 }
               />
             </Field>
-            {project.storage_layout.system_type !== "AMR" && (
+            {systemType !== "AMR" && (
               <details>
                 <summary>Machine envelope</summary>
                 {["length", "width", "height"].map((k) => (
                   <Field key={k} label={`${k} (m)`}>
-                    <input
+                    <NumberInput
                       type="number"
                       min=".001"
                       step=".01"
-                      value={
-                        project.machine_carrying_capacity?.[`max_item_${k}`] ??
-                        1
-                      }
-                      onChange={(e) =>
+                      nullable
+                      placeholder="Unbounded"
+                      value={machine[`max_item_${k}`] ?? ""}
+                      onValue={(value) =>
                         commit({
                           ...project,
                           machine_carrying_capacity: {
-                            ...project.machine_carrying_capacity,
-                            [`max_item_${k}`]: Number(e.target.value),
+                            ...machine,
+                            [`max_item_${k}`]: value,
                           },
                         })
                       }
@@ -677,10 +806,11 @@ export function WarehouseStep({
               className="button full-width"
               onClick={() => {
                 const p = structuredClone(project);
+                p.location_attributes ??= {};
                 for (const z of zones)
                   p.location_attributes[z] = {
                     ...p.location_attributes[z],
-                    ...p.warehouse_storage_defaults,
+                    ...envelope,
                   };
                 commit(p);
               }}
@@ -717,18 +847,7 @@ export function WarehouseStep({
                   <input
                     type="checkbox"
                     checked={Boolean(zoneAttrs[d.key])}
-                    onChange={(e) =>
-                      commit(
-                        {
-                          ...project,
-                          location_attributes: {
-                            ...project.location_attributes,
-                            [zone]: { ...zoneAttrs, [d.key]: e.target.checked },
-                          },
-                        },
-                        false,
-                      )
-                    }
+                    onChange={(e) => editZone({ [d.key]: e.target.checked })}
                   />
                   <span>{d.label}</span>
                 </label>
@@ -739,30 +858,14 @@ export function WarehouseStep({
                 key={k}
                 label={`Maximum item ${k} (${k === "weight" ? "kg" : "m"})`}
               >
-                <input
+                <NumberInput
                   type="number"
                   min=".001"
                   step=".01"
                   placeholder="Unbounded"
+                  nullable
                   value={zoneAttrs[`max_item_${k}`] ?? ""}
-                  onChange={(e) =>
-                    commit(
-                      {
-                        ...project,
-                        location_attributes: {
-                          ...project.location_attributes,
-                          [zone]: {
-                            ...zoneAttrs,
-                            [`max_item_${k}`]:
-                              e.target.value === ""
-                                ? null
-                                : Number(e.target.value),
-                          },
-                        },
-                      },
-                      false,
-                    )
-                  }
+                  onValue={(value) => editZone({ [`max_item_${k}`]: value })}
                 />
               </Field>
             ))}
@@ -834,22 +937,17 @@ export function WarehouseStep({
             <button
               className="button full-width"
               onClick={() => {
-                if (
-                  !window.confirm(
-                    "Create a new grid and clear the current rack, station and lane placements?",
-                  )
-                )
+                try {
+                  validateGrid(gridDraft);
+                } catch (error) {
+                  onError((error as Error).message);
                   return;
-                commit({
-                  ...project,
-                  grid: gridDraft,
-                  markers: [],
-                  zone_assignments: {},
-                  deleted_positions: [],
-                  deleted_lanes: [],
-                  added_lanes: [],
-                  one_way_lanes: [],
-                  coordinate_overrides: [],
+                }
+                setPendingGrid({
+                  width_m: gridDraft.width_m,
+                  length_m: gridDraft.length_m,
+                  spacing_m: gridDraft.spacing_m,
+                  spacing_y_m: gridDraft.spacing_y_m ?? gridDraft.spacing_m,
                 });
               }}
             >
@@ -871,7 +969,7 @@ export function WarehouseStep({
             </button>
             <button
               className="button full-width"
-              disabled={!geometry?.building}
+              disabled={!geometry?.building || updating || invalid}
               onClick={() =>
                 download(
                   "warehouse.building.yaml",
@@ -886,6 +984,124 @@ export function WarehouseStep({
           </>
         )}
       </aside>
-    </div>
+      <dialog
+        ref={gridConfirmRef}
+        className="help-dialog"
+        aria-labelledby="replace-grid-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          setPendingGrid(null);
+        }}
+        onClose={() => setPendingGrid(null)}
+      >
+        <div className="dialog-inner">
+          <h2 id="replace-grid-title">Replace warehouse grid?</h2>
+          <p>
+            Create a {pendingGrid?.width_m} × {pendingGrid?.length_m} m grid
+            with {pendingGrid?.spacing_m} × {pendingGrid?.spacing_y_m} m
+            spacing.
+          </p>
+          <p>
+            Existing racks, workstations, moved or deleted points and lane rules
+            will be cleared. You can undo this change.
+          </p>
+          <div className="dialog-actions">
+            <button
+              className="button"
+              autoFocus
+              onClick={() => setPendingGrid(null)}
+            >
+              Cancel
+            </button>
+            <button
+              className="button primary"
+              onClick={() => {
+                if (!pendingGrid) return;
+                if (
+                  commit(
+                    {
+                      ...project,
+                      grid: { ...project.grid, ...pendingGrid },
+                      markers: [],
+                      zone_assignments: {},
+                      deleted_positions: [],
+                      deleted_lanes: [],
+                      added_lanes: [],
+                      one_way_lanes: [],
+                      coordinate_overrides: [],
+                    },
+                    true,
+                  )
+                ) {
+                  onSelect("");
+                  setColumn(0);
+                  setRow(0);
+                  setRole("clear");
+                  setEndpoint("");
+                  setPendingGrid(null);
+                }
+              }}
+            >
+              Replace grid
+            </button>
+          </div>
+        </div>
+      </dialog>
+    </fieldset>
+  );
+}
+
+function NumberInput({
+  value,
+  onValue,
+  min,
+  max,
+  integer = false,
+  nullable = false,
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "value" | "onChange"> & {
+  value: number | string;
+  onValue: (value: number | null) => boolean;
+  integer?: boolean;
+  nullable?: boolean;
+}) {
+  const [draft, setDraft] = useState(String(value)),
+    [valid, setValid] = useState(true);
+  useEffect(() => {
+    setDraft(String(value));
+    setValid(true);
+  }, [value]);
+  return (
+    <input
+      {...props}
+      min={min}
+      max={max}
+      value={draft}
+      aria-invalid={!valid && draft !== ""}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setDraft(raw);
+        const n = numericDraft(
+          raw,
+          min == null ? undefined : Number(min),
+          max == null ? undefined : Number(max),
+          integer,
+        );
+        if (n === null && !(nullable && raw === "")) {
+          setValid(false);
+          return;
+        }
+        setValid(onValue(n));
+      }}
+      onBlur={() => {
+        if (!valid) {
+          setDraft(String(value));
+          setValid(true);
+        }
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+      }}
+    />
   );
 }

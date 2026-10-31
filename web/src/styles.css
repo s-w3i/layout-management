@@ -548,6 +548,10 @@ small {
   min-width: 0;
 }
 .warehouse-layout {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 274px;
   gap: 20px;
@@ -558,6 +562,7 @@ small {
 }
 .editor-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -2927,6 +2932,17 @@ th[aria-sort="descending"] {
   display: grid;
   gap: 20px;
   min-width: 0;
+}
+.geometry-status {
+  flex-basis: 100%;
+  order: 1;
+  color: var(--muted);
+  font-size: 12px;
+  min-height: 18px;
+}
+.configuration-panel input[aria-invalid="true"],
+.point-panel input[aria-invalid="true"] {
+  border-color: #b84c45;
 }
 .asrs-setup > summary {
   cursor: pointer;

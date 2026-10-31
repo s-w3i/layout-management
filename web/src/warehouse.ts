@@ -1,4 +1,5 @@
-import type { Row } from "../../shared/model";
+import type { Row } from "../../shared/model.js";
+import { validateGrid } from "../../shared/editor.js";
 export const standard = {
   max_item_length: 1.9,
   max_item_width: 0.5,
@@ -62,9 +63,11 @@ export function newProject(): Row {
   };
 }
 export function syncBuffers(project: Row): Row {
-  const p = structuredClone(project),
-    s = p.storage_layout ?? {},
-    amr = s.system_type === "AMR";
+  validateGrid(project.grid);
+  const s: Row = { ...project.storage_layout },
+    p: Row = { ...project, storage_layout: s },
+    amr = (s.system_type ?? "AMR") === "AMR";
+  s.system_type ??= "AMR";
   const levels = Number(s.levels_per_rack ?? 3),
     slots = Number(s.slots_per_level ?? 4);
   if (
@@ -83,7 +86,8 @@ export function syncBuffers(project: Row): Row {
     : s.system_type === "Pallet ASRS"
       ? "Pallet"
       : "Tote";
-  s.machine_carrying_capacity = p.machine_carrying_capacity;
+  s.machine_carrying_capacity =
+    p.machine_carrying_capacity ?? s.machine_carrying_capacity;
   s.buffers = [];
   s.slots = [];
   const sx = Number(p.grid.spacing_m),

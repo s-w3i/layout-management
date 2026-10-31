@@ -6,11 +6,12 @@ import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import ExcelJS from "exceljs";
 import type { Row } from "../shared/model.js";
 import { scenarioRows } from "../shared/operations.js";
-import { physical, project, sku } from "./fixtures.js";
+import { physical, project, sku, native } from "./fixtures.js";
 
 test("HTTP workflow imports, analyzes, sizes, generates, compares and restores portable workspaces", async (t) => {
   const listener = createServer();
@@ -96,6 +97,40 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
       400,
     );
   });
+  await t.test(
+    "editor geometry returns authoritative C++ output without creating persistent jobs",
+    async () => {
+      const db = new DatabaseSync(join(isolated, "app.sqlite"), {
+        readOnly: true,
+      });
+      try {
+        const before = (
+          db.prepare("SELECT count(*) AS n FROM jobs").get() as Row
+        ).n;
+        const g = await request("/api/geometry", { project: p });
+        assert.deepEqual(g, native({ command: "geometry", project: p }));
+        assert.equal(g.summary.rack_count, 3);
+        assert.equal(g.summary.capacity, 18);
+        assert.equal(
+          (db.prepare("SELECT count(*) AS n FROM jobs").get() as Row).n,
+          before,
+        );
+        const bad = await fetch(base + "/api/geometry", {
+          method: "POST",
+          headers: { Origin: "https://example.com" },
+          body: JSON.stringify({ project: p }),
+        });
+        assert.equal(bad.status, 403);
+        const invalid = await fetch(base + "/api/geometry", {
+          method: "POST",
+          body: JSON.stringify({ project: {} }),
+        });
+        assert.equal(invalid.status, 400);
+      } finally {
+        db.close();
+      }
+    },
+  );
   await t.test(
     "CSV and XLSX use the same order and signed-quantity semantics",
     async () => {
@@ -366,6 +401,13 @@ test("HTTP workflow imports, analyzes, sizes, generates, compares and restores p
         await delay(10);
       }
       assert.equal(started, true);
+      const preview = await request("/api/geometry", { project: p });
+      assert.equal(preview.summary.rack_count, 3);
+      assert.equal(
+        (await request(`/api/jobs/${pending.id}`)).status,
+        "running",
+        "An import must not block the editor preview behind its queue",
+      );
       const cancelled = await fetch(`${base}/api/jobs/${pending.id}`, {
         method: "DELETE",
       });

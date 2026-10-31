@@ -46,6 +46,7 @@ type Job = {
   created_at: string;
 };
 const jobs = new Map<string, Job>();
+const geometryPreviews = new Set<Job>();
 
 let tail = Promise.resolve();
 let stopping = false;
@@ -301,6 +302,38 @@ const server = createServer(async (req, res) => {
         version: "0.1.0",
         database: await storage.call("health"),
       });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/geometry") {
+      const request = await body(req);
+      if (geometryPreviews.size >= 4)
+        throw Object.assign(
+          new Error(
+            "Too many geometry previews; finish another edit and retry",
+          ),
+          { status: 429 },
+        );
+      const job: Job = {
+        id: randomUUID(),
+        status: "running",
+        progress: "Checking geometry",
+        created_at: new Date().toISOString(),
+      };
+      geometryPreviews.add(job);
+      const cancel = () => job.cancel?.();
+      res.once("close", cancel);
+      try {
+        const result = await native(
+          { command: "geometry", project: request.project },
+          job,
+        );
+        if (!res.destroyed) send(res, 200, result);
+      } catch (error) {
+        if (!res.destroyed) throw error;
+      } finally {
+        res.off("close", cancel);
+        geometryPreviews.delete(job);
+      }
       return;
     }
     if (req.method === "GET" && url.pathname.startsWith("/api/examples/")) {
@@ -659,6 +692,7 @@ server.on("close", () => {
 const shutdown = async () => {
   if (stopping) return;
   stopping = true;
+  for (const job of geometryPreviews) job.cancel?.();
   const saves: Promise<unknown>[] = [];
   for (const job of jobs.values())
     if (["running", "queued"].includes(job.status)) {

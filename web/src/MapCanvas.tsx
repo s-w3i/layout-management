@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Crosshair, ZoomIn, ZoomOut, Layers3 } from "lucide-react";
 import type { Row } from "../../shared/model";
 import { movementColor } from "../../shared/operations";
+import { lanePair, laneDirections, nextGridPoint } from "../../shared/editor";
+const noHighlights: string[] = [];
 
 const zoneColors = [
   "#dae6f7",
@@ -38,7 +40,7 @@ export function MapCanvas({
   onPaint,
   tool = "select",
   movementView = false,
-  highlighted = [],
+  highlighted = noHighlights,
 }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null),
     container = useRef<HTMLDivElement>(null);
@@ -69,7 +71,16 @@ export function MapCanvas({
     } | null>(null);
   const nodes: Row[] = geometry?.nodes ?? [],
     racks: Row[] = geometry?.racks ?? [];
-  const bounds = (() => {
+  useEffect(() => {
+    setHover((current) =>
+      current ? (nodes.find((n) => n.id === current.id) ?? null) : null,
+    );
+  }, [geometry]);
+  const directions = useMemo(
+    () => laneDirections(project),
+    [project.one_way_lanes],
+  );
+  const bounds = useMemo(() => {
     const xs = nodes.map((n) => n.x),
       ys = nodes.map((n) => n.y);
     return {
@@ -78,7 +89,7 @@ export function MapCanvas({
       minY: Math.min(0, ...ys),
       maxY: Math.max(project.grid.length_m, ...ys),
     };
-  })();
+  }, [nodes, project.grid.width_m, project.grid.length_m]);
   const padding = 38,
     scale =
       Math.min(
@@ -142,10 +153,12 @@ export function MapCanvas({
     const el = canvas.current;
     if (!el) return;
     const dpr = window.devicePixelRatio || 1;
-    el.width = size.width * dpr;
-    el.height = size.height * dpr;
+    if (el.width !== Math.round(size.width * dpr))
+      el.width = Math.round(size.width * dpr);
+    if (el.height !== Math.round(size.height * dpr))
+      el.height = Math.round(size.height * dpr);
     const ctx = el.getContext("2d")!;
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, size.width, size.height);
     ctx.fillStyle = "#fafbfd";
     ctx.fillRect(0, 0, size.width, size.height);
@@ -160,14 +173,20 @@ export function MapCanvas({
       }
     ctx.lineWidth = 0.65;
     ctx.strokeStyle = "#e3e8ef";
-    for (const [a, b, bidi] of geometry?.lanes ?? []) {
-      const p = screen(nodes[a]),
-        q = screen(nodes[b]);
+    for (const [a, b] of geometry?.lanes ?? []) {
+      const pair = lanePair(nodes[a], nodes[b]),
+        direction = directions.get(pair.key) ?? "both";
+      const start = direction === "reverse" ? pair.end : pair.start,
+        end = direction === "reverse" ? pair.start : pair.end;
+      const p = screen(start),
+        q = screen(end);
+      ctx.strokeStyle = direction === "both" ? "#e3e8ef" : "#326fbb";
+      ctx.lineWidth = direction === "both" ? 0.65 : 1.4;
       ctx.beginPath();
       ctx.moveTo(p.x, p.y);
       ctx.lineTo(q.x, q.y);
       ctx.stroke();
-      if (!bidi && view.zoom > 1.3) {
+      if (direction !== "both") {
         const x = (p.x + q.x) / 2,
           y = (p.y + q.y) / 2,
           angle = Math.atan2(q.y - p.y, q.x - p.x);
@@ -175,10 +194,10 @@ export function MapCanvas({
         ctx.translate(x, y);
         ctx.rotate(angle);
         ctx.beginPath();
-        ctx.moveTo(-3, -2);
-        ctx.lineTo(1, 0);
-        ctx.lineTo(-3, 2);
-        ctx.strokeStyle = "#64748b";
+        ctx.moveTo(-3.5, -2.5);
+        ctx.lineTo(1.5, 0);
+        ctx.lineTo(-3.5, 2.5);
+        ctx.strokeStyle = "#255c9f";
         ctx.stroke();
         ctx.restore();
       }
@@ -396,7 +415,12 @@ export function MapCanvas({
                   w: Math.abs(p.x - d.x),
                   h: Math.abs(p.y - d.y),
                 });
-            } else setHover(nearest(p.x, p.y));
+            } else {
+              const next = nearest(p.x, p.y);
+              setHover((current) =>
+                current?.id === next?.id ? current : next,
+              );
+            }
           }}
           onPointerUp={(event) => {
             const p = location(event),
@@ -426,6 +450,9 @@ export function MapCanvas({
             drag.current = null;
             setSelection(null);
           }}
+          onPointerLeave={() => {
+            if (!drag.current) setHover(null);
+          }}
           onKeyDown={(event) => {
             const current = nodes.find((n) => n.id === selected) ?? nodes[0];
             if (!current) return;
@@ -438,10 +465,7 @@ export function MapCanvas({
             if (directions[event.key]) {
               event.preventDefault();
               const [x, y] = directions[event.key];
-              const n = nodes.find(
-                (n) =>
-                  n.column === current.column + x && n.row === current.row + y,
-              );
+              const n = nextGridPoint(nodes, current, x, y);
               if (n) onSelect(n.id);
             }
             if (event.key === "Enter" || event.key === " ") {
