@@ -1,0 +1,82 @@
+{
+  "schema": "layout_generator_resources/v1",
+  "files": [
+    {
+      "path": "resources/data/Sample Data.backup-20260728.xlsx",
+      "kind": "input",
+      "bytes": 125917943,
+      "sha256": "9d0233f45edc9b53aa30496f8f2f85aaf01fdbaabd9f46c6bb9db10dbfccf183",
+      "source": "layout_management_master/resources/data/Sample Data.backup-20260728.xlsx"
+    },
+    {
+      "path": "resources/data/Sample Data.xlsx",
+      "kind": "input",
+      "bytes": 106449274,
+      "sha256": "bdd3a595cc4c963a3be3a694610706473e54d4ea76c1ebb397cee996f0ab6576",
+      "source": "layout_management_master/resources/data/Sample Data.xlsx"
+    },
+    {
+      "path": "resources/data/medicine_sku_attributes.csv",
+      "kind": "input",
+      "bytes": 73570,
+      "sha256": "f53d07b2fd22655dd082ef8aff836a58dbdf10419d3a39e6daa291e00aa7c56b",
+      "source": "layout_management_master/resources/data/medicine_sku_attributes.csv"
+    },
+    {
+      "path": "resources/data/minimum_stock_requirements.csv",
+      "kind": "input",
+      "bytes": 255759,
+      "sha256": "c9ecd66c1a027e1239b8868b9d4d427f1df02be9f0da97a3303e591e47f8e989",
+      "source": "layout_management_master/resources/data/minimum_stock_requirements.csv"
+    },
+    {
+      "path": "resources/data/minimum_stock_requirements_attribute_combinations.csv",
+      "kind": "input",
+      "bytes": 699,
+      "sha256": "2e6661510436b8455f9393a7a7ec0ac908c97e76441a85afdad079dd99356b70",
+      "source": "layout_management_master/resources/data/minimum_stock_requirements_attribute_combinations.csv"
+    },
+    {
+      "path": "resources/data/sku_mixed_uom_conversions.csv",
+      "kind": "input",
+      "bytes": 1630,
+      "sha256": "dc1aa6bea1821f02f1527992ce8fcdd4a5c03d750c190405a322452263d9693c",
+      "source": "layout_management_master/resources/data/sku_mixed_uom_conversions.csv"
+    },
+    {
+      "path": "resources/data/sku_velocity_output/sku_velocity_summary.csv",
+      "kind": "input",
+      "bytes": 113344,
+      "sha256": "5641b98bc224bef5cc3809f0248b33ab18f1ffd8d41bf49ae6849e7ee06342e4",
+      "source": "layout_management_master/resources/data/sku_velocity_output/sku_velocity_summary.csv"
+    },
+    {
+      "path": "resources/map/amr/map1_1.grid.json",
+      "kind": "input",
+      "bytes": 154362,
+      "sha256": "7708987d626e1e64a76190da98a0be2cee96d80b0f6b43f5d75bacc108431c61",
+      "source": "layout_management_master/resources/map/amr/map1_1.grid.json"
+    },
+    {
+      "path": "resources/map/asrs/asrs_grid.grid.json",
+      "kind": "input",
+      "bytes": 2445430,
+      "sha256": "acfb2a20963c9dc180a596a4f70b56147c9d9daa6f96b6e9a3daaa8084aa7583",
+      "source": "layout_management_master/resources/map/asrs/asrs_grid.grid.json"
+    },
+    {
+      "path": "resources/others/mixed_uom_order_examples.csv",
+      "kind": "input",
+      "bytes": 8259,
+      "sha256": "f69cb1cfe6509da29b00ca9320a7dd79bcb520ac8bb3e0cfc43d8476f68b5c83",
+      "source": "layout_management_master/resources/others/mixed_uom_order_examples.csv"
+    },
+    {
+      "path": "resources/others/mixed_uom_order_lines.csv",
+      "kind": "input",
+      "bytes": 5427840,
+      "sha256": "55ac4dc7fec8459e8e1188c0c2a2c8a309a2e63c6abdbd2450d01cfec073cefe",
+      "source": "layout_management_master/resources/others/mixed_uom_order_lines.csv"
+    }
+  ]
+}

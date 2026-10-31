@@ -1,0 +1,4 @@
+# Preserve original dataset bytes and checksums across platforms.
+resources/** -text
+resources/**/*.csv whitespace=cr-at-eol
+resources/data/*.xlsx filter=lfs diff=lfs merge=lfs -text

@@ -7,13 +7,14 @@ Install these on the machine that will run the application:
 - Node.js 22 or later, with npm.
 - CMake 3.16 or later.
 - A C++20 compiler, such as GCC 11 or later.
-- Git and internet access for the initial dependency installation.
+- Git, Git LFS and internet access for dependency and dataset downloads.
 
 On Ubuntu/Debian, install the build tools:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake git
+sudo apt-get install -y build-essential cmake git git-lfs
+git lfs install
 ```
 
 Install Node.js separately if necessary, then check its version:
@@ -28,6 +29,8 @@ npm --version
 ```bash
 git clone --branch web-based --single-branch https://github.com/s-w3i/layout-management.git layout_generator
 cd layout_generator
+git lfs pull
+sha256sum --check resources/SHA256SUMS
 npm ci --include=dev
 npm run build
 ```
@@ -58,6 +61,10 @@ Open **http://127.0.0.1:4318** when using that port. If a port is already occupi
 
 Use a browser with WebGL 2 support for the 3D view.
 
+## Load the supplied data
+
+During warehouse setup, import a `.grid.json` file from `resources/map/amr/` or `resources/map/asrs/`. Load the original input files from `resources/data/` and `resources/others/` for demand and stock setup.
+
 ## Deploy on a remote Linux machine
 
 Complete the prerequisite, checkout and build steps on the remote machine, then start the application there with `npm start`.
@@ -82,6 +89,7 @@ Update, rebuild and restart:
 
 ```bash
 git pull --ff-only origin web-based
+git lfs pull
 npm ci --include=dev
 npm run build
 npm start
